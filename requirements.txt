@@ -1,0 +1,5 @@
+python-telegram-bot[job-queue]>=20.0
+google-generativeai>=0.4.0
+yfinance>=0.2.37
+matplotlib>=3.8.0
+python-dotenv>=1.0.1

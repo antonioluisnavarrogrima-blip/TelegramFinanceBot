@@ -1,0 +1,19 @@
+# Variables de entorno — NUNCA subir al repo
+.env
+
+# Entorno virtual Python
+venv/
+
+# Base de datos SQLite local (se usa solo como fallback de desarrollo)
+*.db
+
+# Gráficos generados por el bot
+*.png
+*.jpg
+
+# Caché de Python
+__pycache__/
+*.py[cod]
+
+# Logs
+*.log

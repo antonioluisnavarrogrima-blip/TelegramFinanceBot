@@ -1,532 +1,11 @@
-'''import os
-import re
-import json
-import logging
-import asyncio
-import operator
-import concurrent.futures
-import yfinance as yf
-import matplotlib
-matplotlib.use('Agg')
-import matplotlib.pyplot as plt
-from google import genai
-from google.genai import types
-from dotenv import load_dotenv
-from telegram import Update, BotCommand, BotCommandScopeDefault, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, filters, ContextTypes
-
-# Configurar el registro (log) para ver errores
-logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
-)
-logger = logging.getLogger(__name__)
-logging.getLogger("google_genai").setLevel(logging.WARNING)
-logging.getLogger("httpx").setLevel(logging.WARNING)
-
-# Cargar las claves API
-load_dotenv()
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-
-if not TELEGRAM_TOKEN or not GEMINI_API_KEY:
-    logger.error("No se encontraron las keys de Telegram o Gemini. El bot no puede continuar.")
-    print("\n--- ERROR ---")
-    print("Falta tu token de Telegram o API de Google.")
-    print("Asegúrate de llenar el archivo .env correctamente.")
-    exit(1)
-
-# Configurar el "Cerebro" de Google (SDK v2)
-try:
-    client = genai.Client(api_key=GEMINI_API_KEY)
-except Exception as e:
-    logger.error(f"Error cargando SDK Gemini v2 (google.genai): {e}")
-    exit(1)
-
-# --- 1. AGENTES DE IA (EXTRACTOR Y GENERADOR) ---
-
-def extractor_intenciones(prompt_del_inversor: str) -> dict | None:
-    """Extrae la intención (Seguro/Riesgo/Balanceado) y 40 tickers del nicho."""
-    prompt_sistema = """
-    Rol: Actúa como un Analista de Datos Financieros especializado en el mercado global.
-    Tarea: Generar una lista de exactamente 40 tickers de acciones explícitamente sobre el sector o concepto implícito en el input.
-    
-    1. Perfil: Si el usuario pide algo seguro/líder, tu perfil es "Seguro". Si pide crecimiento rápido/gangas, "Riesgo". Si no está claro, "Balanceado".
-    2. Filtro CRITICO de Tamaño: PROHIBIDO incluir empresas del Top 50 del S&P 500 (AAPL, MSFT, GOOG, NVDA, AMZN...) a menos que el perfil sea "Seguro". PRIORIZA agresivamente empresas Mid-Cap o Small-Cap desconocidas si el perfil es "Riesgo" o "Balanceado".
-    3. Tickers Internacionales: Si el usuario pide empresas de un país concreto (e.g. España, Europa), DEBES añadir el sufijo de Yahoo Finance correspondiente a cada ticker (Ej: `.MC` para España, `.L` para Londres, `.DE` para Alemania, `.PA` para París). Para España usa "SAN.MC", "ELE.MC", etc. Si omites el sufijo local, la extracción fracasará.
-    4. Overrides Dinámicos: Si el usuario exige restricciones, crea el array `filtros_dinamicos`. 
-       Métricas permitidas: "per", "rendimiento", "dividendo_porcentaje", "dividendo_absoluto", "crecimiento_ingresos", "precio_ventas", "precio_valor_contable", "per_futuro", "roe", "margen_beneficio", "deuda_capital", "beta".
-       Para "más del 20% en ventas", usa {"metrica": "crecimiento_ingresos", "operador": ">", "valor": 20.0}.
-       Para "empresas agresivas / beta alta", usa {"metrica": "beta", "operador": ">", "valor": 1.2}.
-       Para conceptos de pérdida sin número, usa `valor: 0.0` con `operador: "<"`.
-    🚨 ATENCIÓN: Si el usuario pide empresas normales SIN exigencias, el array `filtros_dinamicos` DEBE estar estrictamente vacío `[]`.
-    5. Temporalidad: Si la métrica es "rendimiento", añade el campo `temporalidad` (1d, 5d, 1mo, 3mo, 6mo, 1y, ytd, max).
-    
-    RESPONDE EXCLUSIVAMENTE CON ESTE JSON ESTRICTO EN FORMATO PLANO:
-    {
-      "perfil": "Seguro"|"Riesgo"|"Balanceado",
-      "sector": "El sector inferido",
-      "tickers": ["TKR1", "TKR2", ..., "TKR40"],
-      "filtros_dinamicos": [
-          {"metrica": "rendimiento_temporal", "operador": ">", "valor": 10.0, "temporalidad": "1mo"}
-      ] // DEBE SER [] SI EL USUARIO NO ESCRIBIÓ NÚMEROS
-    }
-    """
-    consulta = f"{prompt_sistema}\n\n[INPUT USUARIO]: {prompt_del_inversor}"
-    try:
-        respuesta = client.models.generate_content(
-            model='gemini-2.5-flash',
-            contents=consulta,
-            config=types.GenerateContentConfig(response_mime_type="application/json")
-        )
-        texto = re.sub(r"^```[a-zA-Z]*\n?", "", respuesta.text.strip())
-        texto = re.sub(r"```$", "", texto.strip())
-        return json.loads(texto)
-    except Exception as e:
-        logger.error(f"Error en Extractor JSON: {e}")
-        return None
-
-def generador_informe_goldman(ticker: str, sector: str, datos: dict, perfil: str) -> str | None:
-    """Genera el informe comercial con el tono de Goldman Sachs basado en datos puros."""
-    prompt_sistema = """
-    Rol: Eres un Director de Estrategia Cuantitativa (Quants) Tier-1 (estilo Goldman Sachs).
-    Tarea: Redactar un 'Flash Note' ejecutivo ultracorto para banca privada basado ESTRICTAMENTE en estos números.
-    
-    Tono: Implacable, técnico, institucional.
-    Restricción 1: Habla estrictamente en ESPAÑOL. Usa "Foso económico" en vez de Moat y "Ventaja" en vez de Alpha.
-    Restricción 2: PROHIBIDO USAR NEGRITAS, cursivas o asteriscos (*). Escribe en texto plano.
-    Restricción 3: NO INVENTES PROYECCIONES. Si un dato falta, omítelo.
-    
-    Estructura Obligatoria:
-    🎯 Tesis de Inversión: [Una frase lapidaria de por qué el modelo algorítmico selecciona esta empresa según su perfil]
-    📊 Fundamentales: [Muestra Ticker, Sector, PER y Dividend Yield en viñetas lisas]
-    ⚖️ Veredicto: [Cierre de una línea pragmático]
-    """
-    consulta = f"{prompt_sistema}\n\nPerfil Cliente: {perfil} | Sector: {sector}\n[DATOS ORO DE {ticker}]: {json.dumps(datos)}\nATENCIÓN: NO USES ASTERISCOS EN TU RESPUESTA."
-    try:
-        res = client.models.generate_content(
-            model='gemini-2.5-flash',
-            contents=consulta
-        )
-        return res.text.strip()
-    except Exception as e:
-        logger.error(f"Error en Generador GS: {e}")
-        return None
-
-# --- 2. HERRAMIENTAS MATEMÁTICAS LOCALES ---
-
-def fabricante_de_graficos(ticker: str, periodo: str = "3mo"):
-    """Extrae datos 100% reales en vivo de Yahoo Finance (con temporalidad) y pinta su estado visual."""
-    try:
-        mercado = yf.Ticker(ticker)
-        historico = mercado.history(period=periodo)
-        if historico.empty:
-            return None, None
-            
-        precio_inicial = historico['Close'].iloc[0]
-        precio_final = historico['Close'].iloc[-1]
-        rendimiento_porcentual = ((precio_final - precio_inicial) / precio_inicial) * 100
-        
-        color_grafico = '#2ca02c' if rendimiento_porcentual >= 0 else '#d62728'
-        plt.figure(figsize=(10, 5))
-        plt.plot(historico.index, historico['Close'], color=color_grafico, linewidth=2.5)
-        
-        plt.fill_between(historico.index, historico['Close'], historico['Close'].min(), color=color_grafico, alpha=0.1)
-        plt.title(f"Evolución de Alpha: {ticker.upper()} ({periodo})", fontsize=14, fontweight='bold', color='#333333')
-        plt.ylabel('Precio por Acción (USD)', fontsize=12)
-        plt.grid(True, linestyle='--', alpha=0.5)
-        
-        nombre_ruta = f"grafico_{ticker}.png"
-        plt.savefig(nombre_ruta, bbox_inches='tight', dpi=80) 
-        plt.close()
-        return nombre_ruta, rendimiento_porcentual
-    except Exception as e:
-        logger.error(f"Fallo trazando grafico de {ticker}: {e}")
-        return None, None
-
-def es_url_valida(texto: str) -> bool:
-    regex = re.compile(
-        r'^(?:http|ftp)s?://' 
-        r'(?:(?:[A-Z0-9](?:[A-Z0-9-]{0,61}[A-Z0-9])?\.)+(?:[A-Z]{2,6}\.?|[A-Z0-9-]{2,}\.?)|'
-        r'localhost|'
-        r'\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})' 
-        r'(?::\d+)?' 
-        r'(?:/?|[/?]\S+)$', re.IGNORECASE)
-    return re.match(regex, texto) is not None
-
-def extraer_url(texto: str) -> str | None:
-    enlaces = re.findall(r'(https?://[^\s]+)', texto)
-    return enlaces[0] if enlaces else None
-
-# --- 3. EL PIPELINE MAESTRO (ORQUESTADOR) ---
-
-async def pipeline_hibrido(solicitud: str, msg_espera=None) -> tuple[str|None, str|None, str|None]:
-    """Orquesta el Analista, el ThreadPool y el Generador Goldman Sachs."""
-         
-    # 1. Extractor (JSON)
-    if msg_espera: await msg_espera.edit_text("🔍 Analizando el sector e infiriendo riesgo implícito del inversor...")
-    extraccion = extractor_intenciones(solicitud)
-    
-    if not extraccion or 'tickers' not in extraccion:
-        return "❌ Disculpa, nuestro Extractor Quants falló al decodificar tu petición. Intenta ser más claro.", None, None
-        
-    perfil = extraccion.get("perfil", "Balanceado")
-    tickers = extraccion.get("tickers", [])
-    sector = extraccion.get("sector", "Múltiple")
-    
-    if len(tickers) == 0:
-        return "❌ El modelo no ha devuelto empresas viables para ese nicho.", None, None
-        
-    if msg_espera: await msg_espera.edit_text(f"🛠️ Extracción superada. Perfil inferido: **{perfil}**.\nLanzando escáner matemático a {len(tickers)} empresas simultáneamente...")
-    
-    # 2. Asignación de Umbrales Dinámicos según el Perfil de Riesgo
-    if perfil == "Seguro":
-        max_per = 35
-        min_div = 0.015
-    elif perfil == "Riesgo":
-        max_per = 15
-        min_div = 0.0
-    else:               # Balanceado
-        max_per = 23
-        min_div = 0.005
-        
-    import operator
-    ops = {
-        ">": operator.gt,
-        "<": operator.lt,
-        ">=": operator.ge,
-        "<=": operator.le,
-        "==": operator.eq,
-        "=": operator.eq
-    }
-        
-    # Aplicar Extracciones Explícitas desde el array de filtros dinámicos
-    filtros_array = extraccion.get("filtros_dinamicos", [])
-    rendimiento_objetivo = 0.0
-    rendimiento_op = operator.ge
-    per_op = operator.lt
-    div_op = operator.ge
-    div_abs_op = operator.ge
-    min_div_pct = min_div
-    min_div_abs = 0.0
-    temporalidad_historico = "3mo"
-    
-    # 8 Dimensiones Avanzadas (Mapeo a Yahoo Finance)
-    metricas_avanzadas = {
-        "crecimiento_ingresos": "revenueGrowth",
-        "precio_ventas": "priceToSalesTrailing12Months",
-        "precio_valor_contable": "priceToBook",
-        "per_futuro": "forwardPE",
-        "roe": "returnOnEquity",
-        "margen_beneficio": "profitMargins",
-        "deuda_capital": "debtToEquity",
-        "beta": "beta"
-    }
-    filtros_extra = []
-    ignorar_per_estricto = False
-    
-    for f in filtros_array:
-        metrica = f.get("metrica", "")
-        valor = f.get("valor")
-        operador_str = f.get("operador", "")
-        
-        if metrica.lower() == "per" and valor is not None:
-            try: 
-                max_per = float(valor)
-                if operador_str in ops: per_op = ops[operador_str]
-            except: pass
-        elif "rendimiento" in metrica.lower() and valor is not None:
-            try: 
-                rendimiento_objetivo = float(valor)
-                if operador_str in ops: rendimiento_op = ops[operador_str]
-            except: pass
-            if f.get("temporalidad"):
-                temporalidad_historico = f.get("temporalidad")
-        elif metrica.lower() == "dividendo_porcentaje" and valor is not None:
-            try: 
-                min_div_pct = float(valor)
-                if min_div_pct > 1: min_div_pct = min_div_pct / 100
-                if operador_str in ops: div_op = ops[operador_str]
-            except: pass
-        elif metrica.lower() == "dividendo_absoluto" and valor is not None:
-            try:
-                min_div_abs = float(valor)
-                if operador_str in ops: div_abs_op = ops[operador_str]
-            except: pass
-        elif metrica.lower() in metricas_avanzadas and valor is not None:
-            try:
-                vf = float(valor)
-                if metrica.lower() in ["crecimiento_ingresos", "roe", "margen_beneficio"] and vf > 1:
-                    vf = vf / 100.0
-                op_fn = operator.ge
-                if operador_str in ops: op_fn = ops[operador_str]
-                filtros_extra.append({"key": metricas_avanzadas[metrica.lower()], "op": op_fn, "val": vf})
-                
-                # Si piden crecimiento agresivo o ventas, desactivar el estrangulador de PER clásico
-                if metrica.lower() in ["crecimiento_ingresos", "precio_ventas", "per_futuro"]:
-                    ignorar_per_estricto = True
-            except: pass
-            
-    if ignorar_per_estricto:
-        max_per = 99999
-                
-    def chequear_fundamentales(t):
-        try:
-            info = yf.Ticker(t).info
-            per = info.get('trailingPE', 999)
-            div_yield = info.get('dividendYield', 0)
-            if div_yield is None: div_yield = 0
-            
-            div_rate = info.get('dividendRate', 0)
-            if div_rate is None: div_rate = 0
-            
-            # Arreglo para la API de Yahoo que a veces devuelve % (ej: 4.55) en lugar de decimal (0.0455). Las divisiones de dividenYield ya deberian ser limpias.
-            div_pct = round(div_yield, 2) if div_yield >= 1 else round(div_yield * 100, 2)
-            
-            pasa_extras = True
-            for fex in filtros_extra:
-                yfin_val = info.get(fex["key"])
-                if yfin_val is None or not fex["op"](yfin_val, fex["val"]):
-                    pasa_extras = False
-                    break
-            
-            if per_op(per, max_per) and div_op(div_yield, min_div_pct) and div_abs_op(div_rate, min_div_abs) and pasa_extras:
-                return {
-                    "ticker": t,
-                    "per": round(per, 2) if per != 999 else "N/A",
-                    "div_yield_pct": div_pct,
-                    "div_rate_abs": round(div_rate, 2)
-                }
-            return None
-        except:
-            return None
-            
-    # Lanzamos ThreadPoolExecutor limitado a 10 hilos para proteger contra Error 429 de YFinance
-    loop = asyncio.get_running_loop()
-    with concurrent.futures.ThreadPoolExecutor(max_workers=10) as pool:
-        tareas = [loop.run_in_executor(pool, chequear_fundamentales, t) for t in tickers]
-        resultados = await asyncio.gather(*tareas)
-        
-    pre_ganadores = [r for r in resultados if r is not None]
-    
-    if not pre_ganadores:
-        msg_fin = f"❌ Filtro Aniquilador. He barrido asíncronamente {len(tickers)} empresas buscando (PER < {max_per}, Dividendo > {min_div_pct*100}%, Tasa > {min_div_abs}) para perfil '{perfil}'.\nMercado actual deficiente: NINGUNA cumple hoy tus requisitos puros."
-        return msg_fin, None, None
-        
-    if msg_espera: await msg_espera.edit_text(f"🔥 ¡Criba inicial extrema superada por {len(pre_ganadores)} empresas!\nComprobando rendimiento histórico de 3M (buscando Tendencia Alcista obligatoria)...")
-    
-    mejor_opcion = None
-    ruta_captura_final = None
-    
-    # Comprobación de gráficos visual (Rendimiento exige cumplir el operador dinámico)
-    for gan in pre_ganadores:
-        t = gan["ticker"]
-        ruta, rend = fabricante_de_graficos(t, periodo=temporalidad_historico)
-        if rend is not None and rendimiento_op(rend, rendimiento_objetivo):
-            mejor_opcion = gan
-            mejor_opcion["rendimiento_real"] = round(rend, 2)
-            ruta_captura_final = ruta
-            break
-        elif ruta and os.path.exists(ruta):
-            # Eliminamos basura estéril
-            os.remove(ruta)
-            
-    if not mejor_opcion:
-        msg_fin = f"❌ Filtro Matemático Fallido.\n\nHe analizado a fondo las 40 empresas propuestas para tu nicho, pero **NINGUNA** ha sido capaz de cumplir el umbral crítico de gráfico que exigiste: que su rendimiento sea {rendimiento_objetivo}%.\n\nEl bot Quant es estricto y no recomienda aproximaciones mediocres. Intenta relajar ligeramente tu petición numérica."
-        return msg_fin, None, None
-        
-    if msg_espera: await msg_espera.edit_text(f"✅ ¡Aguja en el pajar localizada! Ticker final: {mejor_opcion['ticker']}.\nRedactando sumario ejecutivo Goldman Sachs...")
-    
-    # 3. Generador Goldman Sachs
-    informe_gs = generador_informe_goldman(mejor_opcion['ticker'], sector, mejor_opcion, perfil)
-    if not informe_gs:
-        informe_gs = f"Datos Crudos: {mejor_opcion['ticker']} | PER: {mejor_opcion['per']} | Rendimiento ({temporalidad_historico}): {mejor_opcion['rendimiento_real']}%"
-        
-    informe_gs = informe_gs.replace('*', '') # Limpieza forzosa de Markdown
-        
-    url_compra = f"https://finance.yahoo.com/quote/{mejor_opcion['ticker']}"
-    texto_final = f"⚡ ALERTA DE ESTRATEGIA: {mejor_opcion['ticker']}\n📈 Momentum ({temporalidad_historico}): +{mejor_opcion['rendimiento_real']}%\n\n{informe_gs}"
-
-    return texto_final, ruta_captura_final, url_compra
-
-# --- 4. TELEGRAM BOT HANDLERS ---
-
-async def comando_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    mensaje = (
-        f"🤖 Plataforma Ejecutiva de Banca y Quants, Sr. {user.first_name}.\n\n"
-        "Configura tus intenciones. El motor híbrido deducirá automáticamente si buscas:\n"
-        "• Blue Chips seguras\n"
-        "• Gemas de Mid/Small Cap (Riesgo)\n\n"
-        "¿Qué nicho investigamos hoy? (Usa /menu para suscripciones)"
-    )
-    await update.message.reply_text(mensaje)
-
-async def comando_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    teclado = InlineKeyboardMarkup([
-        [InlineKeyboardButton("🔗 Configurar mi Broker (URL)", callback_data="pedir_url")],
-        [InlineKeyboardButton("🔔 Configurar Alerta (6h)", callback_data="alerta_6")],
-        [InlineKeyboardButton("🔔 Configurar Alerta (12h)", callback_data="alerta_12")],
-        [InlineKeyboardButton("🛑 Detener Alertas", callback_data="alerta_stop")]
-    ])
-    await update.message.reply_text(
-        "⚙️ **MENU DE OPERACIONES CRON**\n\n"
-        "Permite que nuestro escáner multi-hilos barra el mercado y te entregue reportes técnicos sobre tu último nicho automáticamente.",
-        reply_markup=teclado,
-        parse_mode="Markdown"
-    )
-
-async def ejecutar_tarea_programada(context: ContextTypes.DEFAULT_TYPE):
-    chat_id = context.job.chat_id
-    solicitud = context.job.data
-    logger.info(f"[*] Lanzando Cron Job Híbrido al chat {chat_id}: {solicitud}")
-    
-    texto_final, ruta_captura, url_compra = await pipeline_hibrido(solicitud, msg_espera=None)
-    
-    if not url_compra:  # Hubo un fallo puramente lógico/api
-        return
-        
-    user_data = context.application.user_data.get(chat_id, {})
-    broker_url = user_data.get('broker_url')
-    
-    botones = []
-    if broker_url:
-        botones.append([InlineKeyboardButton(text="Comprar en tu Broker 🛒", url=broker_url)])
-        botones.append([InlineKeyboardButton(text="Métricas en Yahoo Finance 📈", url=url_compra)])
-    else:
-        botones.append([InlineKeyboardButton(text="Acciones en Yahoo Finance 📈", url=url_compra)])
-        
-    teclado = InlineKeyboardMarkup(botones)
-    
-    try:
-        if ruta_captura and os.path.exists(ruta_captura):
-            with open(ruta_captura, 'rb') as foto:
-                try:
-                    await context.bot.send_photo(chat_id=chat_id, photo=foto, caption=texto_final, reply_markup=teclado, read_timeout=60, write_timeout=60, connect_timeout=60)
-                except Exception:
-                    await context.bot.send_message(chat_id=chat_id, text=texto_final, reply_markup=teclado)
-            os.remove(ruta_captura)
-        else:
-            await context.bot.send_message(chat_id=chat_id, text=texto_final, reply_markup=teclado)
-    except Exception as e:
-        logger.error(f"Fallo cron: {e}")
-
-async def manejador_botones(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    chat_id = update.effective_chat.id
-    
-    if query.data == "pedir_url":
-        context.user_data['estado'] = "ESPERANDO_URL"
-        await query.edit_message_text(text="🏦 **CONFIGURACIÓN DE CONEXIÓN A BROKER**\n\nPégame el enlace absoluto de la plataforma o broker donde suelas operar (Ej: `https://www.degiro.es`).\n\nA partir de ahora, todas las señales ganadoras tendrán un atajo directo a tu plataforma elegida.", parse_mode="Markdown")
-        return
-        
-    if query.data == "alerta_stop":
-        trabajos_actuales = context.job_queue.get_jobs_by_name(str(chat_id))
-        if not trabajos_actuales:
-            await query.edit_message_text(text="ℹ️ Protocolo vacío. No posees cron jobs activos.")
-            return
-        for job in trabajos_actuales: job.schedule_removal()
-        await query.edit_message_text(text="✅ Cron Jobs abortados en el servidor.")
-        return
-        
-    ultima_busqueda = context.user_data.get('ultima_busqueda', "empresas emergentes tecnológicas")
-    intervalo_horas = int(query.data.split("_")[1])
-    
-    trabajos_actuales = context.job_queue.get_jobs_by_name(str(chat_id))
-    for job in trabajos_actuales: job.schedule_removal()
-        
-    context.job_queue.run_repeating(
-        ejecutar_tarea_programada,
-        interval=intervalo_horas * 3600,
-        first=10, 
-        chat_id=chat_id,
-        name=str(chat_id),
-        data=ultima_busqueda
-    )
-    await query.edit_message_text(
-        text=f"✅ **¡JOB ASIGNADO!**\n\nEl cluster asíncrono lanzará reportes de tu nicho *'{ultima_busqueda}'* cada **{intervalo_horas} horas**.\nPuedes desactivarlo desde /menu.",
-        parse_mode="Markdown"
-    )
-
-async def conversacion_inversor(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    solicitud = update.message.text
-    
-    # Manejar estado de configuración de Broker
-    if context.user_data.get('estado') == "ESPERANDO_URL":
-        url_detectada = extraer_url(solicitud)
-        if url_detectada and es_url_valida(url_detectada):
-            context.user_data['broker_url'] = url_detectada
-            context.user_data['estado'] = None
-            await update.message.reply_text(f"✅ **Lazo Broker conectado.**\nA partir de ahora todas tus órdenes prioritarias redirigirán a:\n{url_detectada}")
-        else:
-            context.user_data['estado'] = None
-            await update.message.reply_text("❌ URL Inválida. Protocolo Cancelado.")
-        return
-        
-    context.user_data['ultima_busqueda'] = solicitud
-    
-    msg_espera = await update.message.reply_text("⏳ Conectando con los Agentes Quants...")
-    
-    texto_final, ruta_captura, url_compra = await pipeline_hibrido(solicitud, msg_espera)
-    
-    # Si hubo error o timeout
-    if not url_compra:
-        await msg_espera.edit_text(texto_final)
-        return
-        
-    broker_url = context.user_data.get('broker_url')
-    botones = []
-    if broker_url:
-        botones.append([InlineKeyboardButton(text="Ejecutar Compra en Broker 🛒", url=broker_url)])
-        botones.append([InlineKeyboardButton(text="Validar en Yahoo Finance 📈", url=url_compra)])
-    else:
-        botones.append([InlineKeyboardButton(text="Acciones en Yahoo Finance 📈", url=url_compra)])
-        
-    teclado = InlineKeyboardMarkup(botones)
-    
-    try:
-        if ruta_captura and os.path.exists(ruta_captura):
-            with open(ruta_captura, 'rb') as foto:
-                try:
-                    await update.message.reply_photo(photo=foto, caption=texto_final, reply_markup=teclado, read_timeout=60, write_timeout=60, connect_timeout=60)
-                except Exception as e:
-                    await update.message.reply_text(texto_final, reply_markup=teclado)
-            os.remove(ruta_captura)
-        else:
-            await update.message.reply_text(texto_final, reply_markup=teclado)
-            
-        await msg_espera.delete()
-        
-    except Exception as e:
-        logger.error(f"Telegram API: {e}")
-        await msg_espera.edit_text("Fallo propagando la respuesta al chat de Telegram.")
-
-async def configuracion_post_inicio(application: Application):
-    comandos = [
-        BotCommand("start", "Bootear plataforma Quant"),
-        BotCommand("menu", "Configurar Cron Jobs de radar")
-    ]
-    await application.bot.set_my_commands(comandos, scope=BotCommandScopeDefault())
-
-def main():
-    app = Application.builder().token(TELEGRAM_TOKEN).read_timeout(60).write_timeout(60).post_init(configuracion_post_inicio).build()
-    app.add_handler(CommandHandler("start", comando_start))
-    app.add_handler(CommandHandler("menu", comando_menu))
-    app.add_handler(CallbackQueryHandler(manejador_botones))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, conversacion_inversor))
-    
-    logger.info("Plataforma Hibrída Asíncrona (Goldman Sachs Edition) ONLINE.")
-    app.run_polling()
-
-if __name__ == "__main__":
-    main()
-'''
 import os
 import re
 import json
 import logging
 import asyncio
 import operator
+import tempfile
+import time
 import concurrent.futures
 import yfinance as yf
 import matplotlib
@@ -537,8 +16,13 @@ from google.genai import types
 from dotenv import load_dotenv
 from telegram import Update, BotCommand, BotCommandScopeDefault, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, filters, ContextTypes
+from fastapi import FastAPI, HTTPException, Request
+import uvicorn
+import stripe
 
-# Configurar el registro (log)
+import database as db
+
+# Configurar logging
 logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO)
 logger = logging.getLogger(__name__)
 logging.getLogger("google_genai").setLevel(logging.WARNING)
@@ -546,313 +30,1379 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 
 # Cargar las claves API
 load_dotenv()
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+TELEGRAM_TOKEN   = os.getenv("TELEGRAM_TOKEN")
+GEMINI_API_KEY   = os.getenv("GEMINI_API_KEY")
+STRIPE_API_KEY   = os.getenv("STRIPE_API_KEY", "")   # sk_live_... o sk_test_...
+
+# Inicializar Stripe (necesario para el SDK, aunque no usemos la API REST por ahora)
+import stripe as _stripe_init
+_stripe_init.api_key = STRIPE_API_KEY
 
 if not TELEGRAM_TOKEN or not GEMINI_API_KEY:
-    logger.error("Falta tu token de Telegram o API de Google. Revisa el archivo .env")
+    logger.error("Falta TELEGRAM_TOKEN o GEMINI_API_KEY en .env")
     exit(1)
 
 try:
     client = genai.Client(api_key=GEMINI_API_KEY)
 except Exception as e:
-    logger.error(f"Error cargando SDK Gemini v2: {e}")
+    logger.error(f"Error inicializando SDK Gemini v2: {e}")
     exit(1)
+
+# --- CONSTANTES GLOBALES ---
+
+OPS = {
+    ">": operator.gt, "<": operator.lt, ">=": operator.ge,
+    "<=": operator.le, "==": operator.eq, "=": operator.eq
+}
+
+METRICAS_YF = {
+    "per": "trailingPE",
+    "dividendos_yield": "dividendYield",
+    "dividendo_porcentaje": "dividendYield",
+    "dividendo_absoluto": "dividendRate",
+    "beta": "beta",
+    "crecimiento_ingresos": "revenueGrowth",
+    "precio_ventas": "priceToSalesTrailing12Months",
+    "precio_valor_contable": "priceToBook",
+    "per_futuro": "forwardPE",
+    "roe": "returnOnEquity",
+    "margen_beneficio": "profitMargins",
+    "deuda_capital": "debtToEquity",
+    "deuda_equity": "debtToEquity",
+    "precio_book": "priceToBook",
+}
+
+METRICAS_PORCENTUALES = {
+    "dividendos_yield", "dividendo_porcentaje", "crecimiento_ingresos",
+    "roe", "margen_beneficio",
+}
+
+FUENTES_DATOS = {
+    "yahoo":       {"nombre": "Yahoo Finance",  "url": "https://finance.yahoo.com/quote/{ticker}"},
+    "tradingview": {"nombre": "TradingView",     "url": "https://www.tradingview.com/symbols/{ticker}"},
+    "investing":   {"nombre": "Investing.com",   "url": "https://www.investing.com/search/?q={ticker}"},
+}
+
 
 # --- 1. AGENTES DE IA (EXTRACTOR Y GENERADOR) ---
 
 def extractor_intenciones(prompt_del_inversor: str) -> dict | None:
+    """Extrae clase de activo, perfil, sector, tickers y filtros del input usando Gemini."""
     prompt_sistema = """
-    Rol: Actúa como un Analista de Datos Financieros especializado en el mercado global.
-    Tarea: Generar una lista de exactamente 40 tickers de acciones implícitas en el input.
-    
-    1. Perfil: "Seguro", "Riesgo" o "Balanceado".
-    2. Filtro Tamaño: PROHIBIDO Top 50 del S&P 500 a menos que sea perfil "Seguro". PRIORIZA Mid/Small-Cap.
-    3. Internacionales: Añade sufijo local obligatorio si es fuera de EEUU (ej: .MC para España, .L para Londres).
-    4. Overrides Dinámicos: Crea el array `filtros_dinamicos` solo si hay restricciones numéricas.
-       Métricas: "per", "rendimiento", "dividendos_yield", "beta", "crecimiento_ingresos", "margen_beneficio", "roe", "precio_book", "deuda_equity".
-       Ej: {"metrica": "crecimiento_ingresos", "operador": ">", "valor": 0.20}
-    5. Temporalidad: Si la métrica es "rendimiento", añade `temporalidad` (1d, 5d, 1mo, 3mo, 6mo, 1y, ytd).
-    
-    RESPONDE SOLO EN JSON:
+    Rol: Actúa como un Analista de Datos Financieros Global, experto en todos los mercados.
+
+    🚨 REGLA ANTI-TROLL ESTRICTA:
+    Si el input NO es sobre finanzas, bolsa, inversiones, criptomonedas o economía,
+    devuelve INMEDIATAMENTE:
+    {"error_api": "Petición rechazada. Solo proceso consultas financieras."}
+
+    ℹ️ Si es una consulta financiera válida, responde EXCLUSIVAMENTE con el JSON al final.
+
+    ══ PASO 1: DETECTAR CLASE DE ACTIVO ══
+    Clasifica la intención del usuario en UNA de estas clases:
+    • "ACCION"  → Empresas y acciones de bolsa (el valor por defecto).
+    • "REIT"    → Inmobiliario en bolsa (SOCIMIs, REITs). Palabras clave: ladrillo, alquiler, REIT, SOCIMI, inmobiliaria.
+    • "ETF"     → Fondos indexados y ETFs. Palabras clave: ETF, fondo indexado, VUSA, SPY, QQQ, indexado.
+    • "CRIPTO"  → Criptomonedas y tokens DeFi. Palabras clave: cripto, bitcoin, ethereum, defi, token, blockchain.
+    • "BONO"    → Renta fija, bonos, deuda. Palabras clave: bono, tesoro, deuda, renta fija, obligación.
+
+    ══ PASO 2: GENERAR TICKERS (40 unidades) ══
+    Genera exactamente 40 tickers de Yahoo Finance para la clase de activo detectada.
+    • ACCION: Tickers de empresas (ej: AAPL, SAN.MC).
+    • REIT: Tickers de REITs/SOCIMIs (ej: O, VNQ, STAG, PLD, COL.MC).
+    • ETF: Tickers de ETFs (ej: SPY, QQQ, VTI, VUSA.L, IWDA.L).
+    • CRIPTO: Tickers de cripto en Yahoo (ej: BTC-USD, ETH-USD, SOL-USD, LINK-USD).
+    • BONO: Tickers de ETFs de bonos en Yahoo (ej: TLT, IEF, AGG, EMB, TIP).
+    Regla Perfil:
+      - "Seguro": líderes del sector / large-cap / blue-chip.
+      - "Riesgo": mid/small-cap, especulativos, desconocidos.
+      - "Balanceado": mezcla.
+    Sufijos internacionales: .MC (España), .L (Londres), .DE (Alemania), .PA (París).
+
+    ══ PASO 3: FILTROS DINÁMICOS (solo si el usuario exige restricciones numéricas) ══
+    Si el usuario NO exige restricciones, `filtros_dinamicos` DEBE ser `[]`.
+    Si hay restricciones, crea UN objeto por cada exigencia.
+
+    Métricas válidas por clase de activo:
+    | Clase   | Métricas disponibles                                                             |
+    |---------|---------------------------------------------------------------------------------|
+    | ACCION  | per, rendimiento, dividendo_porcentaje, dividendo_absoluto, roe, margen_beneficio, beta, deuda_capital, crecimiento_ingresos |
+    | REIT    | p_ffo, dividend_yield, ocupacion, ltv                                           |
+    | ETF     | ter, aum, dividend_yield, rendimiento                                           |
+    | CRIPTO  | rendimiento, market_cap                                                         |
+    | BONO    | dividend_yield, rendimiento, duracion                                            |
+
+    TABLA DE TRADUCCIÓN (acciones y equivalentes):
+    | Expresión del usuario           | Traducción                                                          |
+    |----------------------------------|----------------------------------------------------------------------|
+    | "PER bajo"                       | {"metrica": "per", "operador": "<", "valor": 15.0}               |
+    | "dividendo alto" / "generoso"    | {"metrica": "dividendo_porcentaje", "operador": ">", "valor": 4.0} |
+    | "dividendo estable"              | {"metrica": "dividendo_porcentaje", "operador": ">", "valor": 2.0} |
+    | "alta rentabilidad"              | {"metrica": "roe", "operador": ">", "valor": 15.0}               |
+    | "deuda baja"                     | {"metrica": "deuda_capital", "operador": "<", "valor": 50.0}     |
+    | "empresa estábil"               | {"metrica": "beta", "operador": "<", "valor": 0.8}               |
+    | "crecimiento agresivo"           | {"metrica": "crecimiento_ingresos", "operador": ">", "valor": 20.0} |
+    | ETF "barato" / "low cost"        | {"metrica": "ter", "operador": "<", "valor": 0.2}                |
+    | ETF "grande" / "líquido"        | {"metrica": "aum", "operador": ">", "valor": 1000000000.0}       |
+    | REIT "buena ocupación"          | {"metrica": "ocupacion", "operador": ">", "valor": 90.0}         |
+    | REIT "dividendo alto"            | {"metrica": "dividend_yield", "operador": ">", "valor": 4.0}     |
+    | Cripto "gran capitaliz."         | {"metrica": "market_cap", "operador": ">", "valor": 1000000000.0} |
+
+    🚨 MULTI-RESTRICCIÓN: Si el usuario pide 3 cosas, el array DEBE tener 3 objetos.
+
+    RESPONDE EXCLUSIVAMENTE CON ESTE JSON:
     {
-      "perfil": "Seguro",
-      "sector": "Sector inferido",
-      "tickers": ["TKR1", "TKR2"],
-      "filtros_dinamicos": [] 
+      "clase_activo": "ACCION"|"REIT"|"ETF"|"CRIPTO"|"BONO",
+      "perfil": "Seguro"|"Riesgo"|"Balanceado",
+      "sector": "El sector o categoría inferida",
+      "tickers": ["TKR1", ..., "TKR40"],
+      "filtros_dinamicos": []
     }
     """
     try:
         res = client.models.generate_content(
-            model='gemini-2.5-flash',
+            model='gemini-2.0-flash',
             contents=f"{prompt_sistema}\n\n[INPUT USUARIO]: {prompt_del_inversor}",
             config=types.GenerateContentConfig(response_mime_type="application/json")
         )
         texto = re.sub(r"^```[a-zA-Z]*\n?", "", res.text.strip())
-        return json.loads(re.sub(r"```$", "", texto.strip()))
+        texto = re.sub(r"```$", "", texto.strip())
+        return json.loads(texto)
+    except json.JSONDecodeError as je:
+        logger.error(f"JSON decode error en Extractor: {je}")
+        return None
     except Exception as e:
         if "429" in str(e):
-            logger.warning("Límite de Google AI alcanzado. Esperando enfriamiento.")
-            return {"error_api": "Demasiadas peticiones. El motor Quant necesita 60 segundos para enfriarse."}
-        logger.error(f"Error Extractor JSON: {e}")
+            logger.warning("Rate limit de Google AI alcanzado.")
+            return {"error_api": "Demasiadas peticiones. El motor Quant necesita 60s para enfriarse."}
+        logger.error(f"Error Extractor: {e}")
         return None
 
-def generador_informe_goldman(ticker: str, sector: str, datos: dict, perfil: str) -> str | None:
-    prompt_sistema = """
-    Rol: Director de Estrategia Cuantitativa Tier-1.
-    Tarea: Redactar un 'Flash Note' ejecutivo ultracorto basado ESTRICTAMENTE en los números provistos.
-    Tono: Implacable, técnico, institucional. Restricciones: SIN NEGRITAS ni asteriscos. No inventes.
-    Estructura:
-    🎯 Tesis de Inversión: [Frase lapidaria]
-    📊 Fundamentales: [Ticker, Sector y métricas clave en viñetas lisas]
+
+def generador_informe_goldman(ticker: str, sector: str, datos: dict, perfil: str, clase_activo: str = "ACCION") -> str | None:
+    """Genera un informe estilo Goldman Sachs adaptado a la clase de activo.
+    
+    Técnicas aplicadas:
+    - Sanitización: se eliminan campos N/A o None antes de enviar a la IA.
+    - Few-Shot Prompting: se incluye un ejemplo real de informe por clase de activo.
+    - Restricciones Negativas: se prohíbe explícitamente mencionar métricas
+      que no correspondan a la clase de activo analizado.
+    """
+
+    # ── Técnica 1: SANITIZACIÓN ─────────────────────────────────────────────
+    # Eliminamos claves con valor None, "N/A" o 0 para reducir el ruido.
+    # Si la IA no ve el campo "per" en los datos, no tiene incentivo para mencionarlo.
+    datos_limpios = {
+        k: v for k, v in datos.items()
+        if v is not None and v != "N/A" and v != 0 and v != 0.0
+    }
+
+    # ── Técnica 2: FEW-SHOT PROMPTING ───────────────────────────────────────
+    # Ejemplos reales de cómo debe lucir el informe para cada clase de activo.
+    # La IA aprende por imitación de patrones; si ves el patrón de ETF, lo seguirás.
+    ejemplos_por_clase = {
+        "ACCION": """
+Ejemplo de Flash Note para ACCION:
+  Ticker: MSFT | Sector: Tecnología
+  🎯 Tesis de Inversión: Microsoft mantiene su foso económico en productividad empresarial gracias a la integración de Azure y Microsoft 365.
+  📊 Fundamentales:
+    - Dividend Yield: 0.72%
+    - ROE: 38.5%
+    - Margen Neto: 36.2%
+    - Beta: 0.90
+  ⚖️ Veredicto: Posición defensiva con crecimiento estructural. Adecuada para perfil Seguro/Balanceado.""",
+
+        "ETF": """
+Ejemplo de Flash Note para ETF:
+  Ticker: IWDA.L | Categoría: Renta Variable Global
+  🎯 Tesis de Inversión: IWDA ofrece exposición diversificada a mercados desarrollados con un coste mínimo, ideal como núcleo de cartera pasiva.
+  📊 Fundamentales:
+    - TER (Coste Anual): 0.20%
+    - AUM: 68.4 Bn USD
+    - Dividend Yield: 1.45%
+    - Momentum 3m: +4.2%
+  ⚖️ Veredicto: Vehículo eficiente para indexación. Coste competitivo y liquidez institucional garantizada.""",
+
+        "REIT": """
+Ejemplo de Flash Note para REIT:
+  Ticker: O | Tipo: REIT Minorista (Net Lease)
+  🎯 Tesis de Inversión: Realty Income es el referente de los REITs de renta mensual, con contratos triple-net que blindan el flujo de caja ante la inflación.
+  📊 Fundamentales:
+    - Dividend Yield: 5.8%
+    - P/Book (proxy P/FFO): 1.3x
+    - Sector: Real Estate
+    - Momentum 3m: +2.1%
+  ⚖️ Veredicto: Generador de rentas predecible. Adecuado para carteras de renta pasiva.""",
+
+        "CRIPTO": """
+Ejemplo de Flash Note para CRIPTO:
+  Ticker: ETH-USD | Red: Ethereum (Proof of Stake)
+  🎯 Tesis de Inversión: Ethereum lidera el ecosistema DeFi y NFT con una base de desarrolladores sin rival, respaldada por el mecanismo deflacionario post-Merge.
+  📊 Fundamentales:
+    - Market Cap: 298.4 Bn USD
+    - Momentum 1m: +12.5%
+    - Nombre: Ethereum
+  ⚖️ Veredicto: Activo especulativo de alta convicción. Adecuado solo para perfil Riesgo con horizonte largo.""",
+
+        "BONO": """
+Ejemplo de Flash Note para BONO:
+  Ticker: TLT | Tipo: ETF de Bonos del Tesoro USA a Largo Plazo
+  🎯 Tesis de Inversión: TLT actúa como cobertura deflacionaria y refugio ante recesión, con elevada sensibilidad a los movimientos de la curva de tipos.
+  📊 Fundamentales:
+    - YTM / Cupón Proxy: 4.35%
+    - AUM: 41.2 Bn USD
+    - Momentum 3m: -1.8%
+  ⚖️ Veredicto: Instrumento de cobertura y renta fija. Indicado para perfiles conservadores en entornos de alta incertidumbre.""",
+    }
+    ejemplo = ejemplos_por_clase.get(clase_activo, ejemplos_por_clase["ACCION"])
+
+    # ── Técnica 3: RESTRICCIONES NEGATIVAS ──────────────────────────────────
+    # Prohibiciones explícitas según clase de activo para evitar el sesgo de entrenamiento.
+    prohibiciones_por_clase = {
+        "ACCION": "",  # Para acciones, todas las métricas son válidas.
+        "ETF": (
+            "PROHIBIDO mencionar PER, PEG, EPS o BPA. "
+            "PROHIBIDO mencionar Dividendos como si fuera una empresa. "
+            "En un ETF se llama 'Dividend Yield' o 'distribución', NO 'dividendo por acción'. "
+            "Centra el análisis en TER, AUM y diversificación."
+        ),
+        "REIT": (
+            "PROHIBIDO usar el término PER o Price-to-Earnings. "
+            "El ratio de valoración correcto para REITs es P/FFO o P/AFFO. "
+            "Centra el análisis en Dividend Yield y la calidad del portfolio inmobiliario."
+        ),
+        "CRIPTO": (
+            "PROHIBIDO mencionar PER, Dividendos, FFO o TER. Las criptomonedas no tienen esos conceptos. "
+            "Centra el análisis en Market Cap, momentum de precio y utilidad del protocolo o red."
+        ),
+        "BONO": (
+            "PROHIBIDO mencionar PER, PEG o cualquier ratio de valoración de acciones. "
+            "PROHIBIDO llamar 'dividendo' al cupón. Usa siempre 'Cupón', 'YTM' (Yield to Maturity) o 'rendimiento'. "
+            "Centra el análisis en el YTM, la duración y el riesgo de tipo de interés."
+        ),
+    }
+    restricciones_negativas = prohibiciones_por_clase.get(clase_activo, "")
+
+    prompt_sistema = f"""
+    Rol: Eres un Director de Estrategia Cuantitativa (Quants) Tier-1 (estilo Goldman Sachs).
+    Tarea: Redactar un 'Flash Note' ejecutivo ultracorto para banca privada basado ESTRICTAMENTE en los datos proporcionados.
+    Clase de activo analizado: {clase_activo}
+
+    === EJEMPLO DE REFERENCIA (imita este estilo y estructura EXACTAMENTE) ===
+    {ejemplo}
+    === FIN DEL EJEMPLO ===
+
+    Tono: Implacable, técnico, institucional.
+    Restricción 1: Habla estrictamente en ESPAÑOL. Usa "Foso económico" en vez de Moat.
+    Restricción 2: PROHIBIDO USAR NEGRITAS, cursivas o asteriscos (*). Escribe en texto plano.
+    Restricción 3: NO INVENTES PROYECCIONES. Si un dato falta en los datos recibidos, omítelo. NO lo inventes.
+    Restricción 4 (CRÍTICA): {restricciones_negativas if restricciones_negativas else 'Usa las métricas que correspondan a la clase de activo.'}
+
+    Estructura Obligatoria (igual que el ejemplo):
+    🎯 Tesis de Inversión: [Una frase lapidaria]
+    📊 Fundamentales: [Métricas en viñetas lisas, SOLO las que aparecen en los datos]
     ⚖️ Veredicto: [Cierre pragmático]
     """
     try:
         res = client.models.generate_content(
             model='gemini-2.5-flash',
-            contents=f"{prompt_sistema}\n\nPerfil: {perfil} | Sector: {sector}\n[DATOS ORO DE {ticker}]: {json.dumps(datos)}"
+            contents=(
+                f"{prompt_sistema}\n\n"
+                f"Perfil Cliente: {perfil} | Sector/Categoría: {sector}\n"
+                f"[DATOS VERIFICADOS DE {ticker}]: {json.dumps(datos_limpios)}\n"
+                f"RECUERDA: Usa SOLO los datos anteriores. NO USES ASTERISCOS EN TU RESPUESTA."
+            )
         )
         return res.text.replace('*', '').strip()
     except Exception as e:
         logger.error(f"Error Generador GS: {e}")
         return None
 
+
 # --- 2. HERRAMIENTAS MATEMÁTICAS LOCALES ---
 
-def fabricante_de_graficos(ticker: str, periodo: str = "3mo"):
+def fabricante_de_graficos(ticker: str, periodo: str = "3mo") -> tuple[str | None, float | None]:
+    """Genera gráfico PNG en directorio temporal. Retorna (ruta_archivo, rendimiento_%)."""
     try:
         historico = yf.Ticker(ticker).history(period=periodo)
-        if historico.empty: return None, None
-            
-        p_ini, p_fin = historico['Close'].iloc[0], historico['Close'].iloc[-1]
-        rend = ((p_fin - p_ini) / p_ini) * 100
-        
-        color = '#2ca02c' if rend >= 0 else '#d62728'
+        if historico.empty:
+            return None, None
+
+        precio_ini = historico['Close'].iloc[0]
+        precio_fin = historico['Close'].iloc[-1]
+        rendimiento = ((precio_fin - precio_ini) / precio_ini) * 100
+
+        color = '#2ca02c' if rendimiento >= 0 else '#d62728'
         plt.figure(figsize=(10, 5))
         plt.plot(historico.index, historico['Close'], color=color, linewidth=2.5)
         plt.fill_between(historico.index, historico['Close'], historico['Close'].min(), color=color, alpha=0.1)
-        plt.title(f"Alpha: {ticker.upper()} ({periodo})", fontsize=14, fontweight='bold')
+        plt.title(f"Evolución de Alpha: {ticker.upper()} ({periodo})", fontsize=14, fontweight='bold', color='#333333')
+        plt.ylabel('Precio por Acción', fontsize=12)
         plt.grid(True, linestyle='--', alpha=0.5)
-        
-        ruta = f"grafico_{ticker}.png"
-        plt.savefig(ruta, bbox_inches='tight', dpi=80) 
+
+        fd, ruta = tempfile.mkstemp(suffix=f"_{ticker}.png", prefix="quant_")
+        os.close(fd)
+        plt.savefig(ruta, bbox_inches='tight', dpi=80)
         plt.close()
-        return ruta, rend
-    except:
+        return ruta, rendimiento
+    except Exception as e:
+        logger.error(f"Fallo trazando gráfico de {ticker}: {e}")
+        plt.close('all')
         return None, None
 
+
 def es_url_valida(texto: str) -> bool:
-    regex = re.compile(r'^(?:http|ftp)s?://(?:(?:[A-Z0-9](?:[A-Z0-9-]{0,61}[A-Z0-9])?\.)+(?:[A-Z]{2,6}\.?|[A-Z0-9-]{2,}\.?))', re.IGNORECASE)
+    regex = re.compile(
+        r'^(?:http|ftp)s?://'
+        r'(?:(?:[A-Z0-9](?:[A-Z0-9-]{0,61}[A-Z0-9])?\.)+(?:[A-Z]{2,6}\.?|[A-Z0-9-]{2,}\.?)|'
+        r'localhost|'
+        r'\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})'
+        r'(?::\d+)?'
+        r'(?:/?|[/?]\S+)$', re.IGNORECASE)
     return re.match(regex, texto) is not None
+
 
 def extraer_url(texto: str) -> str | None:
     enlaces = re.findall(r'(https?://[^\s]+)', texto)
     return enlaces[0] if enlaces else None
 
+
 # --- 3. EL PIPELINE MAESTRO (ORQUESTADOR) ---
 
-async def pipeline_hibrido(solicitud: str, msg_espera=None):
-    if msg_espera: await msg_espera.edit_text("🔍 Analizando sector e infiriendo métricas Quants...")
-    extraccion = extractor_intenciones(solicitud)
-    
-    if not extraccion or not extraccion.get('tickers'):
-        return "❌ Fallo al decodificar tu petición.", None, None
-        
-    perfil, tickers, sector = extraccion.get("perfil", "Balanceado"), extraccion.get("tickers", []), extraccion.get("sector", "Múltiple")
-    if msg_espera: await msg_espera.edit_text(f"🛠️ Perfil: **{perfil}**. Lanzando escáner matemático a {len(tickers)} empresas...")
-    
-    ops = {">": operator.gt, "<": operator.lt, ">=": operator.ge, "<=": operator.le, "==": operator.eq}
-    mapeo_yf = {
-        "per": "trailingPE", "dividendos_yield": "dividendYield", "beta": "beta", 
-        "crecimiento_ingresos": "revenueGrowth", "margen_beneficio": "profitMargins", 
-        "roe": "returnOnEquity", "precio_book": "priceToBook", "deuda_equity": "debtToEquity"
+def _construir_filtros(perfil: str, filtros_dinamicos: list) -> dict:
+    """Construye el diccionario unificado de filtros combinando perfil base + overrides dinámicos."""
+
+    # Umbrales base según perfil de riesgo
+    if perfil == "Seguro":
+        base_per, base_div_pct, base_div_abs = 35.0, 0.015, 0.0
+    elif perfil == "Riesgo":
+        base_per, base_div_pct, base_div_abs = 15.0, 0.0, 0.0
+    else:  # Balanceado
+        base_per, base_div_pct, base_div_abs = 23.0, 0.005, 0.0
+
+    filtros = {
+        "max_per": base_per,
+        "min_div_pct": base_div_pct,
+        "min_div_abs": base_div_abs,
+        "per_op": operator.lt,
+        "div_op": operator.ge,
+        "div_abs_op": operator.ge,
+        "rendimiento_objetivo": 0.0,
+        "rendimiento_op": operator.ge,
+        "temporalidad": "3mo",
+        "filtros_extra": [],
+        "ignorar_per_estricto": False,
     }
-    
-    filtros = extraccion.get("filtros_dinamicos", [])
-    temporalidad_grafico = "3mo"
-    rendimiento_req = None
-    
-    for f in filtros:
-        if "rendimiento" in f.get("metrica", "").lower():
-            rendimiento_req = {"op": ops.get(f.get("operador", ">")), "val": float(f.get("valor", 0))}
-            temporalidad_grafico = f.get("temporalidad", "3mo")
-            break
 
-    def chequear_fundamentales(t):
-        try:
-            info = yf.Ticker(t).info
-            for f in filtros:
-                metrica = f.get("metrica", "").lower()
-                if "rendimiento" in metrica: continue
-                
-                clave_yf = mapeo_yf.get(metrica)
-                if not clave_yf: continue
-                
-                valor_real = info.get(clave_yf)
-                if valor_real is None: return None
-                
-                valor_requerido = float(f.get("valor", 0))
-                if metrica in ["dividendos_yield", "crecimiento_ingresos", "margen_beneficio", "roe"] and valor_requerido > 1:
-                    valor_requerido /= 100.0
-                    
-                funcion_op = ops.get(f.get("operador", ">"), operator.gt)
-                if not funcion_op(float(valor_real), valor_requerido): return None
-            
-            return {"ticker": t, "per": info.get('trailingPE', 'N/A')}
-        except: return None
-            
+    # Detectar si el usuario pidió explícitamente un PER
+    usuario_pidio_per = any(
+        f.get("metrica", "").lower() == "per" for f in filtros_dinamicos
+    )
+
+    for f in filtros_dinamicos:
+        metrica = f.get("metrica", "").lower()
+        valor = f.get("valor")
+        operador_str = f.get("operador", "")
+
+        if valor is None:
+            continue
+
+        valor = float(valor)
+
+        if metrica == "per":
+            filtros["max_per"] = valor
+            filtros["per_op"] = OPS.get(operador_str, operator.lt)
+
+        elif "rendimiento" in metrica:
+            filtros["rendimiento_objetivo"] = valor
+            filtros["rendimiento_op"] = OPS.get(operador_str, operator.ge)
+            if f.get("temporalidad"):
+                filtros["temporalidad"] = f["temporalidad"]
+
+        elif metrica == "dividendo_porcentaje":
+            if valor > 1:
+                valor /= 100.0
+            filtros["min_div_pct"] = valor
+            filtros["div_op"] = OPS.get(operador_str, operator.ge)
+
+        elif metrica == "dividendo_absoluto":
+            filtros["min_div_abs"] = valor
+            filtros["div_abs_op"] = OPS.get(operador_str, operator.ge)
+
+        elif metrica in METRICAS_YF:
+            if metrica in METRICAS_PORCENTUALES and valor > 1:
+                valor /= 100.0
+            filtros["filtros_extra"].append({
+                "key": METRICAS_YF[metrica],
+                "op": OPS.get(operador_str, operator.ge),
+                "val": valor,
+            })
+            # Solo relajar PER si el usuario NO lo pidió explícitamente
+            if not usuario_pidio_per and metrica in ("crecimiento_ingresos", "precio_ventas", "per_futuro"):
+                filtros["ignorar_per_estricto"] = True
+
+    if filtros["ignorar_per_estricto"]:
+        filtros["max_per"] = 99999.0
+
+    return filtros
+
+
+def _chequear_fundamentales_accion(ticker: str, filtros: dict) -> dict | None:
+    """Verifica si una ACCION pasa los filtros fundamentales."""
+    try:
+        info = yf.Ticker(ticker).info
+        per = info.get('trailingPE', 999)
+        div_yield = info.get('dividendYield', 0) or 0
+        div_rate = info.get('dividendRate', 0) or 0
+        if not filtros["per_op"](per, filtros["max_per"]):
+            return None
+        if not filtros["div_op"](div_yield, filtros["min_div_pct"]):
+            return None
+        if not filtros["div_abs_op"](div_rate, filtros["min_div_abs"]):
+            return None
+        for fex in filtros["filtros_extra"]:
+            yfin_val = info.get(fex["key"])
+            if yfin_val is None or not fex["op"](float(yfin_val), fex["val"]):
+                return None
+        div_pct = round(div_yield * 100, 2) if div_yield < 1 else round(div_yield, 2)
+        return {
+            "ticker": ticker,
+            "per": round(per, 2) if per != 999 else "N/A",
+            "div_yield_pct": div_pct,
+            "div_rate_abs": round(div_rate, 2),
+        }
+    except Exception:
+        return None
+
+
+def _chequear_fundamentales_reit(ticker: str, filtros_extra: list) -> dict | None:
+    """Verifica si un REIT pasa los filtros. Usa FFO (proxy: operatingCashflow/shares) y Dividend Yield."""
+    try:
+        info = yf.Ticker(ticker).info
+        div_yield = info.get('dividendYield', 0) or 0
+        # Yahoo no ofrece FFO directo; usamos priceToBook < 2.5 como proxy de P/FFO razonable
+        p_book = info.get('priceToBook', 999) or 999
+        for f in filtros_extra:
+            if f["metrica"] == "dividend_yield":
+                if not OPS.get(f["operador"], operator.ge)(div_yield * 100, f["valor"]):
+                    return None
+            elif f["metrica"] == "p_ffo":
+                # Proxy: priceToBook como sustituto
+                if not OPS.get(f["operador"], operator.lt)(p_book, f["valor"]):
+                    return None
+        # Requisito mínimo: que pague algún dividendo
+        if div_yield <= 0:
+            return None
+        div_pct = round(div_yield * 100, 2) if div_yield < 1 else round(div_yield, 2)
+        return {
+            "ticker": ticker,
+            "div_yield_pct": div_pct,
+            "p_book_proxy_ffo": round(p_book, 2) if p_book != 999 else "N/A",
+            "sector": info.get("sector", "Real Estate"),
+        }
+    except Exception:
+        return None
+
+
+def _chequear_fundamentales_etf(ticker: str, filtros_extra: list) -> dict | None:
+    """Verifica si un ETF pasa los filtros. Usa TER (annualReportExpenseRatio) y AUM."""
+    try:
+        info = yf.Ticker(ticker).info
+        # TER: annualReportExpenseRatio o totalAssets para AUM
+        ter = info.get('annualReportExpenseRatio') or info.get('expenseRatio') or None
+        aum = info.get('totalAssets') or 0
+        div_yield = info.get('dividendYield', 0) or 0
+        for f in filtros_extra:
+            if f["metrica"] == "ter" and ter is not None:
+                if not OPS.get(f["operador"], operator.lt)(ter, f["valor"]):
+                    return None
+            elif f["metrica"] == "aum":
+                if not OPS.get(f["operador"], operator.ge)(aum, f["valor"]):
+                    return None
+        # Requisito mínimo: que tenga activos bajo gestión > 0
+        if aum <= 0:
+            return None
+        return {
+            "ticker": ticker,
+            "ter_pct": round(ter * 100, 3) if ter else "N/A",
+            "aum_bn": round(aum / 1e9, 2),
+            "div_yield_pct": round(div_yield * 100, 2) if div_yield < 1 else round(div_yield, 2),
+        }
+    except Exception:
+        return None
+
+
+def _chequear_fundamentales_cripto(ticker: str, filtros_extra: list) -> dict | None:
+    """Verifica si una cripto pasa los filtros. Usa marketCap y rendimiento."""
+    try:
+        info = yf.Ticker(ticker).info
+        market_cap = info.get('marketCap') or 0
+        for f in filtros_extra:
+            if f["metrica"] == "market_cap":
+                if not OPS.get(f["operador"], operator.ge)(market_cap, f["valor"]):
+                    return None
+        if market_cap <= 0:
+            return None
+        return {
+            "ticker": ticker,
+            "market_cap_bn": round(market_cap / 1e9, 2),
+            "nombre": info.get("shortName", ticker),
+        }
+    except Exception:
+        return None
+
+
+def _chequear_fundamentales_bono(ticker: str, filtros_extra: list) -> dict | None:
+    """Verifica si un ETF de bonos pasa los filtros. Usa dividendYield como proxy del cupón/YTM."""
+    try:
+        info = yf.Ticker(ticker).info
+        div_yield = info.get('dividendYield', 0) or 0
+        aum = info.get('totalAssets') or 0
+        for f in filtros_extra:
+            if f["metrica"] == "dividend_yield":
+                if not OPS.get(f["operador"], operator.ge)(div_yield * 100, f["valor"]):
+                    return None
+        if div_yield <= 0 or aum <= 0:
+            return None
+        return {
+            "ticker": ticker,
+            "ytm_proxy_pct": round(div_yield * 100, 2) if div_yield < 1 else round(div_yield, 2),
+            "aum_bn": round(aum / 1e9, 2),
+            "nombre": info.get("shortName", ticker),
+        }
+    except Exception:
+        return None
+
+
+async def pipeline_hibrido(
+    solicitud: str,
+    msg_espera=None,
+    fuente_datos: str = "yahoo"
+) -> tuple[str | None, str | None, str | None, str | None]:
+    """Orquesta Extractor → Filtro Fundamentales → Gráfico → Generador Goldman Sachs.
+    Soporta: ACCION, REIT, ETF, CRIPTO, BONO.
+    Retorna SIEMPRE 4 valores: (texto_final, ruta_grafico, url_compra, ticker_final)
+    """
+    # 1. Extracción de intenciones con IA
+    if msg_espera:
+        await msg_espera.edit_text("🔍 Analizando tipo de activo e infiriendo perfil del inversor...")
+    extraccion = extractor_intenciones(solicitud)
+
+    if extraccion and extraccion.get("error_api"):
+        return f"⚠️ {extraccion['error_api']}", None, None, None
+
+    if not extraccion or not extraccion.get('tickers'):
+        return "❌ Nuestro Extractor Quants falló al decodificar tu petición. Intenta ser más claro.", None, None, None
+
+    clase_activo = extraccion.get("clase_activo", "ACCION").upper()
+    perfil = extraccion.get("perfil", "Balanceado")
+    tickers = extraccion.get("tickers", [])
+    sector = extraccion.get("sector", "Múltiple")
+    filtros_dinamicos_raw = extraccion.get("filtros_dinamicos", [])
+
+    if not tickers:
+        return "❌ El modelo no ha devuelto activos viables para ese nicho.", None, None, None
+
+    EMOJIS_CLASE = {
+        "ACCION": "🏢", "REIT": "🏠", "ETF": "📈", "CRIPTO": "₿", "BONO": "📜"
+    }
+    emoji_clase = EMOJIS_CLASE.get(clase_activo, "📈")
+
+    if msg_espera:
+        await msg_espera.edit_text(
+            f"🛠️ Clase detectada: *{emoji_clase} {clase_activo}* | Perfil: *{perfil}*.\n"
+            f"Lanzando escáner a {len(tickers)} activos simultáneamente...",
+            parse_mode="Markdown"
+        )
+
+    # 2. Seleccionar checker según clase de activo
     loop = asyncio.get_running_loop()
-    with concurrent.futures.ThreadPoolExecutor(max_workers=10) as pool:
-        tareas = [loop.run_in_executor(pool, chequear_fundamentales, t) for t in tickers]
-        pre_ganadores = [r for r in await asyncio.gather(*tareas) if r is not None]
-        
-    if not pre_ganadores:
-        return f"❌ Filtro Aniquilador.\nNinguna empresa cumple hoy tus requisitos puros.", None, None
-        
-    if msg_espera: await msg_espera.edit_text(f"🔥 ¡{len(pre_ganadores)} empresas sobrevivieron!\nAnalizando gráfica de {temporalidad_grafico}...")
-    
-    mejor_opcion, ruta_final = None, None
-    for gan in pre_ganadores:
-        ruta, rend = fabricante_de_graficos(gan["ticker"], periodo=temporalidad_grafico)
-        if rend is not None:
-            if rendimiento_req is None or rendimiento_req["op"](rend, rendimiento_req["val"]):
-                mejor_opcion = gan
-                mejor_opcion["rendimiento_real"] = round(rend, 2)
-                ruta_final = ruta
+    pre_ganadores = []
+    # Inicializar filtros con valores por defecto; se sobreescribirán si clase_activo == "ACCION"
+    filtros: dict = {"temporalidad": "3mo", "rendimiento_objetivo": 0.0, "rendimiento_op": operator.ge}
+
+    if clase_activo == "ACCION":
+        filtros = _construir_filtros(perfil, filtros_dinamicos_raw)
+        max_intentos = 3
+        for intento in range(max_intentos):
+            if intento > 0:
+                if filtros["max_per"] < 99999:
+                    filtros["max_per"] *= 1.2
+                filtros["min_div_pct"] = max(0, filtros["min_div_pct"] - 0.005)
+                filtros["min_div_abs"] = max(0, filtros["min_div_abs"] - 0.1)
+                if msg_espera:
+                    await msg_espera.edit_text(
+                        f"🔄 Reintentando con filtros relajados (intento {intento+1}/{max_intentos})..."
+                    )
+                await asyncio.sleep(0.5)
+            filtros_snap = {
+                "max_per": filtros["max_per"], "min_div_pct": filtros["min_div_pct"],
+                "min_div_abs": filtros["min_div_abs"], "per_op": filtros["per_op"],
+                "div_op": filtros["div_op"], "div_abs_op": filtros["div_abs_op"],
+                "filtros_extra": list(filtros["filtros_extra"]),
+            }
+            with concurrent.futures.ThreadPoolExecutor(max_workers=5) as pool:
+                tareas = [loop.run_in_executor(pool, _chequear_fundamentales_accion, t, filtros_snap) for t in tickers]
+                resultados = await asyncio.gather(*tareas)
+            pre_ganadores = [r for r in resultados if r is not None]
+            if pre_ganadores:
                 break
-        if ruta and os.path.exists(ruta): os.remove(ruta)
-            
+
+    elif clase_activo == "REIT":
+        with concurrent.futures.ThreadPoolExecutor(max_workers=5) as pool:
+            tareas = [loop.run_in_executor(pool, _chequear_fundamentales_reit, t, filtros_dinamicos_raw) for t in tickers]
+            resultados = await asyncio.gather(*tareas)
+        pre_ganadores = [r for r in resultados if r is not None]
+
+    elif clase_activo == "ETF":
+        with concurrent.futures.ThreadPoolExecutor(max_workers=5) as pool:
+            tareas = [loop.run_in_executor(pool, _chequear_fundamentales_etf, t, filtros_dinamicos_raw) for t in tickers]
+            resultados = await asyncio.gather(*tareas)
+        pre_ganadores = [r for r in resultados if r is not None]
+
+    elif clase_activo == "CRIPTO":
+        with concurrent.futures.ThreadPoolExecutor(max_workers=5) as pool:
+            tareas = [loop.run_in_executor(pool, _chequear_fundamentales_cripto, t, filtros_dinamicos_raw) for t in tickers]
+            resultados = await asyncio.gather(*tareas)
+        pre_ganadores = [r for r in resultados if r is not None]
+
+    elif clase_activo == "BONO":
+        with concurrent.futures.ThreadPoolExecutor(max_workers=5) as pool:
+            tareas = [loop.run_in_executor(pool, _chequear_fundamentales_bono, t, filtros_dinamicos_raw) for t in tickers]
+            resultados = await asyncio.gather(*tareas)
+        pre_ganadores = [r for r in resultados if r is not None]
+
+    else:
+        return f"❌ Clase de activo no reconocida: {clase_activo}.", None, None, None
+
+    if not pre_ganadores:
+        return (
+            f"❌ Filtro Aniquilador.\n"
+            f"Ninguno de los {len(tickers)} activos cumple tus requisitos de {clase_activo}.\n"
+            f"El mercado actual no ofrece candidatos viables.",
+            None, None, None
+        )
+
+    # 3. Filtro de rendimiento gráfico
+    temporalidad = "3mo"
+    if clase_activo == "ACCION":
+        temporalidad = filtros.get("temporalidad", "3mo")
+    elif clase_activo == "CRIPTO":
+        temporalidad = "1mo"
+
+    if msg_espera:
+        await msg_espera.edit_text(
+            f"🔥 ¡Criba superada por {len(pre_ganadores)} activos!\n"
+            f"Comprobando rendimiento histórico ({temporalidad})..."
+        )
+
+    mejor_opcion = None
+    ruta_captura_final = None
+    rendimiento_objetivo = 0.0
+    rendimiento_op = operator.ge
+    if clase_activo == "ACCION":
+        rendimiento_objetivo = filtros.get("rendimiento_objetivo", 0.0)
+        rendimiento_op = filtros.get("rendimiento_op", operator.ge)
+
+    for gan in pre_ganadores:
+        t = gan["ticker"]
+        ruta, rend = fabricante_de_graficos(t, periodo=temporalidad)
+        if rend is not None and rendimiento_op(rend, rendimiento_objetivo):
+            mejor_opcion = gan
+            mejor_opcion["rendimiento_real"] = round(rend, 2)
+            ruta_captura_final = ruta
+            break
+        elif ruta and os.path.exists(ruta):
+            os.remove(ruta)
+
     if not mejor_opcion:
-        return f"❌ Filtro Gráfico Fallido.\nNinguna finalista cumplió tu exigencia técnica.", None, None
-        
-    if msg_espera: await msg_espera.edit_text(f"✅ ¡Gema Quant localizada: {mejor_opcion['ticker']}!\nRedactando sumario ejecutivo...")
-    
-    informe_gs = generador_informe_goldman(mejor_opcion['ticker'], sector, mejor_opcion, perfil) or f"Datos: {mejor_opcion['ticker']} | PER: {mejor_opcion['per']}"
-    texto_final = f"⚡ ALERTA QUANT: {mejor_opcion['ticker']}\n📈 Momentum ({temporalidad_grafico}): +{mejor_opcion.get('rendimiento_real', 0)}%\n\n{informe_gs}"
+        return (
+            f"❌ Filtro Gráfico Fallido.\n"
+            f"He analizado las {len(pre_ganadores)} finalistas, pero ninguna cumple "
+            f"el umbral de rendimiento en {temporalidad}.\n"
+            f"Intenta relajar tu exigencia numérica.",
+            None, None, None
+        )
 
-    return texto_final, ruta_final, f"https://finance.yahoo.com/quote/{mejor_opcion['ticker']}"
+    if msg_espera:
+        await msg_espera.edit_text(
+            f"✅ ¡Gema {clase_activo} localizada: {mejor_opcion['ticker']}!\n"
+            f"Redactando sumario ejecutivo Goldman Sachs..."
+        )
 
-# --- 4. TELEGRAM BOT HANDLERS Y CRON JOBS ---
+    # 4. Generador Goldman Sachs adaptado
+    ticker_final = mejor_opcion['ticker']
+    informe_gs = generador_informe_goldman(ticker_final, sector, mejor_opcion, perfil, clase_activo)
+    if not informe_gs:
+        informe_gs = f"Datos Crudos: {ticker_final} | Clase: {clase_activo} | {json.dumps(mejor_opcion)}"
+    else:
+        informe_gs = informe_gs.replace('*', '')
+
+    fuente = fuente_datos if fuente_datos in FUENTES_DATOS else "yahoo"
+    url_compra = FUENTES_DATOS[fuente]["url"].format(ticker=ticker_final)
+
+    rend_str = mejor_opcion.get('rendimiento_real', 0)
+    texto_final = (
+        f"⚡ ALERTA {emoji_clase} {clase_activo}: {ticker_final}\n"
+        f"📈 Momentum ({temporalidad}): {'+' if rend_str >= 0 else ''}{rend_str}%\n\n"
+        f"{informe_gs}"
+    )
+
+    return texto_final, ruta_captura_final, url_compra, ticker_final
+
+
+# --- 4. TELEGRAM BOT HANDLERS ---
 
 async def comando_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(f"🤖 Plataforma Ejecutiva Quant, Sr. {update.effective_user.first_name}.\nDime tu estrategia o usa /menu para configurar alertas.")
+    user = update.effective_user
+    # Registrar usuario en DB si es la primera vez
+    await db.upsert_usuario(user.id)
+    creditos = await db.obtener_creditos(user.id)
+    mensaje = (
+        f"🤖 Plataforma Ejecutiva de Banca y Quants, Sr. {user.first_name}.\n\n"
+        "Configura tus intenciones. El motor híbrido deducirá automáticamente si buscas:\n"
+        "• Blue Chips seguras\n"
+        "• Gemas de Mid/Small Cap (Riesgo)\n\n"
+        f"💳 Créditos disponibles: *{creditos}*\n\n"
+        "¿Qué nicho investigamos hoy? (Usa /menu para suscripciones)"
+    )
+    await update.message.reply_text(mensaje, parse_mode="Markdown")
+
 
 async def comando_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    tid = update.effective_user.id
+    creditos = await db.obtener_creditos(tid)
+    strikes = context.user_data.get('strikes', 0)
     teclado = InlineKeyboardMarkup([
+        [InlineKeyboardButton(f"⚠️ Ver mis Strikes ({strikes})", callback_data="ver_strikes")],
         [InlineKeyboardButton("🔗 Configurar mi Broker (URL)", callback_data="pedir_url")],
+        [InlineKeyboardButton("🌐 Fuente de Validación", callback_data="pedir_fuente")],
         [InlineKeyboardButton("🔔 Configurar Alerta (6h)", callback_data="alerta_6")],
         [InlineKeyboardButton("🔔 Configurar Alerta (12h)", callback_data="alerta_12")],
         [InlineKeyboardButton("🛑 Detener Alertas", callback_data="alerta_stop")]
     ])
-    await update.message.reply_text("⚙️ MENU DE OPERACIONES CRON\n\nPermite barrer el mercado y entregarte reportes automáticamente.", reply_markup=teclado)
+    await update.message.reply_text(
+        f"⚙️ *MENU DE OPERACIONES CRON*\n\n"
+        f"💳 Créditos disponibles: *{creditos}*\n\n"
+        "Permite que nuestro escáner multi-hilos barra el mercado y te entregue reportes "
+        "técnicos sobre tu último nicho automáticamente.",
+        reply_markup=teclado,
+        parse_mode="Markdown"
+    )
+
 
 async def manejador_botones(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     chat_id = update.effective_chat.id
-    
+
+    # --- Ver Strikes ---
+    if query.data == "ver_strikes":
+        strikes = context.user_data.get('strikes', 0)
+        cooldown = obtener_penalizacion(strikes)
+        str_tiempo = formatear_tiempo(cooldown)
+        mensaje = f"Nivel Troll: {strikes} | Retardo actual: {str_tiempo}.\nHaz una consulta seria para resetear a 0."
+        await query.answer(text=mensaje, show_alert=True)
+        return
+
+    # --- Configurar Broker ---
     if query.data == "pedir_url":
         context.user_data['estado'] = "ESPERANDO_URL"
-        await query.edit_message_text(text="🏦 Pega el enlace absoluto de tu broker (Ej: https://www.degiro.es).")
+        await query.edit_message_text(
+            text=(
+                "🏦 *CONFIGURACIÓN DE CONEXIÓN A BROKER*\n\n"
+                "Pégame el enlace absoluto de la plataforma o broker donde suelas operar.\n\n"
+                "💡 *Tip Pro:* Puedes incluir `{ticker}` en la URL para enlace dinámico.\n"
+                "Ej: `https://www.degiro.es/trade/{ticker}`\n\n"
+                "Si no incluyes `{ticker}`, el botón redirigirá a la página principal de tu broker."
+            ),
+            parse_mode="Markdown"
+        )
         return
-        
+
+    # --- Selector de Fuente de Datos ---
+    if query.data == "pedir_fuente":
+        fuente_actual = await db.obtener_fuente_datos(chat_id)
+        botones = []
+        for clave, info in FUENTES_DATOS.items():
+            marcador = " ✅" if clave == fuente_actual else ""
+            botones.append([InlineKeyboardButton(
+                f"{info['nombre']}{marcador}",
+                callback_data=f"fuente_{clave}"
+            )])
+        botones.append([InlineKeyboardButton("⬅️ Volver al menú", callback_data="volver_menu")])
+        await query.edit_message_text(
+            text="🌐 *FUENTE DE VALIDACIÓN*\n\nElige dónde quieres que apunten los enlaces de los reportes:",
+            reply_markup=InlineKeyboardMarkup(botones),
+            parse_mode="Markdown"
+        )
+        return
+
+    if query.data.startswith("fuente_"):
+        fuente_elegida = query.data.replace("fuente_", "")
+        if fuente_elegida in FUENTES_DATOS:
+            await db.upsert_usuario(chat_id, fuente_datos=fuente_elegida)
+            nombre = FUENTES_DATOS[fuente_elegida]["nombre"]
+            await query.edit_message_text(
+                text=f"✅ Fuente de validación actualizada a *{nombre}*.",
+                parse_mode="Markdown"
+            )
+        else:
+            await query.edit_message_text(text="❌ Fuente no reconocida.")
+        return
+
+    if query.data == "volver_menu":
+        strikes = context.user_data.get('strikes', 0)
+        teclado = InlineKeyboardMarkup([
+            [InlineKeyboardButton(f"⚠️ Ver mis Strikes ({strikes})", callback_data="ver_strikes")],
+            [InlineKeyboardButton("🔗 Configurar mi Broker (URL)", callback_data="pedir_url")],
+            [InlineKeyboardButton("🌐 Fuente de Validación", callback_data="pedir_fuente")],
+            [InlineKeyboardButton("🔔 Configurar Alerta (6h)", callback_data="alerta_6")],
+            [InlineKeyboardButton("🔔 Configurar Alerta (12h)", callback_data="alerta_12")],
+            [InlineKeyboardButton("🛑 Detener Alertas", callback_data="alerta_stop")]
+        ])
+        await query.edit_message_text(
+            text=(
+                "⚙️ *MENU DE OPERACIONES CRON*\n\n"
+                "Permite que nuestro escáner multi-hilos barra el mercado y te entregue reportes "
+                "técnicos sobre tu último nicho automáticamente."
+            ),
+            reply_markup=teclado,
+            parse_mode="Markdown"
+        )
+        return
+
+    # --- Botón Reintentar ---
+    if query.data == "reintentar":
+        busqueda = await db.obtener_ultima_busqueda(chat_id)
+        if not busqueda:
+            await query.edit_message_text(text="❌ No hay búsqueda previa registrada. Escríbeme tu consulta de inversión.")
+            return
+
+        # Verificar créditos
+        creditos = await db.obtener_creditos(chat_id)
+        if creditos <= 0:
+            teclado_pago = InlineKeyboardMarkup([
+                [InlineKeyboardButton("💳 Recargar Créditos", url=os.getenv("STRIPE_PAYMENT_LINK", "https://buy.stripe.com/test"))]
+            ])
+            await query.edit_message_text(
+                text="💳 *Saldo agotado.*\nHas consumido tus análisis Quant.\nRecarga tus créditos para continuar.",
+                parse_mode="Markdown",
+                reply_markup=teclado_pago
+            )
+            return
+
+        await query.edit_message_text(text="🔄 Relanzando pipeline con nuevos tickers...")
+        msg_espera = await query.message.reply_text("⏳ Reconectando con los Agentes Quants...")
+
+        fuente = await db.obtener_fuente_datos(chat_id)
+        texto_final, ruta_captura, url_compra, ticker = await pipeline_hibrido(
+            busqueda, msg_espera=msg_espera, fuente_datos=fuente
+        )
+
+        if not url_compra:
+            teclado_error = InlineKeyboardMarkup([
+                [InlineKeyboardButton("🔄 Reintentar con otros tickers", callback_data="reintentar")]
+            ])
+            await msg_espera.edit_text(texto_final, reply_markup=teclado_error)
+            return
+
+        # Cobro Justo: solo cobrar en éxito
+        await db.restar_credito(chat_id)
+        creditos_restantes = await db.obtener_creditos(chat_id)
+        texto_final += f"\n\n_Te quedan {creditos_restantes} créditos._"
+
+        broker_url = await db.obtener_broker_url(chat_id)
+        botones = []
+        if broker_url:
+            url_broker_final = broker_url.replace("{ticker}", ticker) if "{ticker}" in broker_url else broker_url
+            botones.append([InlineKeyboardButton(text="Ejecutar Compra en Broker 🛒", url=url_broker_final)])
+        nombre_fuente = FUENTES_DATOS.get(fuente, FUENTES_DATOS["yahoo"])["nombre"]
+        botones.append([InlineKeyboardButton(text=f"Validar en {nombre_fuente} 📈", url=url_compra)])
+        teclado = InlineKeyboardMarkup(botones)
+
+        try:
+            if ruta_captura and os.path.exists(ruta_captura):
+                with open(ruta_captura, 'rb') as foto:
+                    try:
+                        await context.bot.send_photo(
+                            chat_id=chat_id, photo=foto, caption=texto_final,
+                            reply_markup=teclado, read_timeout=60, write_timeout=60, connect_timeout=60
+                        )
+                    except Exception:
+                        await context.bot.send_message(chat_id=chat_id, text=texto_final, reply_markup=teclado)
+                os.remove(ruta_captura)
+            else:
+                await context.bot.send_message(chat_id=chat_id, text=texto_final, reply_markup=teclado)
+            await msg_espera.delete()
+        except Exception as e:
+            logger.error(f"Fallo envío reintento: {e}")
+        return
+
+    # --- Detener Alertas ---
     if query.data == "alerta_stop":
         trabajos = context.job_queue.get_jobs_by_name(str(chat_id))
-        for job in trabajos: job.schedule_removal()
+        if not trabajos:
+            await query.edit_message_text(text="ℹ️ Protocolo vacío. No posees cron jobs activos.")
+            return
+        for job in trabajos:
+            job.schedule_removal()
         await query.edit_message_text(text="✅ Cron Jobs abortados en el servidor.")
         return
-        
-    ultima_busqueda = context.user_data.get('ultima_busqueda', "empresas emergentes tecnológicas")
-    intervalo_horas = int(query.data.split("_")[1])
-    
-    trabajos = context.job_queue.get_jobs_by_name(str(chat_id))
-    for job in trabajos: job.schedule_removal()
-        
-    context.job_queue.run_repeating(
-        ejecutar_tarea_programada,
-        interval=intervalo_horas * 3600,
-        first=10, 
-        chat_id=chat_id,
-        name=str(chat_id),
-        data=ultima_busqueda
-    )
-    await query.edit_message_text(text=f"✅ ¡JOB ASIGNADO!\nEl cluster lanzará reportes de '{ultima_busqueda}' cada {intervalo_horas} horas.")
+
+    # --- Configurar Alerta Periódica ---
+    if query.data.startswith("alerta_"):
+        busqueda = await db.obtener_ultima_busqueda(chat_id)
+        ultima_busqueda = busqueda or "empresas emergentes tecnológicas"
+
+        try:
+            intervalo_horas = int(query.data.split("_")[1])
+        except (IndexError, ValueError):
+            await query.edit_message_text(text="❌ Error procesando la solicitud.")
+            return
+
+        trabajos = context.job_queue.get_jobs_by_name(str(chat_id))
+        for job in trabajos:
+            job.schedule_removal()
+
+        context.job_queue.run_repeating(
+            ejecutar_tarea_programada,
+            interval=intervalo_horas * 3600,
+            first=10,
+            chat_id=chat_id,
+            name=str(chat_id),
+            data=ultima_busqueda
+        )
+        await query.edit_message_text(
+            text=(
+                f"✅ *¡JOB ASIGNADO!*\n\n"
+                f"El cluster asíncrono lanzará reportes de tu nicho '{ultima_busqueda}' "
+                f"cada *{intervalo_horas} horas*.\nPuedes desactivarlo desde /menu."
+            ),
+            parse_mode="Markdown"
+        )
+        return
+
 
 async def ejecutar_tarea_programada(context: ContextTypes.DEFAULT_TYPE):
+    """Callback del Cron Job con retry exponencial y notificación de fallos."""
     chat_id = context.job.chat_id
-    texto_final, ruta_captura, url_compra = await pipeline_hibrido(context.job.data, msg_espera=None)
-    if not url_compra: return
-        
-    broker_url = context.application.user_data.get(chat_id, {}).get('broker_url')
-    botones = []
-    if broker_url:
-        botones.append([InlineKeyboardButton("Comprar en tu Broker 🛒", url=broker_url)])
-    botones.append([InlineKeyboardButton("Métricas en Yahoo 📈", url=url_compra)])
-    teclado = InlineKeyboardMarkup(botones)
-    
-    try:
-        if ruta_captura and os.path.exists(ruta_captura):
-            with open(ruta_captura, 'rb') as foto:
-                await context.bot.send_photo(chat_id=chat_id, photo=foto, caption=texto_final, reply_markup=teclado)
-            os.remove(ruta_captura)
-        else:
-            await context.bot.send_message(chat_id=chat_id, text=texto_final, reply_markup=teclado)
-    except Exception as e:
-        logger.error(f"Fallo cron: {e}")
+    solicitud = context.job.data
+    max_reintentos = 3
 
-async def conversacion_inversor(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    solicitud = update.message.text
+    logger.info(f"[CRON] Lanzando pipeline al chat {chat_id}: {solicitud}")
+
+    # Verificar créditos antes de ejecutar
+    creditos = await db.obtener_creditos(chat_id)
+    if creditos <= 0:
+        logger.info(f"[CRON] Chat {chat_id} sin créditos. Cancelando job.")
+        try:
+            teclado_pago = InlineKeyboardMarkup([
+                [InlineKeyboardButton("💳 Recargar Créditos", url=os.getenv("STRIPE_PAYMENT_LINK", "https://buy.stripe.com/test"))]
+            ])
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=(
+                    "💳 *Alerta Cron Cancelada*\n\n"
+                    "Tus créditos se han agotado. La suscripción ha sido pausada.\n"
+                    "Una vez recargues, reactiva desde /menu."
+                ),
+                parse_mode="Markdown",
+                reply_markup=teclado_pago
+            )
+        except Exception:
+            pass
+        # Cancelar el job
+        context.job.schedule_removal()
+        return
+
+    for intento in range(max_reintentos):
+        try:
+            fuente = await db.obtener_fuente_datos(chat_id)
+            texto_final, ruta_captura, url_compra, ticker = await pipeline_hibrido(
+                solicitud, msg_espera=None, fuente_datos=fuente
+            )
+
+            # Error lógico del pipeline (no de red) → no reintentar, no cobrar
+            if not url_compra:
+                logger.warning(f"[CRON] Pipeline sin resultado para chat {chat_id}")
+                return
+
+            # Cobro Justo: solo cobrar en éxito
+            await db.restar_credito(chat_id)
+            creditos_restantes = await db.obtener_creditos(chat_id)
+            texto_final += f"\n\n_Te quedan {creditos_restantes} créditos._"
+
+            broker_url = await db.obtener_broker_url(chat_id)
+            botones = []
+            if broker_url:
+                url_broker_final = broker_url.replace("{ticker}", ticker) if "{ticker}" in broker_url else broker_url
+                botones.append([InlineKeyboardButton(text="Comprar en tu Broker 🛒", url=url_broker_final)])
+            nombre_fuente = FUENTES_DATOS.get(fuente, FUENTES_DATOS["yahoo"])["nombre"]
+            botones.append([InlineKeyboardButton(text=f"Métricas en {nombre_fuente} 📈", url=url_compra)])
+            teclado = InlineKeyboardMarkup(botones)
+
+            if ruta_captura and os.path.exists(ruta_captura):
+                with open(ruta_captura, 'rb') as foto:
+                    try:
+                        await context.bot.send_photo(
+                            chat_id=chat_id, photo=foto, caption=texto_final,
+                            reply_markup=teclado, read_timeout=60, write_timeout=60, connect_timeout=60
+                        )
+                    except Exception:
+                        await context.bot.send_message(chat_id=chat_id, text=texto_final, reply_markup=teclado)
+                os.remove(ruta_captura)
+            else:
+                await context.bot.send_message(chat_id=chat_id, text=texto_final, reply_markup=teclado)
+
+            return  # Éxito → salir
+
+        except Exception as e:
+            logger.error(f"[CRON] Intento {intento + 1}/{max_reintentos} falló para chat {chat_id}: {e}")
+            if intento < max_reintentos - 1:
+                espera = 2 ** intento * 30  # 30s, 60s, 120s
+                logger.info(f"[CRON] Esperando {espera}s antes de reintentar...")
+                await asyncio.sleep(espera)
+            else:
+                # Reintentos agotados → notificar al usuario
+                try:
+                    await context.bot.send_message(
+                        chat_id=chat_id,
+                        text=(
+                            "⚠️ *Alerta Cron Fallida*\n\n"
+                            f"Tu suscripción a '{solicitud}' falló tras {max_reintentos} intentos.\n"
+                            "Causa probable: fallo de red o API.\n"
+                            "El próximo ciclo programado se ejecutará normalmente."
+                        ),
+                        parse_mode="Markdown"
+                    )
+                except Exception as notify_err:
+                    logger.critical(
+                        f"[CRON] No se pudo notificar fallo al chat {chat_id}: {notify_err}"
+                    )
+
+
+def obtener_penalizacion(strikes: int) -> float:
+    if strikes >= 50:
+        return float('inf')
+    elif strikes >= 40:
+        return 30 * 24 * 3600.0  # 1 mes (30 días)
+    elif strikes >= 30:
+        return 7 * 24 * 3600.0   # 1 semana
+    elif strikes >= 20:
+        return 24 * 3600.0       # 1 día
+    else:
+        # Exponencial limitado para no superar el día antes de llegar a 20.
+        return float(30 * (2 ** min(strikes, 11)))
+
+def formatear_tiempo(segundos: float) -> str:
+    if segundos == float('inf'):
+        return "PERMANENTE"
+    segundos = int(segundos)
+    dias = segundos // 86400
+    horas = (segundos % 86400) // 3600
+    minutos = (segundos % 3600) // 60
+    segs = segundos % 60
     
+    parts = []
+    if dias > 0: parts.append(f"{dias}d")
+    if horas > 0: parts.append(f"{horas}h")
+    if minutos > 0: parts.append(f"{minutos}m")
+    if segs > 0 or not parts: parts.append(f"{segs}s")
+    return " ".join(parts)
+
+
+async def conversacion_inversor(update: Update, context: ContextTypes.DEFAULT_TYPE, es_reintento=False):
+    """Handler principal: procesa consultas de inversión o configuración de broker."""
+    solicitud = update.message.text
+    tid = update.effective_user.id
+
+    # --- 🛡️ SISTEMA ANTI-SPAM (COOLDOWN) ---
+    ahora = time.time()
+    ultimo_uso = context.user_data.get('ultimo_uso', 0)
+    strikes = context.user_data.get('strikes', 0)
+    cooldown_segundos = obtener_penalizacion(strikes)
+    
+    if not es_reintento:
+        if ahora - ultimo_uso < cooldown_segundos:
+            # Timeouts severos (≥ 1 día o permanente): ofrecer opción de pago para desbloquear.
+            es_timeout_severo = (cooldown_segundos == float('inf') or cooldown_segundos >= 86400)
+            if es_timeout_severo:
+                if cooldown_segundos == float('inf'):
+                    msg_ban = (
+                        "🛑 Has sido baneado PERMANENTEMENTE por trolling reiterado.\n\n"
+                        "Puedes desbloquear tu acceso de forma inmediata recargando créditos:"
+                    )
+                else:
+                    tiempo_restante = cooldown_segundos - (ahora - ultimo_uso)
+                    str_tiempo = formatear_tiempo(tiempo_restante)
+                    msg_ban = (
+                        f"🛑 Sanción activa. Tiempo restante: {str_tiempo}.\n\n"
+                        "Puedes saltarte la espera de forma inmediata recargando créditos:"
+                    )
+                teclado_desbloqueo = InlineKeyboardMarkup([
+                    [InlineKeyboardButton(
+                        "💳 Desbloquear ahora",
+                        url=f"{STRIPE_PAYMENT_URL}?client_reference_id={tid}"
+                    )]
+                ])
+                await update.message.reply_text(
+                    msg_ban,
+                    reply_markup=teclado_desbloqueo
+                )
+            else:
+                tiempo_restante = cooldown_segundos - (ahora - ultimo_uso)
+                str_tiempo = formatear_tiempo(tiempo_restante)
+                await update.message.reply_text(
+                    f"🛑 Motor Quant enfriándose. Espera {str_tiempo} para otra consulta."
+                )
+            return
+            
+        context.user_data['ultimo_uso'] = ahora
+    # --- FIN DEL SISTEMA ANTI-SPAM ---
+
+    # Manejar estado de configuración de Broker
     if context.user_data.get('estado') == "ESPERANDO_URL":
         url_detectada = extraer_url(solicitud)
         if url_detectada and es_url_valida(url_detectada):
-            context.user_data['broker_url'] = url_detectada
+            await db.upsert_usuario(tid, broker_url=url_detectada)
             context.user_data['estado'] = None
-            await update.message.reply_text(f"✅ Broker conectado: {url_detectada}")
+            await update.message.reply_text(
+                f"✅ *Broker conectado.*\n"
+                f"Todas tus señales redirigirán a:\n{url_detectada}",
+                parse_mode="Markdown"
+            )
         else:
             context.user_data['estado'] = None
             await update.message.reply_text("❌ URL Inválida. Protocolo Cancelado.")
         return
-        
-    context.user_data['ultima_busqueda'] = solicitud
+
+    # Verificar créditos
+    creditos = await db.obtener_creditos(tid)
+    if creditos <= 0:
+        teclado_pago = InlineKeyboardMarkup([
+            [InlineKeyboardButton("💳 Recargar Créditos", url=f"{STRIPE_PAYMENT_URL}?client_reference_id={tid}")]
+        ])
+        await update.message.reply_text(
+            "💳 *Saldo agotado.*\n"
+            "Has consumido tus análisis Quant.\n"
+            "Pulsa el nivel de abajo para recargar tus créditos:",
+            parse_mode="Markdown",
+            reply_markup=teclado_pago
+        )
+        return
+
+    # Guardar búsqueda en DB
+    await db.upsert_usuario(tid, ultima_busqueda=solicitud)
     msg_espera = await update.message.reply_text("⏳ Conectando con los Agentes Quants...")
-    
-    texto_final, ruta_captura, url_compra = await pipeline_hibrido(solicitud, msg_espera)
-    
-    broker_url = context.user_data.get('broker_url')
+
+    fuente = await db.obtener_fuente_datos(tid)
+    texto_final, ruta_captura, url_compra, ticker = await pipeline_hibrido(
+        solicitud, msg_espera, fuente_datos=fuente
+    )
+
+    # Error → mostrar mensaje con botón de reintento (NO cobrar)
+    if not url_compra:
+        if texto_final and "Petición rechazada" in texto_final:
+            context.user_data['strikes'] = context.user_data.get('strikes', 0) + 1
+        else:
+            context.user_data['strikes'] = 0
+
+        teclado_error = InlineKeyboardMarkup([
+            [InlineKeyboardButton("🔄 Reintentar con otros tickers", callback_data="reintentar")]
+        ])
+        await msg_espera.edit_text(texto_final, reply_markup=teclado_error)
+        return
+
+    # Solicitud exitosa, resetear strikes
+    context.user_data['strikes'] = 0
+
+    # Cobro Justo: solo cobrar en éxito
+    await db.restar_credito(tid)
+    creditos_restantes = await db.obtener_creditos(tid)
+    texto_final += f"\n\n_Te quedan {creditos_restantes} créditos._"
+
+    broker_url = await db.obtener_broker_url(tid)
     botones = []
-    if broker_url and url_compra:
-        botones.append([InlineKeyboardButton("Ejecutar Compra en Broker 🛒", url=broker_url)])
-    if url_compra:
-        botones.append([InlineKeyboardButton("Validar en Yahoo Finance 📈", url=url_compra)])
-        
-    teclado = InlineKeyboardMarkup(botones) if botones else None
-    
+    if broker_url:
+        url_broker_final = broker_url.replace("{ticker}", ticker) if "{ticker}" in broker_url else broker_url
+        botones.append([InlineKeyboardButton(text="Ejecutar Compra en Broker 🛒", url=url_broker_final)])
+    nombre_fuente = FUENTES_DATOS.get(fuente, FUENTES_DATOS["yahoo"])["nombre"]
+    botones.append([InlineKeyboardButton(text=f"Validar en {nombre_fuente} 📈", url=url_compra)])
+    teclado = InlineKeyboardMarkup(botones)
+
     try:
         if ruta_captura and os.path.exists(ruta_captura):
             with open(ruta_captura, 'rb') as foto:
-                await update.message.reply_photo(photo=foto, caption=texto_final, reply_markup=teclado)
+                try:
+                    await update.message.reply_photo(
+                        photo=foto, caption=texto_final,
+                        reply_markup=teclado, read_timeout=60, write_timeout=60, connect_timeout=60
+                    )
+                except Exception:
+                    await update.message.reply_text(texto_final, reply_markup=teclado)
             os.remove(ruta_captura)
         else:
             await update.message.reply_text(texto_final, reply_markup=teclado)
+
         await msg_espera.delete()
+
     except Exception as e:
-        logger.error(f"Fallo envío Telegram: {e}")
+        logger.error(f"Telegram API: {e}")
+        try:
+            await msg_espera.edit_text("Fallo propagando la respuesta al chat de Telegram.")
+        except Exception:
+            pass
+
 
 async def configuracion_post_inicio(application: Application):
-    await application.bot.set_my_commands([
-        BotCommand("start", "Bootear plataforma Quant"),
-        BotCommand("menu", "Configurar Cron Jobs de radar")
-    ], scope=BotCommandScopeDefault())
+    # Inicializar base de datos
+    await db.inicializar_db()
+    # Registrar comandos en Telegram
+    comandos = [
+        BotCommand("start", "Datos del bot"),
+        BotCommand("menu", "Configuración de fuentes y alertas"),
+        BotCommand("comprar", "Recargar créditos de análisis"),
+    ]
+    await application.bot.set_my_commands(comandos, scope=BotCommandScopeDefault())
+
+
+# ── FASTAPI (Servidor Web para Render + Webhook de Pagos) ────────────────────
+
+web_app = FastAPI(title="BotFinanzas Webhook")
+
+# Stripe: clave de firma del endpoint (whsec_...). Se obtiene en el Dashboard de Stripe
+# → Developers → Webhooks → tu endpoint → Signing Secret.
+STRIPE_WEBHOOK_SECRET = os.getenv("STRIPE_WEBHOOK_SECRET", "")
+CREDITOS_POR_COMPRA   = int(os.getenv("CREDITOS_POR_COMPRA", "10"))
+
+# URL del producto en Stripe (con parámetro client_reference_id dinámico)
+STRIPE_PAYMENT_URL = "https://buy.stripe.com/28EcN70yD05tcjHgZm3VC00"
+
+
+@web_app.get("/")
+async def health_check():
+    """Health-check: Render lo usa para confirmar que el servicio está vivo."""
+    return {"status": "online", "service": "BotFinanzas"}
+
+
+@web_app.post("/webhook-pago")
+async def webhook_pago(request: Request):
+    """
+    Webhook oficial de Stripe. Valida la firma criptográfica HMAC-SHA256 del evento
+    usando stripe.Webhook.construct_event — imposible de falsificar sin STRIPE_WEBHOOK_SECRET.
+
+    Flujo:
+      1. Stripe envía el evento 'checkout.session.completed' cuando el pago se completa.
+      2. Extraemos el 'client_reference_id' (= telegram_id) del objeto 'session'.
+      3. Acreditamos CREDITOS_POR_COMPRA créditos al usuario en Turso.
+    """
+    payload    = await request.body()   # Cuerpo en bytes crudos (necesario para la firma)
+    sig_header = request.headers.get("stripe-signature", "")
+
+    if not STRIPE_WEBHOOK_SECRET:
+        logger.error("[STRIPE] STRIPE_WEBHOOK_SECRET no configurado. Rechazando evento.")
+        raise HTTPException(status_code=500, detail="Webhook no configurado en el servidor.")
+
+    try:
+        event = stripe.Webhook.construct_event(
+            payload, sig_header, STRIPE_WEBHOOK_SECRET
+        )
+    except stripe.error.SignatureVerificationError as e:
+        logger.warning(f"[STRIPE] Firma inválida: {e}")
+        raise HTTPException(status_code=400, detail="Firma Stripe inválida.")
+    except Exception as e:
+        logger.error(f"[STRIPE] Error procesando evento: {e}")
+        raise HTTPException(status_code=400, detail="Evento malformado.")
+
+    # Solo procesamos pagos completados
+    if event["type"] == "checkout.session.completed":
+        session     = event["data"]["object"]
+        telegram_id = session.get("client_reference_id")
+
+        if telegram_id:
+            try:
+                await db.actualizar_creditos(int(telegram_id), CREDITOS_POR_COMPRA)
+                logger.info(
+                    f"[STRIPE] Pago completado → +{CREDITOS_POR_COMPRA} créditos "
+                    f"al usuario {telegram_id}"
+                )
+            except Exception as e:
+                logger.error(f"[STRIPE] Error acreditando créditos: {e}")
+        else:
+            logger.warning("[STRIPE] Evento completado sin client_reference_id. "
+                           "Asegúrate de añadir ?client_reference_id={user_id} al enlace de pago.")
+    else:
+        logger.debug(f"[STRIPE] Evento ignorado: {event['type']}")
+
+    # Stripe requiere 200 OK para no reintentar el evento
+    return {"ok": True}
+
+
+# ── COMANDO /comprar ──────────────────────────────────────────────────────────
+
+async def comando_comprar(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Genera un enlace de pago de Stripe personalizado con el telegram_id del usuario."""
+    user_id  = update.effective_user.id
+    creditos = await db.obtener_creditos(user_id)
+    # El client_reference_id permite identificar al usuario tras el pago
+    url_pago = f"{STRIPE_PAYMENT_URL}?client_reference_id={user_id}"
+    teclado  = InlineKeyboardMarkup([[
+        InlineKeyboardButton(f"💳 Comprar {CREDITOS_POR_COMPRA} créditos →", url=url_pago)
+    ]])
+    await update.message.reply_text(
+        f"💳 *Recargar Créditos*\n\n"
+        f"Saldo actual: *{creditos}* créditos de análisis.\n\n"
+        f"Cada paquete añade *{CREDITOS_POR_COMPRA} créditos* a tu cuenta "
+        f"automáticamente tras confirmar el pago.",
+        parse_mode="Markdown",
+        reply_markup=teclado
+    )
+
+
+# ── ARRANQUE PRINCIPAL ────────────────────────────────────────────────────────
 
 def main():
-    app = Application.builder().token(TELEGRAM_TOKEN).post_init(configuracion_post_inicio).build()
-    app.add_handler(CommandHandler("start", comando_start))
-    app.add_handler(CommandHandler("menu", comando_menu))
-    app.add_handler(CallbackQueryHandler(manejador_botones))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, conversacion_inversor))
-    logger.info("Plataforma Quants ONLINE.")
-    app.run_polling()
+    """Arranca Uvicorn (FastAPI) y el polling de Telegram en el MISMO bucle de eventos asyncio.
+    Esto permite que ambos corran en paralelo sin bloquearse mutuamente.
+    """
+    port = int(os.getenv("PORT", "8080"))
+
+    # Construir la aplicación de Telegram
+    telegram_app = (
+        Application.builder()
+        .token(TELEGRAM_TOKEN)
+        .read_timeout(60)
+        .write_timeout(60)
+        .post_init(configuracion_post_inicio)
+        .build()
+    )
+    telegram_app.add_handler(CommandHandler("start", comando_start))
+    telegram_app.add_handler(CommandHandler("menu", comando_menu))
+    telegram_app.add_handler(CommandHandler("comprar", comando_comprar))
+    telegram_app.add_handler(CallbackQueryHandler(manejador_botones))
+    telegram_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, conversacion_inversor))
+
+    logger.info(f"Plataforma Híbrida Asíncrona (Goldman Sachs Edition) v3.0 ONLINE. Puerto: {port}")
+
+    async def _run_all():
+        # Configurar servidor Uvicorn sin bloquear el loop
+        config = uvicorn.Config(
+            app=web_app,
+            host="0.0.0.0",
+            port=port,
+            log_level="info"
+        )
+        server = uvicorn.Server(config)
+
+        # Correr Uvicorn y el polling de Telegram concurrentemente
+        await asyncio.gather(
+            server.serve(),
+            telegram_app.run_polling(close_loop=False)
+        )
+
+    asyncio.run(_run_all())
+
 
 if __name__ == "__main__":
     main()

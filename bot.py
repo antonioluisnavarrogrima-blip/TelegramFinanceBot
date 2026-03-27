@@ -1,4 +1,5 @@
 import os
+from contextlib import asynccontextmanager
 import re
 import json
 import logging
@@ -1255,29 +1256,86 @@ async def conversacion_inversor(update: Update, context: ContextTypes.DEFAULT_TY
             pass
 
 
-async def configuracion_post_inicio(application: Application):
-    # Inicializar base de datos
-    await db.inicializar_db()
-    # Registrar comandos en Telegram
-    comandos = [
-        BotCommand("start", "Datos del bot"),
-        BotCommand("menu", "Configuración de fuentes y alertas"),
-        BotCommand("comprar", "Recargar créditos de análisis"),
-    ]
-    await application.bot.set_my_commands(comandos, scope=BotCommandScopeDefault())
+# ── CONSTANTES FASTAPI / STRIPE ──────────────────────────────────────────────
 
-
-# ── FASTAPI (Servidor Web para Render + Webhook de Pagos) ────────────────────
-
-web_app = FastAPI(title="BotFinanzas Webhook")
-
-# Stripe: clave de firma del endpoint (whsec_...). Se obtiene en el Dashboard de Stripe
-# → Developers → Webhooks → tu endpoint → Signing Secret.
 STRIPE_WEBHOOK_SECRET = os.getenv("STRIPE_WEBHOOK_SECRET", "")
 CREDITOS_POR_COMPRA   = int(os.getenv("CREDITOS_POR_COMPRA", "10"))
+STRIPE_PAYMENT_URL    = "https://buy.stripe.com/28EcN70yD05tcjHgZm3VC00"
 
-# URL del producto en Stripe (con parámetro client_reference_id dinámico)
-STRIPE_PAYMENT_URL = "https://buy.stripe.com/28EcN70yD05tcjHgZm3VC00"
+
+# ── APP DE TELEGRAM (nivel de módulo) ────────────────────────────────────────
+# Se construye aquí para que el lifespan de FastAPI pueda acceder a ella.
+
+telegram_app = (
+    Application.builder()
+    .token(TELEGRAM_TOKEN)
+    .read_timeout(60)
+    .write_timeout(60)
+    .build()
+)
+telegram_app.add_handler(CommandHandler("start", comando_start))
+telegram_app.add_handler(CommandHandler("menu", comando_menu))
+telegram_app.add_handler(CallbackQueryHandler(manejador_botones))
+telegram_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, conversacion_inversor))
+
+
+# ── COMANDO /comprar ──────────────────────────────────────────────────────────
+
+async def comando_comprar(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Genera un enlace de pago de Stripe personalizado con el telegram_id del usuario."""
+    user_id  = update.effective_user.id
+    creditos = await db.obtener_creditos(user_id)
+    url_pago = f"{STRIPE_PAYMENT_URL}?client_reference_id={user_id}"
+    teclado  = InlineKeyboardMarkup([[
+        InlineKeyboardButton(f"💳 Comprar {CREDITOS_POR_COMPRA} créditos →", url=url_pago)
+    ]])
+    await update.message.reply_text(
+        f"💳 *Recargar Créditos*\n\n"
+        f"Saldo actual: *{creditos}* créditos de análisis.\n\n"
+        f"Cada paquete añade *{CREDITOS_POR_COMPRA} créditos* a tu cuenta "
+        f"automáticamente tras confirmar el pago.",
+        parse_mode="Markdown",
+        reply_markup=teclado
+    )
+
+telegram_app.add_handler(CommandHandler("comprar", comando_comprar))
+
+
+# ── FASTAPI + LIFESPAN ────────────────────────────────────────────────────────
+# Uvicorn es el dueño del bucle de eventos. El bot de Telegram arranca y para
+# dentro del lifespan para compartir ese mismo bucle sin conflictos.
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Gestiona el ciclo de vida del bot de Telegram junto a FastAPI/Uvicorn."""
+    # ── STARTUP ──
+    logger.info("[LIFESPAN] Inicializando bot de Telegram...")
+    await telegram_app.initialize()          # Llama a post_init si lo hubiera
+
+    # Inicializar DB y registrar comandos (equivalente al antiguo post_init)
+    await db.inicializar_db()
+    comandos = [
+        BotCommand("start",   "Datos del bot"),
+        BotCommand("menu",    "Configuración de fuentes y alertas"),
+        BotCommand("comprar", "Recargar créditos de análisis"),
+    ]
+    await telegram_app.bot.set_my_commands(comandos, scope=BotCommandScopeDefault())
+
+    await telegram_app.start()
+    await telegram_app.updater.start_polling(drop_pending_updates=True)
+    logger.info("[LIFESPAN] Bot de Telegram en polling. Plataforma ONLINE.")
+
+    yield  # ← FastAPI sirve peticiones aquí
+
+    # ── SHUTDOWN ──
+    logger.info("[LIFESPAN] Apagando bot de Telegram...")
+    await telegram_app.updater.stop()
+    await telegram_app.stop()
+    await telegram_app.shutdown()
+    logger.info("[LIFESPAN] Bot detenido correctamente.")
+
+
+web_app = FastAPI(title="BotFinanzas Webhook", lifespan=lifespan)
 
 
 @web_app.get("/")
@@ -1289,15 +1347,10 @@ async def health_check():
 @web_app.post("/webhook-pago")
 async def webhook_pago(request: Request):
     """
-    Webhook oficial de Stripe. Valida la firma criptográfica HMAC-SHA256 del evento
-    usando stripe.Webhook.construct_event — imposible de falsificar sin STRIPE_WEBHOOK_SECRET.
-
-    Flujo:
-      1. Stripe envía el evento 'checkout.session.completed' cuando el pago se completa.
-      2. Extraemos el 'client_reference_id' (= telegram_id) del objeto 'session'.
-      3. Acreditamos CREDITOS_POR_COMPRA créditos al usuario en Turso.
+    Webhook oficial de Stripe. Valida la firma criptográfica HMAC-SHA256.
+    Acredita CREDITOS_POR_COMPRA al telegram_id enviado en client_reference_id.
     """
-    payload    = await request.body()   # Cuerpo en bytes crudos (necesario para la firma)
+    payload    = await request.body()
     sig_header = request.headers.get("stripe-signature", "")
 
     if not STRIPE_WEBHOOK_SECRET:
@@ -1315,11 +1368,9 @@ async def webhook_pago(request: Request):
         logger.error(f"[STRIPE] Error procesando evento: {e}")
         raise HTTPException(status_code=400, detail="Evento malformado.")
 
-    # Solo procesamos pagos completados
     if event["type"] == "checkout.session.completed":
         session     = event["data"]["object"]
         telegram_id = session.get("client_reference_id")
-
         if telegram_id:
             try:
                 await db.actualizar_creditos(int(telegram_id), CREDITOS_POR_COMPRA)
@@ -1330,79 +1381,17 @@ async def webhook_pago(request: Request):
             except Exception as e:
                 logger.error(f"[STRIPE] Error acreditando créditos: {e}")
         else:
-            logger.warning("[STRIPE] Evento completado sin client_reference_id. "
-                           "Asegúrate de añadir ?client_reference_id={user_id} al enlace de pago.")
+            logger.warning("[STRIPE] Evento sin client_reference_id.")
     else:
         logger.debug(f"[STRIPE] Evento ignorado: {event['type']}")
 
-    # Stripe requiere 200 OK para no reintentar el evento
     return {"ok": True}
 
 
-# ── COMANDO /comprar ──────────────────────────────────────────────────────────
-
-async def comando_comprar(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Genera un enlace de pago de Stripe personalizado con el telegram_id del usuario."""
-    user_id  = update.effective_user.id
-    creditos = await db.obtener_creditos(user_id)
-    # El client_reference_id permite identificar al usuario tras el pago
-    url_pago = f"{STRIPE_PAYMENT_URL}?client_reference_id={user_id}"
-    teclado  = InlineKeyboardMarkup([[
-        InlineKeyboardButton(f"💳 Comprar {CREDITOS_POR_COMPRA} créditos →", url=url_pago)
-    ]])
-    await update.message.reply_text(
-        f"💳 *Recargar Créditos*\n\n"
-        f"Saldo actual: *{creditos}* créditos de análisis.\n\n"
-        f"Cada paquete añade *{CREDITOS_POR_COMPRA} créditos* a tu cuenta "
-        f"automáticamente tras confirmar el pago.",
-        parse_mode="Markdown",
-        reply_markup=teclado
-    )
-
-
 # ── ARRANQUE PRINCIPAL ────────────────────────────────────────────────────────
-
-def main():
-    """Arranca Uvicorn (FastAPI) y el polling de Telegram en el MISMO bucle de eventos asyncio.
-    Esto permite que ambos corran en paralelo sin bloquearse mutuamente.
-    """
-    port = int(os.getenv("PORT", "8080"))
-
-    # Construir la aplicación de Telegram
-    telegram_app = (
-        Application.builder()
-        .token(TELEGRAM_TOKEN)
-        .read_timeout(60)
-        .write_timeout(60)
-        .post_init(configuracion_post_inicio)
-        .build()
-    )
-    telegram_app.add_handler(CommandHandler("start", comando_start))
-    telegram_app.add_handler(CommandHandler("menu", comando_menu))
-    telegram_app.add_handler(CommandHandler("comprar", comando_comprar))
-    telegram_app.add_handler(CallbackQueryHandler(manejador_botones))
-    telegram_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, conversacion_inversor))
-
-    logger.info(f"Plataforma Híbrida Asíncrona (Goldman Sachs Edition) v3.0 ONLINE. Puerto: {port}")
-
-    async def _run_all():
-        # Configurar servidor Uvicorn sin bloquear el loop
-        config = uvicorn.Config(
-            app=web_app,
-            host="0.0.0.0",
-            port=port,
-            log_level="info"
-        )
-        server = uvicorn.Server(config)
-
-        # Correr Uvicorn y el polling de Telegram concurrentemente
-        await asyncio.gather(
-            server.serve(),
-            telegram_app.run_polling(close_loop=False)
-        )
-
-    asyncio.run(_run_all())
-
+# Uvicorn gestiona el loop; el lifespan de FastAPI arranca el bot internamente.
 
 if __name__ == "__main__":
-    main()
+    port = int(os.getenv("PORT", "8080"))
+    logger.info(f"Plataforma Híbrida Asíncrona (Goldman Sachs Edition) v3.0 ONLINE. Puerto: {port}")
+    uvicorn.run(web_app, host="0.0.0.0", port=port, log_level="info")

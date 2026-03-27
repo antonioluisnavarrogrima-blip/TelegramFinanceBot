@@ -1308,7 +1308,7 @@ async def webhook_pago(request: Request):
         event = stripe.Webhook.construct_event(
             payload, sig_header, STRIPE_WEBHOOK_SECRET
         )
-    except stripe.error.SignatureVerificationError as e:
+    except stripe.SignatureVerificationError as e:
         logger.warning(f"[STRIPE] Firma inválida: {e}")
         raise HTTPException(status_code=400, detail="Firma Stripe inválida.")
     except Exception as e:

@@ -756,8 +756,8 @@ async def pipeline_hibrido(
 
 async def comando_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
-    # Registrar usuario en DB si es la primera vez
-    await db.upsert_usuario(user.id)
+    # Registrar/actualizar usuario en BD (guarda username si lo tiene)
+    await db.upsert_usuario(user.id, username=user.username or user.first_name)
     creditos = await db.obtener_creditos(user.id)
     mensaje = (
         f"🤖 Plataforma Ejecutiva de Banca y Quants, Sr. {user.first_name}.\n\n"
@@ -799,10 +799,16 @@ async def manejador_botones(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # --- Ver Strikes ---
     if query.data == "ver_strikes":
-        strikes = context.user_data.get('strikes', 0)
-        cooldown = obtener_penalizacion(strikes)
+        usuario = await db.obtener_usuario(chat_id)
+        strikes   = usuario["strikes"]   if usuario else 0
+        ban_level = usuario["banLevel"]   if usuario else 0
+        cooldown  = obtener_penalizacion_por_ban_level(ban_level)
         str_tiempo = formatear_tiempo(cooldown)
-        mensaje = f"Nivel Troll: {strikes} | Retardo actual: {str_tiempo}.\nHaz una consulta seria para resetear a 0."
+        mensaje = (
+            f"⚠️ Nivel Troll: {strikes} strikes | BanLevel: {ban_level}\n"
+            f"Cooldown activo: {str_tiempo}.\n"
+            f"Haz una consulta financiera seria para resetear a 0."
+        )
         await query.answer(text=mensaje, show_alert=True)
         return
 
@@ -1083,18 +1089,17 @@ async def ejecutar_tarea_programada(context: ContextTypes.DEFAULT_TYPE):
                     )
 
 
-def obtener_penalizacion(strikes: int) -> float:
-    if strikes >= 50:
-        return float('inf')
-    elif strikes >= 40:
-        return 30 * 24 * 3600.0  # 1 mes (30 días)
-    elif strikes >= 30:
-        return 7 * 24 * 3600.0   # 1 semana
-    elif strikes >= 20:
-        return 24 * 3600.0       # 1 día
-    else:
-        # Exponencial limitado para no superar el día antes de llegar a 20.
-        return float(30 * (2 ** min(strikes, 11)))
+def obtener_penalizacion_por_ban_level(ban_level: int) -> float:
+    """Retorna el cooldown en segundos según el banLevel almacenado en BD."""
+    if ban_level >= 4:
+        return float('inf')   # Permanente
+    elif ban_level == 3:
+        return 24 * 3600.0    # 24 horas
+    elif ban_level == 2:
+        return 3600.0         # 1 hora
+    elif ban_level == 1:
+        return 120.0          # 2 minutos
+    return 30.0               # Normal: 30 segundos entre consultas
 
 def formatear_tiempo(segundos: float) -> str:
     if segundos == float('inf'):
@@ -1118,15 +1123,15 @@ async def conversacion_inversor(update: Update, context: ContextTypes.DEFAULT_TY
     solicitud = update.message.text
     tid = update.effective_user.id
 
-    # --- 🛡️ SISTEMA ANTI-SPAM (COOLDOWN) ---
+    # --- 🛡️ SISTEMA ANTI-SPAM (COOLDOWN basado en banLevel de BD) ---
     ahora = time.time()
     ultimo_uso = context.user_data.get('ultimo_uso', 0)
-    strikes = context.user_data.get('strikes', 0)
-    cooldown_segundos = obtener_penalizacion(strikes)
-    
+    ban_level = await db.obtener_ban_level(tid)
+    cooldown_segundos = obtener_penalizacion_por_ban_level(ban_level)
+
     if not es_reintento:
         if ahora - ultimo_uso < cooldown_segundos:
-            # Timeouts severos (≥ 1 día o permanente): ofrecer opción de pago para desbloquear.
+            # Bans severos (≥ día o permanente): ofrecer pago para desbloquear
             es_timeout_severo = (cooldown_segundos == float('inf') or cooldown_segundos >= 86400)
             if es_timeout_severo:
                 if cooldown_segundos == float('inf'):
@@ -1147,10 +1152,7 @@ async def conversacion_inversor(update: Update, context: ContextTypes.DEFAULT_TY
                         url=f"{STRIPE_PAYMENT_URL}?client_reference_id={tid}"
                     )]
                 ])
-                await update.message.reply_text(
-                    msg_ban,
-                    reply_markup=teclado_desbloqueo
-                )
+                await update.message.reply_text(msg_ban, reply_markup=teclado_desbloqueo)
             else:
                 tiempo_restante = cooldown_segundos - (ahora - ultimo_uso)
                 str_tiempo = formatear_tiempo(tiempo_restante)
@@ -1158,7 +1160,7 @@ async def conversacion_inversor(update: Update, context: ContextTypes.DEFAULT_TY
                     f"🛑 Motor Quant enfriándose. Espera {str_tiempo} para otra consulta."
                 )
             return
-            
+
         context.user_data['ultimo_uso'] = ahora
     # --- FIN DEL SISTEMA ANTI-SPAM ---
 
@@ -1205,18 +1207,17 @@ async def conversacion_inversor(update: Update, context: ContextTypes.DEFAULT_TY
     # Error → mostrar mensaje con botón de reintento (NO cobrar)
     if not url_compra:
         if texto_final and "Petición rechazada" in texto_final:
-            context.user_data['strikes'] = context.user_data.get('strikes', 0) + 1
-        else:
-            context.user_data['strikes'] = 0
-
+            # Consulta troll: sumar strike en BD
+            await db.sumar_strike(tid)
+        # (si fue un fallo técnico, no sumamos strike)
         teclado_error = InlineKeyboardMarkup([
             [InlineKeyboardButton("🔄 Reintentar con otros tickers", callback_data="reintentar")]
         ])
         await msg_espera.edit_text(texto_final, reply_markup=teclado_error)
         return
 
-    # Solicitud exitosa, resetear strikes
-    context.user_data['strikes'] = 0
+    # Solicitud exitosa: resetear strikes en BD
+    await db.resetear_strikes(tid)
 
     # Cobro Justo: solo cobrar en éxito
     await db.restar_credito(tid)
@@ -1309,11 +1310,12 @@ telegram_app.add_handler(CommandHandler("comprar", comando_comprar))
 async def lifespan(app: FastAPI):
     """Gestiona el ciclo de vida del bot de Telegram junto a FastAPI/Uvicorn."""
     # ── STARTUP ──
-    logger.info("[LIFESPAN] Inicializando bot de Telegram...")
-    await telegram_app.initialize()          # Llama a post_init si lo hubiera
+    logger.info("[LIFESPAN] Conectando con Supabase...")
+    await db.inicializar_pool()              # Crea el pool asyncpg
+    await db.inicializar_db()               # Añade columnas extra si faltan
 
-    # Inicializar DB y registrar comandos (equivalente al antiguo post_init)
-    await db.inicializar_db()
+    logger.info("[LIFESPAN] Inicializando bot de Telegram...")
+    await telegram_app.initialize()
     comandos = [
         BotCommand("start",   "Datos del bot"),
         BotCommand("menu",    "Configuración de fuentes y alertas"),

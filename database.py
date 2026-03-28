@@ -1,172 +1,242 @@
 """
-database.py — Capa de persistencia con Turso (libsql-client).
+database.py — Capa de persistencia con Supabase (PostgreSQL + asyncpg).
 
-Turso es una base de datos SQLite en la nube que NO se borra en cada
-reinicio de Render. Requiere dos variables de entorno:
-  - TURSO_URL   → libsql://tu-db.turso.io
-  - TURSO_TOKEN → token JWT generado en el dashboard de Turso
+Requiere la variable de entorno:
+  - DATABASE_URL → postgresql://user:password@host:5432/dbname
 
-Si NO están definidas, cae en modo SQLite LOCAL como fallback de desarrollo.
+Schema de la tabla 'usuarios' en Supabase (la tabla base ya está creada):
+  id              BIGINT PRIMARY KEY        (= telegram_id)
+  created_at      TIMESTAMPTZ DEFAULT now()
+  creditos        BIGINT      DEFAULT 2
+  strikes         INTEGER     DEFAULT 0
+  "banLevel"      SMALLINT    DEFAULT 0
+  username        TEXT        DEFAULT NULL
+  pagos           INTEGER     DEFAULT 0
+  -- Las siguientes columnas se añaden en inicializar_db() si no existen:
+  broker_url      TEXT        DEFAULT NULL
+  fuente_datos    TEXT        DEFAULT 'yahoo'
+  ultima_busqueda TEXT        DEFAULT NULL
+
+Niveles de banLevel:
+  0 → libre      (0–4 strikes)   cooldown: 30s
+  1 → leve       (5–14 strikes)  cooldown: 2 min
+  2 → moderado   (15–24 strikes) cooldown: 1 hora
+  3 → grave      (25–34 strikes) cooldown: 24 horas
+  4 → permanente (35+ strikes)   cooldown: infinito
 """
 
-import logging
+import asyncpg
 import os
-import libsql_client
+import logging
 
 logger = logging.getLogger(__name__)
 
-TURSO_URL   = os.getenv("TURSO_URL")
-TURSO_TOKEN = os.getenv("TURSO_TOKEN")
+DATABASE_URL = os.getenv("DATABASE_URL")
 
-# Fallback a SQLite local si no hay credenciales de Turso (entorno de desarrollo)
-if TURSO_URL and TURSO_TOKEN:
-    _DB_URL   = TURSO_URL
-    _DB_TOKEN = TURSO_TOKEN
-    logger.info("[DB] Modo TURSO (nube). Los datos persisten entre reinicios.")
-else:
-    # file: URI relativa para SQLite local
-    _DB_URL   = "file:botfinanzas.db"
-    _DB_TOKEN = ""
-    logger.warning("[DB] TURSO_URL/TURSO_TOKEN no definidos. Usando SQLite LOCAL (datos volátiles en Render).")
+# Pool global de conexiones
+_pool: asyncpg.Pool | None = None
 
-
-def _get_client() -> libsql_client.Client:
-    """Retorna un cliente síncrono de libsql. Se crea y cierra en cada operación."""
-    return libsql_client.create_client_sync(url=_DB_URL, auth_token=_DB_TOKEN)
+# Umbrales ordenados de mayor a menor para calcular banLevel
+_BAN_THRESHOLDS = [
+    (35, 4),
+    (25, 3),
+    (15, 2),
+    (5,  1),
+    (0,  0),
+]
 
 
-# ── DDL ─────────────────────────────────────────────────────────────────────
+def _calcular_ban_level(strikes: int) -> int:
+    for threshold, level in _BAN_THRESHOLDS:
+        if strikes >= threshold:
+            return level
+    return 0
+
+
+# ── INICIALIZACIÓN ────────────────────────────────────────────────────────────
+
+async def inicializar_pool():
+    """Crea el pool de conexiones asyncpg. Llamar UNA vez en el startup del lifespan."""
+    global _pool
+    if not DATABASE_URL:
+        logger.error("[DB] DATABASE_URL no definida. La BD no funcionará.")
+        return
+    _pool = await asyncpg.create_pool(
+        DATABASE_URL,
+        ssl='require',   # Supabase exige SSL
+        min_size=1,
+        max_size=5,
+    )
+    logger.info("[DB] Pool asyncpg inicializado correctamente.")
+
 
 async def inicializar_db():
-    """Crea las tablas si no existen. Llamar UNA vez en post_init del bot."""
-    with _get_client() as db:
-        db.execute("""
-            CREATE TABLE IF NOT EXISTS usuarios (
-                telegram_id     INTEGER PRIMARY KEY,
-                broker_url      TEXT    DEFAULT NULL,
-                fuente_datos    TEXT    DEFAULT 'yahoo',
-                ultima_busqueda TEXT    DEFAULT NULL,
-                creditos        INTEGER DEFAULT 3,
-                created_at      TEXT    DEFAULT (datetime('now')),
-                updated_at      TEXT    DEFAULT (datetime('now'))
-            )
-        """)
-        # Migración segura: añadir columna si la tabla ya existía sin ella
-        try:
-            db.execute("ALTER TABLE usuarios ADD COLUMN creditos INTEGER DEFAULT 3")
-        except Exception:
-            pass  # Columna ya existe
-    logger.info("[DB] Base de datos Turso inicializada correctamente.")
+    """
+    Añade las columnas extra (broker_url, fuente_datos, ultima_busqueda)
+    si aún no existen. La tabla base 'usuarios' ya fue creada en Supabase.
+    """
+    async with _pool.acquire() as conn:
+        for col, definition in [
+            ("broker_url",      "TEXT DEFAULT NULL"),
+            ("fuente_datos",    "TEXT DEFAULT 'yahoo'"),
+            ("ultima_busqueda", "TEXT DEFAULT NULL"),
+        ]:
+            try:
+                await conn.execute(
+                    f"ALTER TABLE usuarios ADD COLUMN {col} {definition}"
+                )
+            except Exception:
+                pass  # La columna ya existe, ignorar
+    logger.info("[DB] BD Supabase lista.")
 
 
-# ── LECTURA ──────────────────────────────────────────────────────────────────
+# ── LECTURA ───────────────────────────────────────────────────────────────────
 
 async def obtener_usuario(telegram_id: int) -> dict | None:
-    """Retorna el registro del usuario como dict, o None si no existe."""
-    with _get_client() as db:
-        result = db.execute(
-            "SELECT * FROM usuarios WHERE telegram_id = ?",
-            [telegram_id]
+    """Retorna el registro completo del usuario o None si no existe."""
+    async with _pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT * FROM usuarios WHERE id = $1", telegram_id
         )
-        if result.rows:
-            columnas = [c.name for c in result.columns]
-            return dict(zip(columnas, result.rows[0]))
-        return None
-
-
-async def obtener_ultima_busqueda(telegram_id: int) -> str | None:
-    """Atajo para leer solo la última búsqueda de un usuario."""
-    usuario = await obtener_usuario(telegram_id)
-    return usuario["ultima_busqueda"] if usuario else None
-
-
-async def obtener_fuente_datos(telegram_id: int) -> str:
-    """Retorna la fuente de datos del usuario, o 'yahoo' por defecto."""
-    usuario = await obtener_usuario(telegram_id)
-    return usuario["fuente_datos"] if usuario and usuario["fuente_datos"] else "yahoo"
-
-
-async def obtener_broker_url(telegram_id: int) -> str | None:
-    """Retorna la URL del broker del usuario, o None."""
-    usuario = await obtener_usuario(telegram_id)
-    return usuario["broker_url"] if usuario else None
+        return dict(row) if row else None
 
 
 async def obtener_creditos(telegram_id: int) -> int:
-    """Retorna los créditos del usuario, o 3 (default) si no existe."""
     usuario = await obtener_usuario(telegram_id)
-    return usuario["creditos"] if usuario and usuario["creditos"] is not None else 3
+    if usuario and usuario.get("creditos") is not None:
+        return int(usuario["creditos"])
+    return 2
 
 
-# ── ESCRITURA ────────────────────────────────────────────────────────────────
+async def obtener_ultima_busqueda(telegram_id: int) -> str | None:
+    usuario = await obtener_usuario(telegram_id)
+    return usuario.get("ultima_busqueda") if usuario else None
+
+
+async def obtener_fuente_datos(telegram_id: int) -> str:
+    usuario = await obtener_usuario(telegram_id)
+    if usuario and usuario.get("fuente_datos"):
+        return usuario["fuente_datos"]
+    return "yahoo"
+
+
+async def obtener_broker_url(telegram_id: int) -> str | None:
+    usuario = await obtener_usuario(telegram_id)
+    return usuario.get("broker_url") if usuario else None
+
+
+async def obtener_ban_level(telegram_id: int) -> int:
+    """Retorna el banLevel actual del usuario (0 si no existe)."""
+    async with _pool.acquire() as conn:
+        val = await conn.fetchval(
+            'SELECT "banLevel" FROM usuarios WHERE id = $1', telegram_id
+        )
+        return int(val) if val is not None else 0
+
+
+# ── ESCRITURA ─────────────────────────────────────────────────────────────────
 
 async def upsert_usuario(telegram_id: int, **campos):
-    """INSERT o UPDATE de un usuario con los campos proporcionados.
-
-    Ejemplo:
-        await upsert_usuario(12345, broker_url="https://degiro.es", ultima_busqueda="tech")
     """
-    # Campos válidos para evitar inyección SQL
-    CAMPOS_VALIDOS = {"broker_url", "fuente_datos", "ultima_busqueda", "creditos"}
+    INSERT o UPDATE de un usuario con los campos proporcionados.
+    Crea el registro si no existe.
+    """
+    CAMPOS_VALIDOS = {
+        "username", "creditos", "broker_url", "fuente_datos", "ultima_busqueda"
+    }
     campos_filtrados = {k: v for k, v in campos.items() if k in CAMPOS_VALIDOS}
 
-    with _get_client() as db:
-        existe = db.execute(
-            "SELECT 1 FROM usuarios WHERE telegram_id = ?",
-            [telegram_id]
+    async with _pool.acquire() as conn:
+        existe = await conn.fetchval(
+            "SELECT 1 FROM usuarios WHERE id = $1", telegram_id
         )
-
-        if existe.rows:
-            # UPDATE solo los campos proporcionados
+        if existe:
             if campos_filtrados:
-                set_clause = ", ".join(f"{k} = ?" for k in campos_filtrados)
-                valores = list(campos_filtrados.values()) + [telegram_id]
-                db.execute(
-                    f"UPDATE usuarios SET {set_clause}, updated_at = datetime('now') "
-                    f"WHERE telegram_id = ?",
-                    valores
+                keys = list(campos_filtrados.keys())
+                set_clause = ", ".join(f"{k} = ${i+2}" for i, k in enumerate(keys))
+                valores = [telegram_id] + list(campos_filtrados.values())
+                await conn.execute(
+                    f"UPDATE usuarios SET {set_clause} WHERE id = $1",
+                    *valores
                 )
         else:
-            # INSERT nuevo usuario con los campos proporcionados
-            columnas = ["telegram_id"] + list(campos_filtrados.keys())
-            placeholders = ", ".join("?" for _ in columnas)
+            columnas = ["id"] + list(campos_filtrados.keys())
+            placeholders = ", ".join(f"${i+1}" for i in range(len(columnas)))
             valores = [telegram_id] + list(campos_filtrados.values())
-            db.execute(
+            await conn.execute(
                 f"INSERT INTO usuarios ({', '.join(columnas)}) VALUES ({placeholders})",
-                valores
+                *valores
             )
 
 
 async def restar_credito(telegram_id: int):
-    """Resta 1 crédito al usuario. Solo ejecutar tras éxito del pipeline (Cobro Justo)."""
-    with _get_client() as db:
-        db.execute(
-            "UPDATE usuarios SET creditos = creditos - 1, updated_at = datetime('now') "
-            "WHERE telegram_id = ? AND creditos > 0",
-            [telegram_id]
+    """Resta 1 crédito. Solo ejecutar tras éxito del pipeline (Cobro Justo)."""
+    async with _pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE usuarios SET creditos = creditos - 1 "
+            "WHERE id = $1 AND creditos > 0",
+            telegram_id
         )
 
 
 async def actualizar_creditos(telegram_id: int, cantidad: int):
-    """Suma (o resta si negativo) créditos a un usuario. Crea el usuario si no existe.
-
-    Usado por el webhook de pago de Render para acreditar compras.
-    """
-    with _get_client() as db:
-        existe = db.execute(
-            "SELECT 1 FROM usuarios WHERE telegram_id = ?",
-            [telegram_id]
+    """Suma créditos e incrementa el contador de pagos. Crea el usuario si no existe."""
+    async with _pool.acquire() as conn:
+        existe = await conn.fetchval(
+            "SELECT 1 FROM usuarios WHERE id = $1", telegram_id
         )
-        if existe.rows:
-            db.execute(
-                "UPDATE usuarios SET creditos = creditos + ?, updated_at = datetime('now') "
-                "WHERE telegram_id = ?",
-                [cantidad, telegram_id]
+        if existe:
+            await conn.execute(
+                "UPDATE usuarios SET creditos = creditos + $2, pagos = pagos + 1 "
+                "WHERE id = $1",
+                telegram_id, cantidad
             )
         else:
-            # Primera vez que el usuario aparece (compró antes de usar el bot)
-            db.execute(
-                "INSERT INTO usuarios (telegram_id, creditos) VALUES (?, ?)",
-                [telegram_id, max(0, cantidad)]
+            await conn.execute(
+                "INSERT INTO usuarios (id, creditos, pagos) VALUES ($1, $2, 1)",
+                telegram_id, max(0, cantidad)
             )
-    logger.info(f"[DB] actualizar_creditos: usuario {telegram_id} += {cantidad}")
+    logger.info(f"[DB] actualizar_creditos: usuario {telegram_id} += {cantidad} créditos")
+
+
+async def sumar_strike(telegram_id: int) -> int:
+    """
+    Suma 1 strike, recalcula banLevel y lo persiste.
+    Retorna el nuevo banLevel.
+    """
+    async with _pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "UPDATE usuarios SET strikes = strikes + 1 "
+            "WHERE id = $1 RETURNING strikes",
+            telegram_id
+        )
+        if row:
+            new_strikes = row["strikes"]
+        else:
+            # Usuario no existe todavía: INSERT con 1 strike
+            await conn.execute(
+                "INSERT INTO usuarios (id, strikes) VALUES ($1, 1) "
+                "ON CONFLICT (id) DO UPDATE SET strikes = usuarios.strikes + 1",
+                telegram_id
+            )
+            new_strikes = 1
+
+        new_ban_level = _calcular_ban_level(new_strikes)
+        await conn.execute(
+            'UPDATE usuarios SET "banLevel" = $2 WHERE id = $1',
+            telegram_id, new_ban_level
+        )
+    logger.info(
+        f"[DB] sumar_strike: usuario {telegram_id} → "
+        f"strikes={new_strikes}, banLevel={new_ban_level}"
+    )
+    return new_ban_level
+
+
+async def resetear_strikes(telegram_id: int):
+    """Resetea strikes y banLevel a 0 tras una consulta legítima exitosa."""
+    async with _pool.acquire() as conn:
+        await conn.execute(
+            'UPDATE usuarios SET strikes = 0, "banLevel" = 0 WHERE id = $1',
+            telegram_id
+        )

@@ -173,11 +173,18 @@ def extractor_intenciones(prompt_del_inversor: str) -> dict | None:
         logger.error(f"JSON decode error en Extractor: {je}")
         return None
     except Exception as e:
-        es_rate_limit = "429" in str(e) or "quota" in str(e).lower() or "resource_exhausted" in str(e).lower()
+        error_str = str(e).lower()
+        # Log exacto para diagnóstico en Render
+        logger.error(f"[GEMINI ERROR] Tipo: {type(e).__name__} | Mensaje: {str(e)[:300]}")
+        es_rate_limit = "429" in str(e) or "quota" in error_str or "resource_exhausted" in error_str
+        es_conexion   = "timeout" in error_str or "timed out" in error_str or "connection" in error_str or "network" in error_str
         if es_rate_limit:
-            logger.warning("Rate limit Gemini en Extractor. Se reintentará desde el pipeline.")
+            logger.warning("[GEMINI] Rate limit detectado. Se reintentará desde el pipeline.")
             return {"_rate_limit": True}
-        logger.error(f"Error Extractor: {e}")
+        if es_conexion:
+            logger.warning("[GEMINI] Error de conexión/timeout. Se reintentará desde el pipeline.")
+            return {"_rate_limit": True}  # mismo flujo de reintento
+        logger.error(f"[GEMINI] Error no recuperable en Extractor.")
         return None
 
 
@@ -1359,6 +1366,24 @@ web_app = FastAPI(title="BotFinanzas Webhook", lifespan=lifespan)
 async def health_check():
     """Health-check: Render lo usa para confirmar que el servicio está vivo."""
     return {"status": "online", "service": "BotFinanzas"}
+
+
+@web_app.get("/health/gemini")
+async def health_gemini():
+    """Prueba la conectividad con la API de Gemini. Útil para diagnóstico en producción."""
+    import asyncio
+    loop = asyncio.get_running_loop()
+    def _test_gemini():
+        try:
+            res = client.models.generate_content(
+                model='gemini-2.0-flash',
+                contents="Responde solo con la palabra: OK"
+            )
+            return {"status": "ok", "response": res.text.strip()[:50]}
+        except Exception as e:
+            return {"status": "error", "type": type(e).__name__, "detail": str(e)[:300]}
+    result = await loop.run_in_executor(None, _test_gemini)
+    return result
 
 
 @web_app.post("/webhook-pago")

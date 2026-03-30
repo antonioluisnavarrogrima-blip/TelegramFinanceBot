@@ -160,31 +160,25 @@ def extractor_intenciones(prompt_del_inversor: str) -> dict | None:
       "filtros_dinamicos": []
     }
     """
-    esperas = [5, 15, 45]  # backoff exponencial en segundos
-    for intento, espera in enumerate(esperas + [None]):
-        try:
-            res = client.models.generate_content(
-                model='gemini-2.0-flash',
-                contents=f"{prompt_sistema}\n\n[INPUT USUARIO]: {prompt_del_inversor}",
-                config=types.GenerateContentConfig(response_mime_type="application/json")
-            )
-            texto = re.sub(r"^```[a-zA-Z]*\n?", "", res.text.strip())
-            texto = re.sub(r"```$", "", texto.strip())
-            return json.loads(texto)
-        except json.JSONDecodeError as je:
-            logger.error(f"JSON decode error en Extractor: {je}")
-            return None
-        except Exception as e:
-            es_rate_limit = "429" in str(e) or "quota" in str(e).lower() or "resource_exhausted" in str(e).lower()
-            if es_rate_limit and espera is not None:
-                logger.warning(f"Rate limit Gemini (intento {intento + 1}/3). Reintentando en {espera}s...")
-                time.sleep(espera)
-                continue
-            if es_rate_limit:
-                logger.error("Rate limit Gemini agotado tras 3 reintentos.")
-                return {"error_api": "Demasiadas peticiones al motor IA. Por favor, intenta de nuevo en 1 minuto."}
-            logger.error(f"Error Extractor: {e}")
-            return None
+    try:
+        res = client.models.generate_content(
+            model='gemini-2.0-flash',
+            contents=f"{prompt_sistema}\n\n[INPUT USUARIO]: {prompt_del_inversor}",
+            config=types.GenerateContentConfig(response_mime_type="application/json")
+        )
+        texto = re.sub(r"^```[a-zA-Z]*\n?", "", res.text.strip())
+        texto = re.sub(r"```$", "", texto.strip())
+        return json.loads(texto)
+    except json.JSONDecodeError as je:
+        logger.error(f"JSON decode error en Extractor: {je}")
+        return None
+    except Exception as e:
+        es_rate_limit = "429" in str(e) or "quota" in str(e).lower() or "resource_exhausted" in str(e).lower()
+        if es_rate_limit:
+            logger.warning("Rate limit Gemini en Extractor. Se reintentará desde el pipeline.")
+            return {"_rate_limit": True}
+        logger.error(f"Error Extractor: {e}")
+        return None
 
 
 def generador_informe_goldman(ticker: str, sector: str, datos: dict, perfil: str, clase_activo: str = "ACCION") -> str | None:
@@ -313,7 +307,7 @@ Ejemplo de Flash Note para BONO:
     """
     try:
         res = client.models.generate_content(
-            model='gemini-2.5-flash',
+            model='gemini-2.0-flash',
             contents=(
                 f"{prompt_sistema}\n\n"
                 f"Perfil Cliente: {perfil} | Sector/Categoría: {sector}\n"
@@ -591,10 +585,24 @@ async def pipeline_hibrido(
     Soporta: ACCION, REIT, ETF, CRIPTO, BONO.
     Retorna SIEMPRE 4 valores: (texto_final, ruta_grafico, url_compra, ticker_final)
     """
-    # 1. Extracción de intenciones con IA
+    # 1. Extracción de intenciones con IA (con reintentos async no bloqueantes)
     if msg_espera:
         await msg_espera.edit_text("🔍 Analizando tipo de activo e infiriendo perfil del inversor...")
-    extraccion = extractor_intenciones(solicitud)
+
+    extraccion = None
+    esperas_retry = [10, 20]
+    for i_retry, espera_retry in enumerate(esperas_retry + [None]):
+        extraccion = extractor_intenciones(solicitud)
+        if extraccion and extraccion.get("_rate_limit"):
+            if espera_retry is not None:
+                logger.warning(f"Rate limit Gemini, reintentando en {espera_retry}s (intento {i_retry+1})...")
+                if msg_espera:
+                    await msg_espera.edit_text(f"⏳ Motor IA ocupado, reintentando en {espera_retry}s...")
+                await asyncio.sleep(espera_retry)
+                continue
+            else:
+                return "⚠️ El motor IA está temporalmente saturado. Por favor, espera 1 minuto e inténtalo de nuevo.", None, None, None
+        break  # éxito o error no relacionado con rate limit
 
     if extraccion and extraccion.get("error_api"):
         return f"⚠️ {extraccion['error_api']}", None, None, None

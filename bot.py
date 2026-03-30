@@ -160,24 +160,31 @@ def extractor_intenciones(prompt_del_inversor: str) -> dict | None:
       "filtros_dinamicos": []
     }
     """
-    try:
-        res = client.models.generate_content(
-            model='gemini-2.0-flash',
-            contents=f"{prompt_sistema}\n\n[INPUT USUARIO]: {prompt_del_inversor}",
-            config=types.GenerateContentConfig(response_mime_type="application/json")
-        )
-        texto = re.sub(r"^```[a-zA-Z]*\n?", "", res.text.strip())
-        texto = re.sub(r"```$", "", texto.strip())
-        return json.loads(texto)
-    except json.JSONDecodeError as je:
-        logger.error(f"JSON decode error en Extractor: {je}")
-        return None
-    except Exception as e:
-        if "429" in str(e):
-            logger.warning("Rate limit de Google AI alcanzado.")
-            return {"error_api": "Demasiadas peticiones. El motor Quant necesita 60s para enfriarse."}
-        logger.error(f"Error Extractor: {e}")
-        return None
+    esperas = [5, 15, 45]  # backoff exponencial en segundos
+    for intento, espera in enumerate(esperas + [None]):
+        try:
+            res = client.models.generate_content(
+                model='gemini-2.0-flash',
+                contents=f"{prompt_sistema}\n\n[INPUT USUARIO]: {prompt_del_inversor}",
+                config=types.GenerateContentConfig(response_mime_type="application/json")
+            )
+            texto = re.sub(r"^```[a-zA-Z]*\n?", "", res.text.strip())
+            texto = re.sub(r"```$", "", texto.strip())
+            return json.loads(texto)
+        except json.JSONDecodeError as je:
+            logger.error(f"JSON decode error en Extractor: {je}")
+            return None
+        except Exception as e:
+            es_rate_limit = "429" in str(e) or "quota" in str(e).lower() or "resource_exhausted" in str(e).lower()
+            if es_rate_limit and espera is not None:
+                logger.warning(f"Rate limit Gemini (intento {intento + 1}/3). Reintentando en {espera}s...")
+                time.sleep(espera)
+                continue
+            if es_rate_limit:
+                logger.error("Rate limit Gemini agotado tras 3 reintentos.")
+                return {"error_api": "Demasiadas peticiones al motor IA. Por favor, intenta de nuevo en 1 minuto."}
+            logger.error(f"Error Extractor: {e}")
+            return None
 
 
 def generador_informe_goldman(ticker: str, sector: str, datos: dict, perfil: str, clase_activo: str = "ACCION") -> str | None:

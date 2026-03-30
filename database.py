@@ -4,7 +4,7 @@ database.py — Capa de persistencia con Supabase (PostgreSQL + asyncpg).
 Requiere la variable de entorno:
   - DATABASE_URL → postgresql://user:password@host:5432/dbname
 
-Schema de la tabla 'usuarios' en Supabase (la tabla base ya está creada):
+Schema de la tabla 'usuarios' en Supabase:
   id              BIGINT PRIMARY KEY        (= telegram_id)
   created_at      TIMESTAMPTZ DEFAULT now()
   creditos        BIGINT      DEFAULT 2
@@ -16,6 +16,10 @@ Schema de la tabla 'usuarios' en Supabase (la tabla base ya está creada):
   broker_url      TEXT        DEFAULT NULL
   fuente_datos    TEXT        DEFAULT 'yahoo'
   ultima_busqueda TEXT        DEFAULT NULL
+  ultimo_uso      FLOAT       DEFAULT 0     ← timestamp Unix para cooldown anti-spam
+
+Tabla adicional (creada en inicializar_db si no existe):
+  stripe_eventos (event_id TEXT PK, created_at TIMESTAMPTZ)  ← idempotencia Stripe
 
 Niveles de banLevel:
   0 → libre      (0–4 strikes)   cooldown: 30s
@@ -65,28 +69,46 @@ async def inicializar_pool():
         DATABASE_URL,
         ssl='require',   # Supabase exige SSL
         min_size=1,
-        max_size=5,
+        max_size=10,     # Subido para soportar más carga concurrente
     )
     logger.info("[DB] Pool asyncpg inicializado correctamente.")
 
 
 async def inicializar_db():
     """
-    Añade las columnas extra (broker_url, fuente_datos, ultima_busqueda)
-    si aún no existen. La tabla base 'usuarios' ya fue creada en Supabase.
+    Añade columnas extra y crea tablas auxiliares si no existen.
+    La tabla base 'usuarios' ya fue creada en Supabase.
     """
     async with _pool.acquire() as conn:
-        for col, definition in [
+        # ── Columnas extra en 'usuarios' ──────────────────────────────────────
+        columnas_extra = [
             ("broker_url",      "TEXT DEFAULT NULL"),
             ("fuente_datos",    "TEXT DEFAULT 'yahoo'"),
             ("ultima_busqueda", "TEXT DEFAULT NULL"),
-        ]:
+            ("ultimo_uso",      "FLOAT DEFAULT 0"),
+            ("estado",          "TEXT DEFAULT NULL"),    # Estado de conversación persistente
+            ("alerta_intervalo","INTEGER DEFAULT NULL"), # Horas entre alertas (NULL = desactivada)
+            ("ultima_alerta",   "FLOAT DEFAULT 0"),      # Timestamp Unix de la última alerta enviada
+        ]
+        for col, definition in columnas_extra:
             try:
                 await conn.execute(
                     f"ALTER TABLE usuarios ADD COLUMN {col} {definition}"
                 )
             except Exception:
                 pass  # La columna ya existe, ignorar
+
+        # ── Tabla de idempotencia Stripe ──────────────────────────────────────
+        try:
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS stripe_eventos (
+                    event_id   TEXT        PRIMARY KEY,
+                    created_at TIMESTAMPTZ DEFAULT now()
+                )
+            """)
+        except Exception as e:
+            logger.warning(f"[DB] No se pudo crear tabla stripe_eventos: {e}")
+
     logger.info("[DB] BD Supabase lista.")
 
 
@@ -102,27 +124,33 @@ async def obtener_usuario(telegram_id: int) -> dict | None:
 
 
 async def obtener_creditos(telegram_id: int) -> int:
-    usuario = await obtener_usuario(telegram_id)
-    if usuario and usuario.get("creditos") is not None:
-        return int(usuario["creditos"])
-    return 2
+    async with _pool.acquire() as conn:
+        val = await conn.fetchval(
+            "SELECT creditos FROM usuarios WHERE id = $1", telegram_id
+        )
+        return int(val) if val is not None else 2
 
 
 async def obtener_ultima_busqueda(telegram_id: int) -> str | None:
-    usuario = await obtener_usuario(telegram_id)
-    return usuario.get("ultima_busqueda") if usuario else None
+    async with _pool.acquire() as conn:
+        return await conn.fetchval(
+            "SELECT ultima_busqueda FROM usuarios WHERE id = $1", telegram_id
+        )
 
 
 async def obtener_fuente_datos(telegram_id: int) -> str:
-    usuario = await obtener_usuario(telegram_id)
-    if usuario and usuario.get("fuente_datos"):
-        return usuario["fuente_datos"]
-    return "yahoo"
+    async with _pool.acquire() as conn:
+        val = await conn.fetchval(
+            "SELECT fuente_datos FROM usuarios WHERE id = $1", telegram_id
+        )
+        return val if val else "yahoo"
 
 
 async def obtener_broker_url(telegram_id: int) -> str | None:
-    usuario = await obtener_usuario(telegram_id)
-    return usuario.get("broker_url") if usuario else None
+    async with _pool.acquire() as conn:
+        return await conn.fetchval(
+            "SELECT broker_url FROM usuarios WHERE id = $1", telegram_id
+        )
 
 
 async def obtener_ban_level(telegram_id: int) -> int:
@@ -134,6 +162,41 @@ async def obtener_ban_level(telegram_id: int) -> int:
         return int(val) if val is not None else 0
 
 
+async def obtener_ultimo_uso(telegram_id: int) -> float:
+    """
+    Retorna el timestamp Unix (float) de la última consulta del usuario.
+    Se usa para aplicar el cooldown anti-spam de forma persistente.
+    """
+    async with _pool.acquire() as conn:
+        val = await conn.fetchval(
+            "SELECT ultimo_uso FROM usuarios WHERE id = $1", telegram_id
+        )
+        return float(val) if val is not None else 0.0
+
+
+# ── IDEMPOTENCIA STRIPE ───────────────────────────────────────────────────────
+
+async def evento_ya_procesado(event_id: str) -> bool:
+    """Retorna True si el event_id de Stripe ya fue procesado anteriormente."""
+    async with _pool.acquire() as conn:
+        val = await conn.fetchval(
+            "SELECT 1 FROM stripe_eventos WHERE event_id = $1", event_id
+        )
+        return val is not None
+
+
+async def marcar_evento_procesado(event_id: str) -> None:
+    """Registra el event_id de Stripe para evitar procesarlo dos veces."""
+    async with _pool.acquire() as conn:
+        try:
+            await conn.execute(
+                "INSERT INTO stripe_eventos (event_id) VALUES ($1) ON CONFLICT DO NOTHING",
+                event_id
+            )
+        except Exception as e:
+            logger.error(f"[DB] Error marcando evento Stripe {event_id}: {e}")
+
+
 # ── ESCRITURA ─────────────────────────────────────────────────────────────────
 
 async def upsert_usuario(telegram_id: int, **campos):
@@ -142,7 +205,9 @@ async def upsert_usuario(telegram_id: int, **campos):
     Crea el registro si no existe.
     """
     CAMPOS_VALIDOS = {
-        "username", "creditos", "broker_url", "fuente_datos", "ultima_busqueda"
+        "username", "creditos", "broker_url", "fuente_datos",
+        "ultima_busqueda", "ultimo_uso", "estado",
+        "alerta_intervalo", "ultima_alerta",
     }
     campos_filtrados = {k: v for k, v in campos.items() if k in CAMPOS_VALIDOS}
 
@@ -167,6 +232,22 @@ async def upsert_usuario(telegram_id: int, **campos):
                 f"INSERT INTO usuarios ({', '.join(columnas)}) VALUES ({placeholders})",
                 *valores
             )
+
+
+async def actualizar_ultimo_uso(telegram_id: int, timestamp: float) -> None:
+    """
+    Actualiza el timestamp de último uso para el cooldown anti-spam.
+    Opera con UPSERT para garantizar que el registro existe.
+    """
+    async with _pool.acquire() as conn:
+        await conn.execute(
+            """
+            INSERT INTO usuarios (id, ultimo_uso)
+            VALUES ($1, $2)
+            ON CONFLICT (id) DO UPDATE SET ultimo_uso = $2
+            """,
+            telegram_id, timestamp
+        )
 
 
 async def restar_credito(telegram_id: int):
@@ -239,4 +320,53 @@ async def resetear_strikes(telegram_id: int):
         await conn.execute(
             'UPDATE usuarios SET strikes = 0, "banLevel" = 0 WHERE id = $1',
             telegram_id
+        )
+
+
+# ── ALERTAS PERSISTENTES ──────────────────────────────────────────────────────
+
+async def obtener_usuarios_con_alerta() -> list[dict]:
+    """
+    Retorna todos los usuarios con alerta activa (alerta_intervalo IS NOT NULL)
+    y con una búsqueda guardada válida.
+    """
+    async with _pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT id, ultima_busqueda, fuente_datos, alerta_intervalo, ultima_alerta
+            FROM usuarios
+            WHERE alerta_intervalo IS NOT NULL
+              AND ultima_busqueda IS NOT NULL
+              AND ultima_busqueda NOT LIKE '__STATE:%'
+              AND ultima_busqueda != '__ESPERANDO_URL__'
+            """
+        )
+        return [dict(row) for row in rows]
+
+
+async def actualizar_alerta(telegram_id: int, intervalo_horas: int | None) -> None:
+    """
+    Activa (intervalo_horas > 0) o desactiva (None) la alerta del usuario.
+    Si se desactiva, también resetea ultima_alerta.
+    """
+    async with _pool.acquire() as conn:
+        await conn.execute(
+            """
+            INSERT INTO usuarios (id, alerta_intervalo, ultima_alerta)
+            VALUES ($1, $2, 0)
+            ON CONFLICT (id) DO UPDATE
+              SET alerta_intervalo = $2,
+                  ultima_alerta    = CASE WHEN $2 IS NULL THEN 0 ELSE usuarios.ultima_alerta END
+            """,
+            telegram_id, intervalo_horas
+        )
+    logger.info(f"[DB] actualizar_alerta: usuario {telegram_id} → intervalo={intervalo_horas}h")
+
+
+async def actualizar_ultima_alerta(telegram_id: int, timestamp: float) -> None:
+    """Registra el timestamp Unix de la última alerta enviada (para calcular cuándo toca la siguiente)."""
+    async with _pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE usuarios SET ultima_alerta = $2 WHERE id = $1",
+            telegram_id, timestamp
         )

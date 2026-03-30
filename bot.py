@@ -23,6 +23,11 @@ import stripe
 
 import database as db
 
+# Executor global reutilizable para tareas generales
+_EXECUTOR = concurrent.futures.ThreadPoolExecutor(max_workers=10)
+# Executor dedicado con sólo 3 workers para Yahoo Finance (evita IP ban por exceso de requests)
+_YF_EXECUTOR = concurrent.futures.ThreadPoolExecutor(max_workers=3)
+
 # Configurar logging
 logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -34,10 +39,7 @@ load_dotenv()
 TELEGRAM_TOKEN   = os.getenv("TELEGRAM_TOKEN")
 GEMINI_API_KEY   = os.getenv("GEMINI_API_KEY")
 STRIPE_API_KEY   = os.getenv("STRIPE_API_KEY", "")   # sk_live_... o sk_test_...
-
-# Inicializar Stripe (necesario para el SDK, aunque no usemos la API REST por ahora)
-import stripe as _stripe_init
-_stripe_init.api_key = STRIPE_API_KEY
+stripe.api_key = STRIPE_API_KEY
 
 if not TELEGRAM_TOKEN or not GEMINI_API_KEY:
     logger.error("Falta TELEGRAM_TOKEN o GEMINI_API_KEY en .env")
@@ -55,6 +57,8 @@ except Exception as e:
 STRIPE_WEBHOOK_SECRET = os.getenv("STRIPE_WEBHOOK_SECRET", "")
 CREDITOS_POR_COMPRA   = int(os.getenv("CREDITOS_POR_COMPRA", "10"))
 STRIPE_PAYMENT_URL    = "https://buy.stripe.com/28EcN70yD05tcjHgZm3VC00"
+# Secret para proteger el endpoint /cron/ejecutar de llamadas no autorizadas
+CRON_SECRET = os.getenv("CRON_SECRET", "")
 
 OPS = {
     ">": operator.gt, "<": operator.lt, ">=": operator.ge,
@@ -92,8 +96,8 @@ FUENTES_DATOS = {
 
 # --- 1. AGENTES DE IA (EXTRACTOR Y GENERADOR) ---
 
-def extractor_intenciones(prompt_del_inversor: str) -> dict | None:
-    """Extrae clase de activo, perfil, sector, tickers y filtros del input usando Gemini."""
+async def extractor_intenciones(prompt_del_inversor: str) -> dict | None:
+    """Extrae clase de activo, perfil, sector, tickers y filtros del input usando Gemini (async nativo)."""
     prompt_sistema = """
     Rol: Actúa como un Analista de Datos Financieros Global, experto en todos los mercados.
 
@@ -112,8 +116,8 @@ def extractor_intenciones(prompt_del_inversor: str) -> dict | None:
     • "CRIPTO"  → Criptomonedas y tokens DeFi. Palabras clave: cripto, bitcoin, ethereum, defi, token, blockchain.
     • "BONO"    → Renta fija, bonos, deuda. Palabras clave: bono, tesoro, deuda, renta fija, obligación.
 
-    ══ PASO 2: GENERAR TICKERS (20 unidades) ══
-    Genera exactamente 20 tickers de Yahoo Finance para la clase de activo detectada.
+    ══ PASO 2: GENERAR TICKERS (10 unidades) ══
+    Genera exactamente 10 tickers de Yahoo Finance para la clase de activo detectada.
     • ACCION: Tickers de empresas (ej: AAPL, SAN.MC).
     • REIT: Tickers de REITs/SOCIMIs (ej: O, VNQ, STAG, PLD, COL.MC).
     • ETF: Tickers de ETFs (ej: SPY, QQQ, VTI, VUSA.L, IWDA.L).
@@ -156,62 +160,46 @@ def extractor_intenciones(prompt_del_inversor: str) -> dict | None:
 
     🚨 MULTI-RESTRICCIÓN: Si el usuario pide 3 cosas, el array DEBE tener 3 objetos.
 
-    RESPONDE EXCLUSIVAMENTE CON ESTE JSON:
+    RESPONDE EXCLUSIVAMENTE CON ESTE JSON (sin texto extra, sin bloques markdown):
     {
-      "clase_activo": "ACCION"|"REIT"|"ETF"|"CRIPTO"|"BONO",
-      "perfil": "Seguro"|"Riesgo"|"Balanceado",
-      "sector": "El sector o categoría inferida",
-      "tickers": ["TKR1", ..., "TKR20"],
+      "clase_activo": "<ACCION|REIT|ETF|CRIPTO|BONO>",
+      "perfil": "<Seguro|Riesgo|Balanceado>",
+      "sector": "<sector o categoría inferida>",
+      "tickers": ["<TICKER_1>", "<TICKER_2>", "<TICKER_3>", "<TICKER_4>", "<TICKER_5>", "<TICKER_6>", "<TICKER_7>", "<TICKER_8>", "<TICKER_9>", "<TICKER_10>"],
       "filtros_dinamicos": []
     }
+    El array "tickers" DEBE contener exactamente 10 símbolos reales de Yahoo Finance, sin placeholders.
     """
     try:
-        res = client.models.generate_content(
+        res = await client.aio.models.generate_content(
             model='gemini-2.0-flash',
             contents=f"{prompt_sistema}\n\n[INPUT USUARIO]: {prompt_del_inversor}",
             config=types.GenerateContentConfig(response_mime_type="application/json")
         )
-        
-        # Extracción de JSON a prueba de balas (ignora Markdown y texto extra)
         texto_bruto = res.text.strip()
         match = re.search(r'(\{.*\})', texto_bruto, re.DOTALL)
-        
-        if match:
-            texto_limpio = match.group(1)
-        else:
-            texto_limpio = texto_bruto
-            
+        texto_limpio = match.group(1) if match else texto_bruto
         return json.loads(texto_limpio)
-        
     except json.JSONDecodeError as je:
-        # Añadido log para que veas qué intentó responder la IA si vuelve a fallar
-        logger.error(f"JSON decode error en Extractor: {je} | Texto devuelto: {res.text[:200]}...")
+        logger.error(f"[EXTRACTOR] JSON decode error: {je} | Texto bruto: '{texto_bruto[:400]}'")
         return None
     except Exception as e:
         error_str = str(e).lower()
-        # Log exacto para diagnóstico en Render
         logger.error(f"[GEMINI ERROR] Tipo: {type(e).__name__} | Mensaje: {str(e)[:300]}")
         es_rate_limit = "429" in str(e) or "quota" in error_str or "resource_exhausted" in error_str
         es_conexion   = "timeout" in error_str or "timed out" in error_str or "connection" in error_str or "network" in error_str
         if es_rate_limit:
-            logger.warning("[GEMINI] Rate limit detectado. Se reintentará desde el pipeline.")
+            logger.warning("[GEMINI] Rate limit. Se reintentará desde el pipeline.")
             return {"_rate_limit": True}
         if es_conexion:
-            logger.warning("[GEMINI] Error de conexión/timeout. Se reintentará desde el pipeline.")
-            return {"_rate_limit": True}  # mismo flujo de reintento
-        logger.error(f"[GEMINI] Error no recuperable en Extractor.")
+            logger.warning("[GEMINI] Error de conexión/timeout. Se reintentará.")
+            return {"_rate_limit": True}
+        logger.error("[GEMINI] Error no recuperable en Extractor.")
         return None
 
 
-def generador_informe_goldman(ticker: str, sector: str, datos: dict, perfil: str, clase_activo: str = "ACCION") -> str | None:
-    """Genera un informe estilo Goldman Sachs adaptado a la clase de activo.
-    
-    Técnicas aplicadas:
-    - Sanitización: se eliminan campos N/A o None antes de enviar a la IA.
-    - Few-Shot Prompting: se incluye un ejemplo real de informe por clase de activo.
-    - Restricciones Negativas: se prohíbe explícitamente mencionar métricas
-      que no correspondan a la clase de activo analizado.
-    """
+async def generador_informe_goldman(ticker: str, sector: str, datos: dict, perfil: str, clase_activo: str = "ACCION") -> str | None:
+    """Genera un informe estilo Goldman Sachs adaptado a la clase de activo (async nativo)."""
 
     # ── Técnica 1: SANITIZACIÓN ─────────────────────────────────────────────
     # Eliminamos claves con valor None, "N/A" o 0 para reducir el ruido.
@@ -328,7 +316,7 @@ Ejemplo de Flash Note para BONO:
     ⚖️ Veredicto: [Cierre pragmático]
     """
     try:
-        res = client.models.generate_content(
+        res = await client.aio.models.generate_content(
             model='gemini-2.0-flash',
             contents=(
                 f"{prompt_sistema}\n\n"
@@ -346,7 +334,9 @@ Ejemplo de Flash Note para BONO:
 # --- 2. HERRAMIENTAS MATEMÁTICAS LOCALES ---
 
 def fabricante_de_graficos(ticker: str, periodo: str = "3mo") -> tuple[str | None, float | None]:
-    """Genera gráfico PNG en directorio temporal. Retorna (ruta_archivo, rendimiento_%)."""
+    """Genera gráfico PNG en directorio temporal. Retorna (ruta_archivo, rendimiento_%).
+    Thread-safe: usa la API OOP de Matplotlib en vez del estado global plt.*
+    """
     try:
         historico = yf.Ticker(ticker).history(period=periodo)
         if historico.empty:
@@ -357,17 +347,18 @@ def fabricante_de_graficos(ticker: str, periodo: str = "3mo") -> tuple[str | Non
         rendimiento = ((precio_fin - precio_ini) / precio_ini) * 100
 
         color = '#2ca02c' if rendimiento >= 0 else '#d62728'
-        plt.figure(figsize=(10, 5))
-        plt.plot(historico.index, historico['Close'], color=color, linewidth=2.5)
-        plt.fill_between(historico.index, historico['Close'], historico['Close'].min(), color=color, alpha=0.1)
-        plt.title(f"Evolución de Alpha: {ticker.upper()} ({periodo})", fontsize=14, fontweight='bold', color='#333333')
-        plt.ylabel('Precio por Acción', fontsize=12)
-        plt.grid(True, linestyle='--', alpha=0.5)
+        # API OOP: cada llamada trabaja sobre su propio objeto fig/ax (thread-safe)
+        fig, ax = plt.subplots(figsize=(10, 5))
+        ax.plot(historico.index, historico['Close'], color=color, linewidth=2.5)
+        ax.fill_between(historico.index, historico['Close'], historico['Close'].min(), color=color, alpha=0.1)
+        ax.set_title(f"Evolución de Alpha: {ticker.upper()} ({periodo})", fontsize=14, fontweight='bold', color='#333333')
+        ax.set_ylabel('Precio por Acción', fontsize=12)
+        ax.grid(True, linestyle='--', alpha=0.5)
 
         fd, ruta = tempfile.mkstemp(suffix=f"_{ticker}.png", prefix="quant_")
         os.close(fd)
-        plt.savefig(ruta, bbox_inches='tight', dpi=80)
-        plt.close()
+        fig.savefig(ruta, bbox_inches='tight', dpi=80)
+        plt.close(fig)  # Cierra SOLO esta figura, no afecta a otros hilos
         return ruta, rendimiento
     except Exception as e:
         logger.error(f"Fallo trazando gráfico de {ticker}: {e}")
@@ -629,13 +620,16 @@ async def pipeline_hibrido(
     Retorna SIEMPRE 4 valores: (texto_final, ruta_grafico, url_compra, ticker_final)
     """
     # 1. Extracción de intenciones con IA (con reintentos async no bloqueantes)
+    # Se ejecuta en el executor global para no bloquear el event loop de asyncio
     if msg_espera:
         await msg_espera.edit_text("🔍 Analizando tipo de activo e infiriendo perfil del inversor...")
 
+    loop = asyncio.get_running_loop()
     extraccion = None
     esperas_retry = [10, 20]
     for i_retry, espera_retry in enumerate(esperas_retry + [None]):
-        extraccion = extractor_intenciones(solicitud)
+        # Gemini async nativo: no necesita executor
+        extraccion = await extractor_intenciones(solicitud)
         if extraccion and extraccion.get("_rate_limit"):
             if espera_retry is not None:
                 logger.warning(f"Rate limit Gemini, reintentando en {espera_retry}s (intento {i_retry+1})...")
@@ -651,7 +645,15 @@ async def pipeline_hibrido(
         return f"⚠️ {extraccion['error_api']}", None, None, None
 
     if not extraccion or not extraccion.get('tickers'):
-        return "❌ Nuestro Extractor Quants falló al decodificar tu petición. Intenta ser más claro.", None, None, None
+        logger.error(f"[PIPELINE] Extractor devolvio resultado invalido: {extraccion}")
+        return (
+            "❌ El Extractor IA no logro identificar activos para esa consulta.\n"
+            "Prueba a ser más específico, por ejemplo:\n"
+            "  • 'acciones con dividendo >5% del sector energía'\n"
+            "  • 'ETFs tecnológicos baratos'\n"
+            "  • 'REITs con rentabilidad alta'",
+            None, None, None
+        )
 
     clase_activo = extraccion.get("clase_activo", "ACCION").upper()
     perfil = extraccion.get("perfil", "Balanceado")
@@ -674,8 +676,8 @@ async def pipeline_hibrido(
             parse_mode="Markdown"
         )
 
-    # 2. Seleccionar checker según clase de activo
-    loop = asyncio.get_running_loop()
+    # 2. Seleccionar checker según clase de activo (loop ya definido arriba)
+    # Se usa _YF_EXECUTOR (3 workers) para limitar la concurrencia con Yahoo Finance
     pre_ganadores = []
     # Inicializar filtros con valores por defecto; se sobreescribirán si clase_activo == "ACCION"
     filtros: dict = {"temporalidad": "3mo", "rendimiento_objetivo": 0.0, "rendimiento_op": operator.ge}
@@ -700,35 +702,31 @@ async def pipeline_hibrido(
                 "div_op": filtros["div_op"], "div_abs_op": filtros["div_abs_op"],
                 "filtros_extra": list(filtros["filtros_extra"]),
             }
-            with concurrent.futures.ThreadPoolExecutor(max_workers=5) as pool:
-                tareas = [loop.run_in_executor(pool, _chequear_fundamentales_accion, t, filtros_snap) for t in tickers]
-                resultados = await asyncio.gather(*tareas)
+            # Usar _YF_EXECUTOR (máx 3 workers) para no saturar a Yahoo Finance
+            tareas = [loop.run_in_executor(_YF_EXECUTOR, _chequear_fundamentales_accion, t, filtros_snap) for t in tickers]
+            resultados = await asyncio.gather(*tareas)
             pre_ganadores = [r for r in resultados if r is not None]
             if pre_ganadores:
                 break
 
     elif clase_activo == "REIT":
-        with concurrent.futures.ThreadPoolExecutor(max_workers=5) as pool:
-            tareas = [loop.run_in_executor(pool, _chequear_fundamentales_reit, t, filtros_dinamicos_raw) for t in tickers]
-            resultados = await asyncio.gather(*tareas)
+        tareas = [loop.run_in_executor(_YF_EXECUTOR, _chequear_fundamentales_reit, t, filtros_dinamicos_raw) for t in tickers]
+        resultados = await asyncio.gather(*tareas)
         pre_ganadores = [r for r in resultados if r is not None]
 
     elif clase_activo == "ETF":
-        with concurrent.futures.ThreadPoolExecutor(max_workers=5) as pool:
-            tareas = [loop.run_in_executor(pool, _chequear_fundamentales_etf, t, filtros_dinamicos_raw) for t in tickers]
-            resultados = await asyncio.gather(*tareas)
+        tareas = [loop.run_in_executor(_YF_EXECUTOR, _chequear_fundamentales_etf, t, filtros_dinamicos_raw) for t in tickers]
+        resultados = await asyncio.gather(*tareas)
         pre_ganadores = [r for r in resultados if r is not None]
 
     elif clase_activo == "CRIPTO":
-        with concurrent.futures.ThreadPoolExecutor(max_workers=5) as pool:
-            tareas = [loop.run_in_executor(pool, _chequear_fundamentales_cripto, t, filtros_dinamicos_raw) for t in tickers]
-            resultados = await asyncio.gather(*tareas)
+        tareas = [loop.run_in_executor(_YF_EXECUTOR, _chequear_fundamentales_cripto, t, filtros_dinamicos_raw) for t in tickers]
+        resultados = await asyncio.gather(*tareas)
         pre_ganadores = [r for r in resultados if r is not None]
 
     elif clase_activo == "BONO":
-        with concurrent.futures.ThreadPoolExecutor(max_workers=5) as pool:
-            tareas = [loop.run_in_executor(pool, _chequear_fundamentales_bono, t, filtros_dinamicos_raw) for t in tickers]
-            resultados = await asyncio.gather(*tareas)
+        tareas = [loop.run_in_executor(_YF_EXECUTOR, _chequear_fundamentales_bono, t, filtros_dinamicos_raw) for t in tickers]
+        resultados = await asyncio.gather(*tareas)
         pre_ganadores = [r for r in resultados if r is not None]
 
     else:
@@ -789,9 +787,20 @@ async def pipeline_hibrido(
             f"Redactando sumario ejecutivo Goldman Sachs..."
         )
 
-    # 4. Generador Goldman Sachs adaptado
+    # 4. Generador Goldman Sachs adaptado (en executor para no bloquear el event loop)
     ticker_final = mejor_opcion['ticker']
-    informe_gs = generador_informe_goldman(ticker_final, sector, mejor_opcion, perfil, clase_activo)
+    try:
+        # Gemini async nativo: await directo, sin executor
+        informe_gs = await generador_informe_goldman(
+            ticker_final, sector, mejor_opcion, perfil, clase_activo
+        )
+    except Exception as e:
+        logger.error(f"[GS] Error generando informe: {e}")
+        if ruta_captura_final and os.path.exists(ruta_captura_final):
+            try: os.remove(ruta_captura_final)
+            except OSError: pass
+        return "❌ Error al generar el informe ejecutivo. Intenta de nuevo.", None, None, None
+
     if not informe_gs:
         informe_gs = f"Datos Crudos: {ticker_final} | Clase: {clase_activo} | {json.dumps(mejor_opcion)}"
     else:
@@ -831,7 +840,9 @@ async def comando_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def comando_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     tid = update.effective_user.id
     creditos = await db.obtener_creditos(tid)
-    strikes = context.user_data.get('strikes', 0)
+    # Fix: leer strikes reales desde la BD en vez de user_data (en memoria)
+    usuario = await db.obtener_usuario(tid)
+    strikes = usuario["strikes"] if usuario else 0
     teclado = InlineKeyboardMarkup([
         [InlineKeyboardButton(f"⚠️ Ver mis Strikes ({strikes})", callback_data="ver_strikes")],
         [InlineKeyboardButton("🔗 Configurar mi Broker (URL)", callback_data="pedir_url")],
@@ -862,17 +873,24 @@ async def manejador_botones(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ban_level = usuario["banLevel"]   if usuario else 0
         cooldown  = obtener_penalizacion_por_ban_level(ban_level)
         str_tiempo = formatear_tiempo(cooldown)
-        mensaje = (
-            f"⚠️ Nivel Troll: {strikes} strikes | BanLevel: {ban_level}\n"
-            f"Cooldown activo: {str_tiempo}.\n"
-            f"Haz una consulta financiera seria para resetear a 0."
+        # Fix: el popup de query.answer tiene límite de 200 chars; usamos edit_message_text
+        await query.answer()  # Cierra el "cargando" del botón
+        await query.edit_message_text(
+            text=(
+                f"⚠️ *Estado de Moderación*\n\n"
+                f"Strikes acumulados: *{strikes}*\n"
+                f"Nivel de ban: *{ban_level}*\n"
+                f"Cooldown activo: *{str_tiempo}*\n\n"
+                "_Realiza una consulta financiera válida para resetear a 0._"
+            ),
+            parse_mode="Markdown"
         )
-        await query.answer(text=mensaje, show_alert=True)
         return
 
     # --- Configurar Broker ---
     if query.data == "pedir_url":
-        context.user_data['estado'] = "ESPERANDO_URL"
+        context.user_data['estado'] = "ESPERANDO_URL"  # En memoria (rápido)
+        await db.upsert_usuario(chat_id, estado="ESPERANDO_URL")  # Persistente en BD
         await query.edit_message_text(
             text=(
                 "🏦 *CONFIGURACIÓN DE CONEXIÓN A BROKER*\n\n"
@@ -917,7 +935,9 @@ async def manejador_botones(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if query.data == "volver_menu":
-        strikes = context.user_data.get('strikes', 0)
+        # Fix: leer strikes reales desde BD
+        usuario_menu = await db.obtener_usuario(chat_id)
+        strikes = usuario_menu["strikes"] if usuario_menu else 0
         teclado = InlineKeyboardMarkup([
             [InlineKeyboardButton(f"⚠️ Ver mis Strikes ({strikes})", callback_data="ver_strikes")],
             [InlineKeyboardButton("🔗 Configurar mi Broker (URL)", callback_data="pedir_url")],
@@ -996,29 +1016,37 @@ async def manejador_botones(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         )
                     except Exception:
                         await context.bot.send_message(chat_id=chat_id, text=texto_final, reply_markup=teclado)
-                os.remove(ruta_captura)
             else:
                 await context.bot.send_message(chat_id=chat_id, text=texto_final, reply_markup=teclado)
             await msg_espera.delete()
         except Exception as e:
             logger.error(f"Fallo envío reintento: {e}")
+        finally:
+            if ruta_captura and os.path.exists(ruta_captura):
+                try: os.remove(ruta_captura)
+                except OSError: pass
         return
 
     # --- Detener Alertas ---
     if query.data == "alerta_stop":
-        trabajos = context.job_queue.get_jobs_by_name(str(chat_id))
-        if not trabajos:
-            await query.edit_message_text(text="ℹ️ Protocolo vacío. No posees cron jobs activos.")
-            return
-        for job in trabajos:
-            job.schedule_removal()
-        await query.edit_message_text(text="✅ Cron Jobs abortados en el servidor.")
+        # Desactivar en BD (persistente)
+        await db.actualizar_alerta(chat_id, None)
+        # Limpiar jobs legacy en memoria (por si acaso)
+        try:
+            for job in context.job_queue.get_jobs_by_name(str(chat_id)):
+                job.schedule_removal()
+        except Exception:
+            pass
+        await query.edit_message_text(text="✅ Alertas desactivadas. Puedes reactivarlas desde /menu.")
         return
 
     # --- Configurar Alerta Periódica ---
     if query.data.startswith("alerta_"):
         busqueda = await db.obtener_ultima_busqueda(chat_id)
-        ultima_busqueda = busqueda or "empresas emergentes tecnológicas"
+        ultima_busqueda = (
+            busqueda if busqueda and not busqueda.startswith("__")
+            else "empresas tecnológicas de crecimiento"
+        )
 
         try:
             intervalo_horas = int(query.data.split("_")[1])
@@ -1026,23 +1054,21 @@ async def manejador_botones(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text(text="❌ Error procesando la solicitud.")
             return
 
-        trabajos = context.job_queue.get_jobs_by_name(str(chat_id))
-        for job in trabajos:
-            job.schedule_removal()
+        # Guardar alerta en BD (sobrevive reinicios de Render)
+        await db.actualizar_alerta(chat_id, intervalo_horas)
+        # Limpiar jobs legacy en memoria
+        try:
+            for job in context.job_queue.get_jobs_by_name(str(chat_id)):
+                job.schedule_removal()
+        except Exception:
+            pass
 
-        context.job_queue.run_repeating(
-            ejecutar_tarea_programada,
-            interval=intervalo_horas * 3600,
-            first=10,
-            chat_id=chat_id,
-            name=str(chat_id),
-            data=ultima_busqueda
-        )
         await query.edit_message_text(
             text=(
-                f"✅ *¡JOB ASIGNADO!*\n\n"
-                f"El cluster asíncrono lanzará reportes de tu nicho '{ultima_busqueda}' "
-                f"cada *{intervalo_horas} horas*.\nPuedes desactivarlo desde /menu."
+                f"✅ *¡ALERTA ACTIVADA!*\n\n"
+                f"Recibirás análisis de '{ultima_busqueda}' cada *{intervalo_horas}h*.\n"
+                "El sistema es persistente — sobrevive reinicios del servidor.\n"
+                "Desáctivalo desde /menu → Detener Alertas."
             ),
             parse_mode="Markdown"
         )
@@ -1116,9 +1142,12 @@ async def ejecutar_tarea_programada(context: ContextTypes.DEFAULT_TYPE):
                         )
                     except Exception:
                         await context.bot.send_message(chat_id=chat_id, text=texto_final, reply_markup=teclado)
-                os.remove(ruta_captura)
             else:
                 await context.bot.send_message(chat_id=chat_id, text=texto_final, reply_markup=teclado)
+            # try/finally garantiza que el PNG se borra aunque send_photo falle
+            if ruta_captura and os.path.exists(ruta_captura):
+                try: os.remove(ruta_captura)
+                except OSError: pass
 
             return  # Éxito → salir
 
@@ -1181,9 +1210,10 @@ async def conversacion_inversor(update: Update, context: ContextTypes.DEFAULT_TY
     solicitud = update.message.text
     tid = update.effective_user.id
 
-    # --- 🛡️ SISTEMA ANTI-SPAM (COOLDOWN basado en banLevel de BD) ---
+    # --- 🛡️ SISTEMA ANTI-SPAM (COOLDOWN basado en banLevel de BD + persistencia) ---
     ahora = time.time()
-    ultimo_uso = context.user_data.get('ultimo_uso', 0)
+    # Fix: leer ultimo_uso desde BD para que el cooldown sobreviva reinicios de Render
+    ultimo_uso = await db.obtener_ultimo_uso(tid)
     ban_level = await db.obtener_ban_level(tid)
     cooldown_segundos = obtener_penalizacion_por_ban_level(ban_level)
 
@@ -1219,14 +1249,18 @@ async def conversacion_inversor(update: Update, context: ContextTypes.DEFAULT_TY
                 )
             return
 
-        context.user_data['ultimo_uso'] = ahora
+        # Persistir timestamp en BD para cooldown cross-restart
+        await db.actualizar_ultimo_uso(tid, ahora)
     # --- FIN DEL SISTEMA ANTI-SPAM ---
 
-    # Manejar estado de configuración de Broker
-    if context.user_data.get('estado') == "ESPERANDO_URL":
+    # Manejar estado de configuración de Broker (BD + fallback en memoria)
+    estado_mem = context.user_data.get('estado')
+    usuario_actual = await db.obtener_usuario(tid)
+    estado_db = usuario_actual.get('estado') if usuario_actual else None
+    if estado_mem == "ESPERANDO_URL" or estado_db == "ESPERANDO_URL":
         url_detectada = extraer_url(solicitud)
         if url_detectada and es_url_valida(url_detectada):
-            await db.upsert_usuario(tid, broker_url=url_detectada)
+            await db.upsert_usuario(tid, broker_url=url_detectada, estado=None)
             context.user_data['estado'] = None
             await update.message.reply_text(
                 f"✅ *Broker conectado.*\n"
@@ -1234,6 +1268,7 @@ async def conversacion_inversor(update: Update, context: ContextTypes.DEFAULT_TY
                 parse_mode="Markdown"
             )
         else:
+            await db.upsert_usuario(tid, estado=None)
             context.user_data['estado'] = None
             await update.message.reply_text("❌ URL Inválida. Protocolo Cancelado.")
         return
@@ -1301,18 +1336,20 @@ async def conversacion_inversor(update: Update, context: ContextTypes.DEFAULT_TY
                     )
                 except Exception:
                     await update.message.reply_text(texto_final, reply_markup=teclado)
-            os.remove(ruta_captura)
         else:
             await update.message.reply_text(texto_final, reply_markup=teclado)
-
         await msg_espera.delete()
-
     except Exception as e:
         logger.error(f"Telegram API: {e}")
         try:
             await msg_espera.edit_text("Fallo propagando la respuesta al chat de Telegram.")
         except Exception:
             pass
+    finally:
+        # Garantizar limpieza del archivo PNG aunque Telegram falle
+        if ruta_captura and os.path.exists(ruta_captura):
+            try: os.remove(ruta_captura)
+            except OSError: pass
 
 
 # ── APP DE TELEGRAM (nivel de módulo) ────────────────────────────────────────
@@ -1439,12 +1476,21 @@ async def webhook_pago(request: Request):
         logger.error(f"[STRIPE] Error procesando evento: {e}")
         raise HTTPException(status_code=400, detail="Evento malformado.")
 
+    # Fix: verificar idempotencia para evitar acreditar créditos dobles
+    event_id = event.get("id", "")
+    if event_id and await db.evento_ya_procesado(event_id):
+        logger.info(f"[STRIPE] Evento {event_id} ya procesado. Ignorando duplicado.")
+        return {"ok": True, "duplicado": True}
+
     if event["type"] == "checkout.session.completed":
         session     = event["data"]["object"]
         telegram_id = session.get("client_reference_id")
         if telegram_id:
             try:
                 await db.actualizar_creditos(int(telegram_id), CREDITOS_POR_COMPRA)
+                # Marcar evento procesado DESPUÉS de acreditar (orden correcto)
+                if event_id:
+                    await db.marcar_evento_procesado(event_id)
                 logger.info(
                     f"[STRIPE] Pago completado → +{CREDITOS_POR_COMPRA} créditos "
                     f"al usuario {telegram_id}"
@@ -1455,8 +1501,111 @@ async def webhook_pago(request: Request):
             logger.warning("[STRIPE] Evento sin client_reference_id.")
     else:
         logger.debug(f"[STRIPE] Evento ignorado: {event['type']}")
+        # Marcar igualmente para no reprocesar otros tipos de eventos
+        if event_id:
+            await db.marcar_evento_procesado(event_id)
 
     return {"ok": True}
+
+
+# ── SISTEMA DE ALERTAS PERSISTENTES (DB-BASED CRON) ──────────────────────────
+
+async def _ejecutar_alerta_usuario(tid: int, solicitud: str, fuente: str):
+    """Ejecuta el pipeline para un usuario y le envía el resultado. Fire-and-forget."""
+    try:
+        texto_final, ruta_captura, url_compra, ticker = await pipeline_hibrido(
+            solicitud, msg_espera=None, fuente_datos=fuente
+        )
+        if not url_compra:
+            logger.warning(f"[CRON-DB] Sin resultado para usuario {tid}")
+            return
+
+        await db.restar_credito(tid)
+        creditos_restantes = await db.obtener_creditos(tid)
+        texto_final += f"\n\n_Te quedan {creditos_restantes} créditos._"
+
+        broker_url = await db.obtener_broker_url(tid)
+        botones = []
+        if broker_url:
+            url_broker_final = broker_url.replace("{ticker}", ticker) if "{ticker}" in broker_url else broker_url
+            botones.append([InlineKeyboardButton(text="Comprar en tu Broker 🛒", url=url_broker_final)])
+        nombre_fuente = FUENTES_DATOS.get(fuente, FUENTES_DATOS["yahoo"])["nombre"]
+        botones.append([InlineKeyboardButton(text=f"Métricas en {nombre_fuente} 📈", url=url_compra)])
+        teclado = InlineKeyboardMarkup(botones)
+
+        try:
+            if ruta_captura and os.path.exists(ruta_captura):
+                with open(ruta_captura, 'rb') as foto:
+                    try:
+                        await telegram_app.bot.send_photo(
+                            chat_id=tid, photo=foto, caption=texto_final, reply_markup=teclado
+                        )
+                    except Exception:
+                        await telegram_app.bot.send_message(chat_id=tid, text=texto_final, reply_markup=teclado)
+            else:
+                await telegram_app.bot.send_message(chat_id=tid, text=texto_final, reply_markup=teclado)
+        finally:
+            if ruta_captura and os.path.exists(ruta_captura):
+                try: os.remove(ruta_captura)
+                except OSError: pass
+
+    except Exception as e:
+        logger.error(f"[CRON-DB] Error ejecutando alerta para usuario {tid}: {e}")
+
+
+@web_app.post("/cron/ejecutar")
+async def cron_ejecutar(request: Request):
+    """
+    Endpoint llamado por el servicio externo (cron-job.org) cada hora.
+    Lee la BD, localiza usuarios con alerta activa y lanza su pipeline.
+    Requiere el header X-Cron-Secret configurado en CRON_SECRET.
+    """
+    secret = request.headers.get("X-Cron-Secret", "")
+    if not CRON_SECRET or secret != CRON_SECRET:
+        raise HTTPException(status_code=403, detail="Forbidden: secret incorrecto o no configurado.")
+
+    ahora = time.time()
+    usuarios = await db.obtener_usuarios_con_alerta()
+    ejecutados = 0
+    omitidos = 0
+
+    for usuario in usuarios:
+        tid             = usuario["id"]
+        intervalo_s     = (usuario["alerta_intervalo"] or 6) * 3600
+        ultima_alerta   = float(usuario["ultima_alerta"] or 0)
+        solicitud       = usuario["ultima_busqueda"]
+        fuente          = usuario["fuente_datos"] or "yahoo"
+
+        # ¿Le toca a este usuario?
+        if ahora - ultima_alerta < intervalo_s:
+            omitidos += 1
+            continue
+
+        # Verificar créditos
+        creditos = await db.obtener_creditos(tid)
+        if creditos <= 0:
+            await db.actualizar_alerta(tid, None)  # Desactivar si sin créditos
+            try:
+                teclado_pago = InlineKeyboardMarkup([[
+                    InlineKeyboardButton("💳 Recargar", url=f"{STRIPE_PAYMENT_URL}?client_reference_id={tid}")
+                ]])
+                await telegram_app.bot.send_message(
+                    chat_id=tid,
+                    text="💳 *Alerta Cron Pausada*\n\nSin créditos. Recarga y reactiva desde /menu.",
+                    parse_mode="Markdown", reply_markup=teclado_pago
+                )
+            except Exception:
+                pass
+            continue
+
+        # Marcar ANTES de ejecutar (evita doble ejecución si el cron llama dos veces)
+        await db.actualizar_ultima_alerta(tid, ahora)
+        # Lanzar en background para no bloquear la respuesta HTTP
+        asyncio.create_task(_ejecutar_alerta_usuario(tid, solicitud, fuente))
+        ejecutados += 1
+
+    logger.info(f"[CRON-DB] Ciclo completo: {ejecutados} ejecutados, {omitidos} omitidos de {len(usuarios)} activos.")
+    return {"ok": True, "ejecutados": ejecutados, "omitidos": omitidos, "total_activos": len(usuarios)}
 
 
 # ── ARRANQUE PRINCIPAL ────────────────────────────────────────────────────────
@@ -1464,5 +1613,5 @@ async def webhook_pago(request: Request):
 
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "8080"))
-    logger.info(f"Plataforma Híbrida Asíncrona (Goldman Sachs Edition) v3.0 ONLINE. Puerto: {port}")
+    logger.info(f"Plataforma Híbrida Asíncrona (Goldman Sachs Edition) v4.0 ONLINE. Puerto: {port}")
     uvicorn.run(web_app, host="0.0.0.0", port=port, log_level="info")

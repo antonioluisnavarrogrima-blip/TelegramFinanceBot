@@ -51,6 +51,11 @@ except Exception as e:
 
 # --- CONSTANTES GLOBALES ---
 
+# Solución Bug 1: Constantes de Stripe movidas al scope global correcto
+STRIPE_WEBHOOK_SECRET = os.getenv("STRIPE_WEBHOOK_SECRET", "")
+CREDITOS_POR_COMPRA   = int(os.getenv("CREDITOS_POR_COMPRA", "10"))
+STRIPE_PAYMENT_URL    = "https://buy.stripe.com/28EcN70yD05tcjHgZm3VC00"
+
 OPS = {
     ">": operator.gt, "<": operator.lt, ">=": operator.ge,
     "<=": operator.le, "==": operator.eq, "=": operator.eq
@@ -107,8 +112,8 @@ def extractor_intenciones(prompt_del_inversor: str) -> dict | None:
     • "CRIPTO"  → Criptomonedas y tokens DeFi. Palabras clave: cripto, bitcoin, ethereum, defi, token, blockchain.
     • "BONO"    → Renta fija, bonos, deuda. Palabras clave: bono, tesoro, deuda, renta fija, obligación.
 
-    ══ PASO 2: GENERAR TICKERS (40 unidades) ══
-    Genera exactamente 40 tickers de Yahoo Finance para la clase de activo detectada.
+    ══ PASO 2: GENERAR TICKERS (20 unidades) ══
+    Genera exactamente 20 tickers de Yahoo Finance para la clase de activo detectada.
     • ACCION: Tickers de empresas (ej: AAPL, SAN.MC).
     • REIT: Tickers de REITs/SOCIMIs (ej: O, VNQ, STAG, PLD, COL.MC).
     • ETF: Tickers de ETFs (ej: SPY, QQQ, VTI, VUSA.L, IWDA.L).
@@ -156,7 +161,7 @@ def extractor_intenciones(prompt_del_inversor: str) -> dict | None:
       "clase_activo": "ACCION"|"REIT"|"ETF"|"CRIPTO"|"BONO",
       "perfil": "Seguro"|"Riesgo"|"Balanceado",
       "sector": "El sector o categoría inferida",
-      "tickers": ["TKR1", ..., "TKR40"],
+      "tickers": ["TKR1", ..., "TKR20"],
       "filtros_dinamicos": []
     }
     """
@@ -166,11 +171,21 @@ def extractor_intenciones(prompt_del_inversor: str) -> dict | None:
             contents=f"{prompt_sistema}\n\n[INPUT USUARIO]: {prompt_del_inversor}",
             config=types.GenerateContentConfig(response_mime_type="application/json")
         )
-        texto = re.sub(r"^```[a-zA-Z]*\n?", "", res.text.strip())
-        texto = re.sub(r"```$", "", texto.strip())
-        return json.loads(texto)
+        
+        # Extracción de JSON a prueba de balas (ignora Markdown y texto extra)
+        texto_bruto = res.text.strip()
+        match = re.search(r'(\{.*\})', texto_bruto, re.DOTALL)
+        
+        if match:
+            texto_limpio = match.group(1)
+        else:
+            texto_limpio = texto_bruto
+            
+        return json.loads(texto_limpio)
+        
     except json.JSONDecodeError as je:
-        logger.error(f"JSON decode error en Extractor: {je}")
+        # Añadido log para que veas qué intentó responder la IA si vuelve a fallar
+        logger.error(f"JSON decode error en Extractor: {je} | Texto devuelto: {res.text[:200]}...")
         return None
     except Exception as e:
         error_str = str(e).lower()
@@ -463,6 +478,11 @@ def _chequear_fundamentales_accion(ticker: str, filtros: dict) -> dict | None:
         per = info.get('trailingPE', 999)
         div_yield = info.get('dividendYield', 0) or 0
         div_rate = info.get('dividendRate', 0) or 0
+        
+        # Solución Bug 2: Normalización pre-filtro para dividendYield
+        if div_yield > 1:
+            div_yield /= 100.0
+            
         if not filtros["per_op"](per, filtros["max_per"]):
             return None
         if not filtros["div_op"](div_yield, filtros["min_div_pct"]):
@@ -489,10 +509,16 @@ def _chequear_fundamentales_reit(ticker: str, filtros_extra: list) -> dict | Non
     try:
         info = yf.Ticker(ticker).info
         div_yield = info.get('dividendYield', 0) or 0
+        
+        # Solución Bug 2: Normalización pre-filtro
+        if div_yield > 1:
+            div_yield /= 100.0
+            
         # Yahoo no ofrece FFO directo; usamos priceToBook < 2.5 como proxy de P/FFO razonable
         p_book = info.get('priceToBook', 999) or 999
         for f in filtros_extra:
             if f["metrica"] == "dividend_yield":
+                # Convertimos div_yield a porcentaje para compararlo con el valor que introdujo el usuario
                 if not OPS.get(f["operador"], operator.ge)(div_yield * 100, f["valor"]):
                     return None
             elif f["metrica"] == "p_ffo":
@@ -521,6 +547,11 @@ def _chequear_fundamentales_etf(ticker: str, filtros_extra: list) -> dict | None
         ter = info.get('annualReportExpenseRatio') or info.get('expenseRatio') or None
         aum = info.get('totalAssets') or 0
         div_yield = info.get('dividendYield', 0) or 0
+        
+        # Solución Bug 2: Normalización
+        if div_yield > 1:
+            div_yield /= 100.0
+            
         for f in filtros_extra:
             if f["metrica"] == "ter" and ter is not None:
                 if not OPS.get(f["operador"], operator.lt)(ter, f["valor"]):
@@ -567,6 +598,11 @@ def _chequear_fundamentales_bono(ticker: str, filtros_extra: list) -> dict | Non
         info = yf.Ticker(ticker).info
         div_yield = info.get('dividendYield', 0) or 0
         aum = info.get('totalAssets') or 0
+        
+        # Solución Bug 2: Normalización
+        if div_yield > 1:
+            div_yield /= 100.0
+            
         for f in filtros_extra:
             if f["metrica"] == "dividend_yield":
                 if not OPS.get(f["operador"], operator.ge)(div_yield * 100, f["valor"]):
@@ -1277,13 +1313,6 @@ async def conversacion_inversor(update: Update, context: ContextTypes.DEFAULT_TY
             await msg_espera.edit_text("Fallo propagando la respuesta al chat de Telegram.")
         except Exception:
             pass
-
-
-# ── CONSTANTES FASTAPI / STRIPE ──────────────────────────────────────────────
-
-STRIPE_WEBHOOK_SECRET = os.getenv("STRIPE_WEBHOOK_SECRET", "")
-CREDITOS_POR_COMPRA   = int(os.getenv("CREDITOS_POR_COMPRA", "10"))
-STRIPE_PAYMENT_URL    = "https://buy.stripe.com/28EcN70yD05tcjHgZm3VC00"
 
 
 # ── APP DE TELEGRAM (nivel de módulo) ────────────────────────────────────────

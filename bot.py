@@ -96,8 +96,8 @@ FUENTES_DATOS = {
 
 # --- 1. AGENTES DE IA (EXTRACTOR Y GENERADOR) ---
 
-async def extractor_intenciones(prompt_del_inversor: str) -> dict | None:
-    """Extrae clase de activo, perfil, sector, tickers y filtros del input usando Gemini (async nativo)."""
+def extractor_intenciones(prompt_del_inversor: str) -> dict | None:
+    """Extrae clase de activo, perfil, sector, tickers y filtros del input usando Gemini (síncrono, llamado desde executor)."""
     prompt_sistema = """
     Rol: Actúa como un Analista de Datos Financieros Global, experto en todos los mercados.
 
@@ -110,7 +110,7 @@ async def extractor_intenciones(prompt_del_inversor: str) -> dict | None:
 
     ══ PASO 1: DETECTAR CLASE DE ACTIVO ══
     Clasifica la intención del usuario en UNA de estas clases:
-    • "ACCION"  → Empresas y acciones de bolsa (el valor por defecto).
+    • "ACCION"  → Empresas y acciones de bolsa (el valor por defecto). Incluye sectores como: tecnología, energía, banca, materias primas, commodities, petróleo, gas, minería, agricultura, químicos, metales, industria, consumo, salud, etc.
     • "REIT"    → Inmobiliario en bolsa (SOCIMIs, REITs). Palabras clave: ladrillo, alquiler, REIT, SOCIMI, inmobiliaria.
     • "ETF"     → Fondos indexados y ETFs. Palabras clave: ETF, fondo indexado, VUSA, SPY, QQQ, indexado.
     • "CRIPTO"  → Criptomonedas y tokens DeFi. Palabras clave: cripto, bitcoin, ethereum, defi, token, blockchain.
@@ -119,6 +119,11 @@ async def extractor_intenciones(prompt_del_inversor: str) -> dict | None:
     ══ PASO 2: GENERAR TICKERS (10 unidades) ══
     Genera exactamente 10 tickers de Yahoo Finance para la clase de activo detectada.
     • ACCION: Tickers de empresas (ej: AAPL, SAN.MC).
+      - Materias primas / Commodities: empresas productoras y distribuidoras. Ejemplos válidos:
+        BHP (minería), RIO (minería), VALE (minería), FCX (cobre), MOS (fertilizantes),
+        NUE (acero), CLF (acero), AA (aluminio), MP (tierras raras),
+        CVX (petróleo), XOM (petróleo), COP (petróleo), SLB (servicios petróleo),
+        ADM (agro), BG (agro), CF (fertilizantes), NTR (nutrientes), MPC (refino).
     • REIT: Tickers de REITs/SOCIMIs (ej: O, VNQ, STAG, PLD, COL.MC).
     • ETF: Tickers de ETFs (ej: SPY, QQQ, VTI, VUSA.L, IWDA.L).
     • CRIPTO: Tickers de cripto en Yahoo (ej: BTC-USD, ETH-USD, SOL-USD, LINK-USD).
@@ -143,20 +148,32 @@ async def extractor_intenciones(prompt_del_inversor: str) -> dict | None:
     | BONO    | dividend_yield, rendimiento, duracion                                            |
 
     TABLA DE TRADUCCIÓN (acciones y equivalentes):
-    | Expresión del usuario           | Traducción                                                          |
-    |----------------------------------|----------------------------------------------------------------------|
-    | "PER bajo"                       | {"metrica": "per", "operador": "<", "valor": 15.0}               |
-    | "dividendo alto" / "generoso"    | {"metrica": "dividendo_porcentaje", "operador": ">", "valor": 4.0} |
-    | "dividendo estable"              | {"metrica": "dividendo_porcentaje", "operador": ">", "valor": 2.0} |
-    | "alta rentabilidad"              | {"metrica": "roe", "operador": ">", "valor": 15.0}               |
-    | "deuda baja"                     | {"metrica": "deuda_capital", "operador": "<", "valor": 50.0}     |
-    | "empresa estábil"               | {"metrica": "beta", "operador": "<", "valor": 0.8}               |
-    | "crecimiento agresivo"           | {"metrica": "crecimiento_ingresos", "operador": ">", "valor": 20.0} |
-    | ETF "barato" / "low cost"        | {"metrica": "ter", "operador": "<", "valor": 0.2}                |
-    | ETF "grande" / "líquido"        | {"metrica": "aum", "operador": ">", "valor": 1000000000.0}       |
-    | REIT "buena ocupación"          | {"metrica": "ocupacion", "operador": ">", "valor": 90.0}         |
-    | REIT "dividendo alto"            | {"metrica": "dividend_yield", "operador": ">", "valor": 4.0}     |
-    | Cripto "gran capitaliz."         | {"metrica": "market_cap", "operador": ">", "valor": 1000000000.0} |
+    | Expresión del usuario                        | Traducción                                                               |
+    |----------------------------------------------|--------------------------------------------------------------------------|
+    | "PER bajo"                                   | {"metrica": "per", "operador": "<", "valor": 15.0}                    |
+    | "dividendo alto" / "generoso"                | {"metrica": "dividendo_porcentaje", "operador": ">", "valor": 4.0}      |
+    | "dividendo estable"                          | {"metrica": "dividendo_porcentaje", "operador": ">", "valor": 2.0}      |
+    | "dividendo > X%" (ej: >5%, >8%, >10%)        | {"metrica": "dividendo_porcentaje", "operador": ">", "valor": X.0}     |
+    | "tasa de dividendos superior al X%"          | {"metrica": "dividendo_porcentaje", "operador": ">", "valor": X.0}     |
+    | "rentabilidad por dividendo > X%"            | {"metrica": "dividendo_porcentaje", "operador": ">", "valor": X.0}     |
+    | "alta rentabilidad"                          | {"metrica": "roe", "operador": ">", "valor": 15.0}                    |
+    | "deuda baja"                                 | {"metrica": "deuda_capital", "operador": "<", "valor": 50.0}          |
+    | "empresa estable" / "estábil" / "estabilidad"| {"metrica": "beta", "operador": "<", "valor": 0.8}                    |
+    | "crecimiento agresivo"                       | {"metrica": "crecimiento_ingresos", "operador": ">", "valor": 20.0}    |
+    | ETF "barato" / "low cost"                    | {"metrica": "ter", "operador": "<", "valor": 0.2}                     |
+    | ETF "grande" / "líquido"                    | {"metrica": "aum", "operador": ">", "valor": 1000000000.0}            |
+    | REIT "buena ocupación"                      | {"metrica": "ocupacion", "operador": ">", "valor": 90.0}              |
+    | REIT "dividendo alto"                        | {"metrica": "dividend_yield", "operador": ">", "valor": 4.0}          |
+    | Cripto "gran capitaliz."                     | {"metrica": "market_cap", "operador": ">", "valor": 1000000000.0}     |
+
+    EJEMPLOS DE CONSULTAS CON MATERIAS PRIMAS:
+    - "empresa estable de materias primas con dividendo >10%" →
+      clase_activo: "ACCION", sector: "Materias Primas", perfil: "Seguro",
+      tickers: ["BHP", "RIO", "VALE", "FCX", "MOS", "NUE", "CVX", "XOM", "ADM", "CF"],
+      filtros_dinamicos: [
+        {"metrica": "dividendo_porcentaje", "operador": ">", "valor": 10.0},
+        {"metrica": "beta", "operador": "<", "valor": 0.8}
+      ]
 
     🚨 MULTI-RESTRICCIÓN: Si el usuario pide 3 cosas, el array DEBE tener 3 objetos.
 
@@ -171,7 +188,7 @@ async def extractor_intenciones(prompt_del_inversor: str) -> dict | None:
     El array "tickers" DEBE contener exactamente 10 símbolos reales de Yahoo Finance, sin placeholders.
     """
     try:
-        res = await client.aio.models.generate_content(
+        res = client.models.generate_content(
             model='gemini-2.0-flash',
             contents=f"{prompt_sistema}\n\n[INPUT USUARIO]: {prompt_del_inversor}",
             config=types.GenerateContentConfig(response_mime_type="application/json")
@@ -198,8 +215,8 @@ async def extractor_intenciones(prompt_del_inversor: str) -> dict | None:
         return None
 
 
-async def generador_informe_goldman(ticker: str, sector: str, datos: dict, perfil: str, clase_activo: str = "ACCION") -> str | None:
-    """Genera un informe estilo Goldman Sachs adaptado a la clase de activo (async nativo)."""
+def generador_informe_goldman(ticker: str, sector: str, datos: dict, perfil: str, clase_activo: str = "ACCION") -> str | None:
+    """Genera un informe estilo Goldman Sachs adaptado a la clase de activo (síncrono, llamado desde executor)."""
 
     # ── Técnica 1: SANITIZACIÓN ─────────────────────────────────────────────
     # Eliminamos claves con valor None, "N/A" o 0 para reducir el ruido.
@@ -316,7 +333,7 @@ Ejemplo de Flash Note para BONO:
     ⚖️ Veredicto: [Cierre pragmático]
     """
     try:
-        res = await client.aio.models.generate_content(
+        res = client.models.generate_content(
             model='gemini-2.0-flash',
             contents=(
                 f"{prompt_sistema}\n\n"
@@ -628,8 +645,8 @@ async def pipeline_hibrido(
     extraccion = None
     esperas_retry = [10, 20]
     for i_retry, espera_retry in enumerate(esperas_retry + [None]):
-        # Gemini async nativo: no necesita executor
-        extraccion = await extractor_intenciones(solicitud)
+        # Gemini síncrono en executor: no bloquea el event loop
+        extraccion = await loop.run_in_executor(_EXECUTOR, extractor_intenciones, solicitud)
         if extraccion and extraccion.get("_rate_limit"):
             if espera_retry is not None:
                 logger.warning(f"Rate limit Gemini, reintentando en {espera_retry}s (intento {i_retry+1})...")
@@ -684,12 +701,15 @@ async def pipeline_hibrido(
 
     if clase_activo == "ACCION":
         filtros = _construir_filtros(perfil, filtros_dinamicos_raw)
+        # Paso proporcional: 15% del umbral pedido por intento (mínimo 0.5%pp)
+        # Esto garantiza que umbrales altos (>10%) también se relajen de forma útil
+        _paso_div_pct = max(0.005, filtros["min_div_pct"] * 0.15)
         max_intentos = 3
         for intento in range(max_intentos):
             if intento > 0:
                 if filtros["max_per"] < 99999:
                     filtros["max_per"] *= 1.2
-                filtros["min_div_pct"] = max(0, filtros["min_div_pct"] - 0.005)
+                filtros["min_div_pct"] = max(0, filtros["min_div_pct"] - _paso_div_pct)
                 filtros["min_div_abs"] = max(0, filtros["min_div_abs"] - 0.1)
                 if msg_espera:
                     await msg_espera.edit_text(
@@ -790,8 +810,9 @@ async def pipeline_hibrido(
     # 4. Generador Goldman Sachs adaptado (en executor para no bloquear el event loop)
     ticker_final = mejor_opcion['ticker']
     try:
-        # Gemini async nativo: await directo, sin executor
-        informe_gs = await generador_informe_goldman(
+        # Gemini síncrono en executor: no bloquea el event loop
+        informe_gs = await loop.run_in_executor(
+            _EXECUTOR, generador_informe_goldman,
             ticker_final, sector, mejor_opcion, perfil, clase_activo
         )
     except Exception as e:

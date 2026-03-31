@@ -3,6 +3,8 @@ from contextlib import asynccontextmanager
 import re
 import json
 import logging
+from typing import List, Optional, Literal
+from pydantic import BaseModel, Field
 import asyncio
 import operator
 import tempfile
@@ -96,6 +98,19 @@ FUENTES_DATOS = {
 
 # --- 1. AGENTES DE IA (EXTRACTOR Y GENERADOR) ---
 
+class FiltroDinamico(BaseModel):
+    metrica: str = Field(description="Métrica a filtrar (ej: 'per', 'dividendo_porcentaje', 'beta', etc.)")
+    operador: Literal['>', '<', '>=', '<=', '==', '=']
+    valor: float = Field(description="Umbral numérico exigido")
+
+class RespuestaIA(BaseModel):
+    clase_activo: Literal["ACCION", "REIT", "ETF", "CRIPTO", "BONO"] = Field(description="Tipo de activo financiero detectado")
+    perfil: Literal["Seguro", "Riesgo", "Balanceado"]
+    sector: str = Field(description="Sector o categoría inferida")
+    tickers: List[str] = Field(description="Exactamente 10 tickers oficiales de Yahoo Finance")
+    filtros_dinamicos: List[FiltroDinamico] = Field(default_factory=list, description="Restricciones específicas exigidas")
+    error_api: Optional[str] = Field(None, description="Mensaje de error si la consulta es inválida o troll")
+
 def extractor_intenciones(prompt_del_inversor: str) -> dict | None:
     """Extrae clase de activo, perfil, sector, tickers y filtros del input usando Gemini (síncrono, llamado desde executor)."""
     prompt_sistema = """
@@ -176,29 +191,19 @@ def extractor_intenciones(prompt_del_inversor: str) -> dict | None:
       ]
 
     🚨 MULTI-RESTRICCIÓN: Si el usuario pide 3 cosas, el array DEBE tener 3 objetos.
-
-    RESPONDE EXCLUSIVAMENTE CON ESTE JSON (sin texto extra, sin bloques markdown):
-    {
-      "clase_activo": "<ACCION|REIT|ETF|CRIPTO|BONO>",
-      "perfil": "<Seguro|Riesgo|Balanceado>",
-      "sector": "<sector o categoría inferida>",
-      "tickers": ["<TICKER_1>", "<TICKER_2>", "<TICKER_3>", "<TICKER_4>", "<TICKER_5>", "<TICKER_6>", "<TICKER_7>", "<TICKER_8>", "<TICKER_9>", "<TICKER_10>"],
-      "filtros_dinamicos": []
-    }
-    El array "tickers" DEBE contener exactamente 10 símbolos reales de Yahoo Finance, sin placeholders.
     """
     try:
         res = client.models.generate_content(
             model='gemini-2.0-flash',
             contents=f"{prompt_sistema}\n\n[INPUT USUARIO]: {prompt_del_inversor}",
-            config=types.GenerateContentConfig(response_mime_type="application/json")
+            config=types.GenerateContentConfig(
+                response_mime_type="application/json",
+                response_schema=RespuestaIA
+            )
         )
-        texto_bruto = res.text.strip()
-        match = re.search(r'(\{.*\})', texto_bruto, re.DOTALL)
-        texto_limpio = match.group(1) if match else texto_bruto
-        return json.loads(texto_limpio)
+        return json.loads(res.text.strip())
     except json.JSONDecodeError as je:
-        logger.error(f"[EXTRACTOR] JSON decode error: {je} | Texto bruto: '{texto_bruto[:400]}'")
+        logger.error(f"[EXTRACTOR] JSON decode error: {je} | Texto bruto: '{res.text[:400]}'")
         return None
     except Exception as e:
         error_str = str(e).lower()
@@ -479,10 +484,29 @@ def _construir_filtros(perfil: str, filtros_dinamicos: list) -> dict:
     return filtros
 
 
+# --- CACHÉ YFINANCE ---
+_YF_INFO_CACHE = {}
+_YF_CACHE_TTL = 3600  # 1 hora
+
+def _obtener_info_yf(ticker: str) -> dict:
+    ahora = time.time()
+    if ticker in _YF_INFO_CACHE:
+        timestamp, info = _YF_INFO_CACHE[ticker]
+        if ahora - timestamp < _YF_CACHE_TTL:
+            return info
+    try:
+        info = yf.Ticker(ticker).info
+        if info:
+            _YF_INFO_CACHE[ticker] = (ahora, info)
+        return info
+    except Exception:
+        return {}
+
+
 def _chequear_fundamentales_accion(ticker: str, filtros: dict) -> dict | None:
     """Verifica si una ACCION pasa los filtros fundamentales."""
     try:
-        info = yf.Ticker(ticker).info
+        info = _obtener_info_yf(ticker)
         per = info.get('trailingPE', 999)
         div_yield = info.get('dividendYield', 0) or 0
         div_rate = info.get('dividendRate', 0) or 0
@@ -515,7 +539,7 @@ def _chequear_fundamentales_accion(ticker: str, filtros: dict) -> dict | None:
 def _chequear_fundamentales_reit(ticker: str, filtros_extra: list) -> dict | None:
     """Verifica si un REIT pasa los filtros. Usa FFO (proxy: operatingCashflow/shares) y Dividend Yield."""
     try:
-        info = yf.Ticker(ticker).info
+        info = _obtener_info_yf(ticker)
         div_yield = info.get('dividendYield', 0) or 0
         
         # Solución Bug 2: Normalización pre-filtro
@@ -550,7 +574,7 @@ def _chequear_fundamentales_reit(ticker: str, filtros_extra: list) -> dict | Non
 def _chequear_fundamentales_etf(ticker: str, filtros_extra: list) -> dict | None:
     """Verifica si un ETF pasa los filtros. Usa TER (annualReportExpenseRatio) y AUM."""
     try:
-        info = yf.Ticker(ticker).info
+        info = _obtener_info_yf(ticker)
         # TER: annualReportExpenseRatio o totalAssets para AUM
         ter = info.get('annualReportExpenseRatio') or info.get('expenseRatio') or None
         aum = info.get('totalAssets') or 0
@@ -583,7 +607,7 @@ def _chequear_fundamentales_etf(ticker: str, filtros_extra: list) -> dict | None
 def _chequear_fundamentales_cripto(ticker: str, filtros_extra: list) -> dict | None:
     """Verifica si una cripto pasa los filtros. Usa marketCap y rendimiento."""
     try:
-        info = yf.Ticker(ticker).info
+        info = _obtener_info_yf(ticker)
         market_cap = info.get('marketCap') or 0
         for f in filtros_extra:
             if f["metrica"] == "market_cap":
@@ -603,7 +627,7 @@ def _chequear_fundamentales_cripto(ticker: str, filtros_extra: list) -> dict | N
 def _chequear_fundamentales_bono(ticker: str, filtros_extra: list) -> dict | None:
     """Verifica si un ETF de bonos pasa los filtros. Usa dividendYield como proxy del cupón/YTM."""
     try:
-        info = yf.Ticker(ticker).info
+        info = _obtener_info_yf(ticker)
         div_yield = info.get('dividendYield', 0) or 0
         aum = info.get('totalAssets') or 0
         

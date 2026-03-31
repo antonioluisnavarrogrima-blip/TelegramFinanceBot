@@ -112,6 +112,14 @@ async def inicializar_db():
     logger.info("[DB] BD Supabase lista.")
 
 
+async def cerrar_pool():
+    """Cierra el pool de conexiones asyncpg (graceful shutdown)."""
+    global _pool
+    if _pool:
+        await _pool.close()
+        logger.info("[DB] Pool asyncpg cerrado correctamente.")
+
+
 # ── LECTURA ───────────────────────────────────────────────────────────────────
 
 async def obtener_usuario(telegram_id: int) -> dict | None:

@@ -7,20 +7,24 @@ from typing import List, Optional, Literal
 from pydantic import BaseModel, Field
 import asyncio
 import operator
-import tempfile
+import io
 import time
 import threading
 import random
+import requests
+import functools
 import yfinance as yf
 import matplotlib
 matplotlib.use('Agg')
-import matplotlib.pyplot as plt
+from matplotlib.figure import Figure
+from matplotlib.backends.backend_agg import FigureCanvasAgg as FigureCanvas
 from google import genai
 from google.genai import types
 from dotenv import load_dotenv
-from telegram import Update, BotCommand, BotCommandScopeDefault, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update, BotCommand, BotCommandScopeDefault, InlineKeyboardButton, InlineKeyboardMarkup, InputFile
 from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, filters, ContextTypes
-from fastapi import FastAPI, HTTPException, Request
+from telegram.error import BadRequest
+from fastapi import FastAPI, HTTPException, Request, BackgroundTasks
 import uvicorn
 import stripe
 
@@ -108,8 +112,8 @@ class RespuestaIA(BaseModel):
     filtros_dinamicos: List[FiltroDinamico] = Field(default_factory=list, description="Restricciones específicas exigidas")
     error_api: Optional[str] = Field(None, description="Mensaje de error si la consulta es inválida o troll")
 
-def extractor_intenciones(prompt_del_inversor: str) -> dict | None:
-    """Extrae clase de activo, perfil, sector, tickers y filtros del input usando Gemini (síncrono, llamado desde executor)."""
+async def extractor_intenciones(prompt_del_inversor: str) -> dict | None:
+    """Extrae clase de activo, perfil, sector, tickers y filtros del input usando Gemini (Asíncrono nativo)."""
     prompt_sistema = """
     Rol: Actúa como un Analista de Datos Financieros Global, experto en todos los mercados.
 
@@ -180,17 +184,22 @@ def extractor_intenciones(prompt_del_inversor: str) -> dict | None:
 
     EJEMPLOS DE CONSULTAS CON MATERIAS PRIMAS:
     - "empresa estable de materias primas con dividendo >10%" →
-      clase_activo: "ACCION", sector: "Materias Primas", perfil: "Seguro",
-      tickers: ["BHP", "RIO", "VALE", "FCX", "MOS", "NUE", "CVX", "XOM", "ADM", "CF"],
-      filtros_dinamicos: [
-        {"metrica": "dividendo_porcentaje", "operador": ">", "valor": 10.0},
-        {"metrica": "beta", "operador": "<", "valor": 0.8}
-      ]
+      {
+        "clase_activo": "ACCION",
+        "sector": "Materias Primas",
+        "perfil": "Seguro",
+        "tickers": ["BHP", "RIO", "VALE", "FCX", "MOS", "NUE", "CVX", "XOM", "ADM", "CF"],
+        "filtros_dinamicos": [
+          {"metrica": "dividendo_porcentaje", "operador": ">", "valor": 10.0},
+          {"metrica": "beta", "operador": "<", "valor": 0.8}
+        ]
+      }
 
     🚨 MULTI-RESTRICCIÓN: Si el usuario pide 3 cosas, el array DEBE tener 3 objetos.
+    🚨 CRÍTICO SOBRE TICKERS: NO apliques los filtros numéricos (PER, dividendos, etc.) tú mismo. Tu trabajo es SOLO proponer 10 tickers candidatos del sector. El backend verificará los datos en tiempo real. ¡SIEMPRE devuelve 10 tickers aproximados! NUNCA vacío.
     """
     try:
-        res = client.models.generate_content(
+        res = await client.aio.models.generate_content(
             model='gemini-2.0-flash',
             contents=f"{prompt_sistema}\n\n[INPUT USUARIO]: {prompt_del_inversor}",
             config=types.GenerateContentConfig(
@@ -217,8 +226,8 @@ def extractor_intenciones(prompt_del_inversor: str) -> dict | None:
         return None
 
 
-def generador_informe_goldman(ticker: str, sector: str, datos: dict, perfil: str, clase_activo: str = "ACCION") -> str | None:
-    """Genera un informe estilo Goldman Sachs adaptado a la clase de activo (síncrono, llamado desde executor)."""
+async def generador_informe_goldman(ticker: str, sector: str, datos: dict, perfil: str, clase_activo: str = "ACCION") -> str | None:
+    """Genera un informe estilo Goldman Sachs adaptado a la clase de activo (Asíncrono nativo)."""
 
     # ── Técnica 1: SANITIZACIÓN ─────────────────────────────────────────────
     # Eliminamos claves con valor None, "N/A" o 0 para reducir el ruido.
@@ -335,16 +344,17 @@ Ejemplo de Flash Note para BONO:
     ⚖️ Veredicto: [Cierre pragmático]
     """
     try:
-        res = client.models.generate_content(
+        res = await client.aio.models.generate_content(
             model='gemini-2.0-flash',
             contents=(
                 f"{prompt_sistema}\n\n"
                 f"Perfil Cliente: {perfil} | Sector/Categoría: {sector}\n"
                 f"[DATOS VERIFICADOS DE {ticker}]: {json.dumps(datos_limpios)}\n"
-                f"RECUERDA: Usa SOLO los datos anteriores. NO USES ASTERISCOS EN TU RESPUESTA."
+                f"RECUERDA: Formatea en HTML estricto (<b>negrita</b>, <i>cursiva</i>). NO uses Markdown ni asteriscos."
             )
         )
-        return res.text.replace('*', '').strip()
+        texto = res.text.replace('*', '').replace('**', '').strip()
+        return texto
     except Exception as e:
         logger.error(f"Error Generador GS: {e}")
         return None
@@ -352,12 +362,10 @@ Ejemplo de Flash Note para BONO:
 
 # --- 2. HERRAMIENTAS MATEMÁTICAS LOCALES ---
 
-def fabricante_de_graficos(ticker: str, periodo: str = "3mo") -> tuple[str | None, float | None]:
-    """Genera gráfico PNG en directorio temporal. Retorna (ruta_archivo, rendimiento_%).
+def fabricante_de_graficos(ticker: str, periodo: str = "3mo") -> tuple[bytes | None, float | None]:
+    """Genera gráfico PNG en RAM. Retorna (buffer_bytes, rendimiento_%).
     Thread-safe: usa la API OOP de Matplotlib con liberación garantizada de memoria.
     """
-    fig = None
-    ruta = None
     try:
         historico = yf.Ticker(ticker).history(period=periodo)
         if historico.empty:
@@ -368,26 +376,25 @@ def fabricante_de_graficos(ticker: str, periodo: str = "3mo") -> tuple[str | Non
         rendimiento = ((precio_fin - precio_ini) / precio_ini) * 100
 
         color = '#2ca02c' if rendimiento >= 0 else '#d62728'
-        fig, ax = plt.subplots(figsize=(10, 5))
+        fig = Figure(figsize=(10, 5))
+        canvas = FigureCanvas(fig)
+        ax = fig.add_subplot(111)
         ax.plot(historico.index, historico['Close'], color=color, linewidth=2.5)
         ax.fill_between(historico.index, historico['Close'], historico['Close'].min(), color=color, alpha=0.1)
         ax.set_title(f"Evolución de Alpha: {ticker.upper()} ({periodo})", fontsize=14, fontweight='bold', color='#333333')
         ax.set_ylabel('Precio por Acción', fontsize=12)
         ax.grid(True, linestyle='--', alpha=0.5)
 
-        fd, ruta = tempfile.mkstemp(suffix=f"_{ticker}.png", prefix="quant_")
-        os.close(fd)
-        fig.savefig(ruta, bbox_inches='tight', dpi=80)
-        return ruta, rendimiento
+        buf = io.BytesIO()
+        fig.savefig(buf, format='png', bbox_inches='tight', dpi=80)
+        buf.seek(0)
+        import matplotlib.pyplot as plt
+        plt.close(fig)
+        
+        return buf.getvalue(), rendimiento
     except Exception as e:
         logger.error(f"Fallo trazando gráfico de {ticker}: {e}")
         return None, None
-    finally:
-        # Liberación de memoria GARANTIZADA aunque haya excepción
-        if fig:
-            plt.close(fig)
-        else:
-            plt.close('all')
 
 
 def es_url_valida(texto: str) -> bool:
@@ -413,9 +420,9 @@ def _construir_filtros(perfil: str, filtros_dinamicos: list) -> dict:
 
     # Umbrales base según perfil de riesgo
     if perfil == "Seguro":
-        base_per, base_div_pct, base_div_abs = 35.0, 0.015, 0.0
+        base_per, base_div_pct, base_div_abs = 15.0, 0.015, 0.0
     elif perfil == "Riesgo":
-        base_per, base_div_pct, base_div_abs = 15.0, 0.0, 0.0
+        base_per, base_div_pct, base_div_abs = 35.0, 0.0, 0.0
     else:  # Balanceado
         base_per, base_div_pct, base_div_abs = 23.0, 0.005, 0.0
 
@@ -446,7 +453,10 @@ def _construir_filtros(perfil: str, filtros_dinamicos: list) -> dict:
         if valor is None:
             continue
 
-        valor = float(valor)
+        try:
+            valor = float(valor)
+        except (ValueError, TypeError):
+            continue
 
         if metrica == "per":
             filtros["max_per"] = valor
@@ -486,23 +496,46 @@ def _construir_filtros(perfil: str, filtros_dinamicos: list) -> dict:
     return filtros
 
 
-# --- CACHÉ YFINANCE (THREAD-SAFE) ---
+# --- CACHÉ YFINANCE Y POOLING (THREAD-SAFE) ---
 _YF_INFO_CACHE = {}
 _YF_CACHE_TTL = 3600  # 1 hora
 _CACHE_LOCK = threading.Lock()
+_thread_local = threading.local()
 
-def _obtener_info_yf(ticker: str) -> dict:
-    """Obtiene .info de Yahoo Finance con caché thread-safe y delay anti-ban."""
+def _get_yf_session() -> requests.Session:
+    """Instancia y retiene una sesión de requests de forma única por hilo (Pooling + Thread-Safety)."""
+    if not hasattr(_thread_local, "session"):
+        session = requests.Session()
+        session.request = functools.partial(session.request, timeout=10)
+        _thread_local.session = session
+    return _thread_local.session
+
+def _obtener_info_yf(ticker: str, indice: int = 0) -> dict:
+    """Obtiene .info con caché, GC automático, session timeout y delay escalonado."""
     with _CACHE_LOCK:
         ahora = time.time()
+        # Limpieza activa de _YF_INFO_CACHE si crece demasiado (Garbage Collector)
+        if len(_YF_INFO_CACHE) > 200:
+            claves_borrar = [k for k, (ts, _) in _YF_INFO_CACHE.items() if ahora - ts >= _YF_CACHE_TTL]
+            for k in claves_borrar:
+                del _YF_INFO_CACHE[k]
+            
+            # Botón de pánico anti-fugas severas:
+            if len(_YF_INFO_CACHE) > 1000:
+                _YF_INFO_CACHE.clear()
+
         if ticker in _YF_INFO_CACHE:
             timestamp, info = _YF_INFO_CACHE[ticker]
             if ahora - timestamp < _YF_CACHE_TTL:
                 return info
-    # Delay anti-ban: 0.1s–0.3s aleatorio para no saturar Yahoo con ráfagas
-    time.sleep(random.uniform(0.1, 0.3))
+    # Delay anti-ban: 0.1s–0.3s aleatorio + escalonamiento basado en el índice
+    time.sleep((indice * 0.15) + random.uniform(0.1, 0.2))
+    
+    # Usar sesión compartida por el hilo (Connection Pooling)
+    session = _get_yf_session()
+    
     try:
-        info = yf.Ticker(ticker).info
+        info = yf.Ticker(ticker, session=session).info
         if info:
             with _CACHE_LOCK:
                 _YF_INFO_CACHE[ticker] = (time.time(), info)
@@ -511,10 +544,10 @@ def _obtener_info_yf(ticker: str) -> dict:
         return {}
 
 
-def _chequear_fundamentales_accion(ticker: str, filtros: dict) -> dict | None:
+def _chequear_fundamentales_accion(indice: int, ticker: str, filtros: dict) -> dict | None:
     """Verifica si una ACCION pasa los filtros fundamentales."""
     try:
-        info = _obtener_info_yf(ticker)
+        info = _obtener_info_yf(ticker, indice)
         per = info.get('trailingPE', 999)
         div_yield = info.get('dividendYield', 0) or 0
         div_rate = info.get('dividendRate', 0) or 0
@@ -544,26 +577,33 @@ def _chequear_fundamentales_accion(ticker: str, filtros: dict) -> dict | None:
         return None
 
 
-def _chequear_fundamentales_reit(ticker: str, filtros_extra: list) -> dict | None:
+def _chequear_fundamentales_reit(indice: int, ticker: str, filtros_extra: list) -> dict | None:
     """Verifica si un REIT pasa los filtros. Usa FFO (proxy: operatingCashflow/shares) y Dividend Yield."""
     try:
-        info = _obtener_info_yf(ticker)
+        info = _obtener_info_yf(ticker, indice)
         div_yield = info.get('dividendYield', 0) or 0
         
         # Solución Bug 2: Normalización pre-filtro
         if div_yield > 1:
             div_yield /= 100.0
             
-        # Yahoo no ofrece FFO directo; usamos priceToBook < 2.5 como proxy de P/FFO razonable
-        p_book = info.get('priceToBook', 999) or 999
+        # Yahoo no ofrece FFO directo. Proxy prioritario: operatingCashflow
+        ocf = info.get('operatingCashflow')
+        market_cap = info.get('marketCap')
+        
+        p_ffo_proxy = 999.0
+        if ocf and market_cap and ocf > 0:
+            p_ffo_proxy = market_cap / ocf
+        else:
+            p_ffo_proxy = info.get('priceToBook', 999) or 999
+
         for f in filtros_extra:
             if f["metrica"] == "dividend_yield":
                 # Convertimos div_yield a porcentaje para compararlo con el valor que introdujo el usuario
                 if not OPS.get(f["operador"], operator.ge)(div_yield * 100, f["valor"]):
                     return None
             elif f["metrica"] == "p_ffo":
-                # Proxy: priceToBook como sustituto
-                if not OPS.get(f["operador"], operator.lt)(p_book, f["valor"]):
+                if not OPS.get(f["operador"], operator.lt)(p_ffo_proxy, f["valor"]):
                     return None
         # Requisito mínimo: que pague algún dividendo
         if div_yield <= 0:
@@ -572,17 +612,17 @@ def _chequear_fundamentales_reit(ticker: str, filtros_extra: list) -> dict | Non
         return {
             "ticker": ticker,
             "div_yield_pct": div_pct,
-            "p_book_proxy_ffo": round(p_book, 2) if p_book != 999 else "N/A",
+            "p_ffo_proxy": round(p_ffo_proxy, 2) if p_ffo_proxy != 999 else "N/A",
             "sector": info.get("sector", "Real Estate"),
         }
     except Exception:
         return None
 
 
-def _chequear_fundamentales_etf(ticker: str, filtros_extra: list) -> dict | None:
-    """Verifica si un ETF pasa los filtros. Usa TER (annualReportExpenseRatio) y AUM."""
+def _chequear_fundamentales_etf(indice: int, ticker: str, filtros_extra: list) -> dict | None:
+    """Verifica si un ETF pasa los filtros. Usa TER y AUM."""
     try:
-        info = _obtener_info_yf(ticker)
+        info = _obtener_info_yf(ticker, indice)
         # TER: annualReportExpenseRatio o totalAssets para AUM
         ter = info.get('annualReportExpenseRatio') or info.get('expenseRatio') or None
         aum = info.get('totalAssets') or 0
@@ -612,10 +652,10 @@ def _chequear_fundamentales_etf(ticker: str, filtros_extra: list) -> dict | None
         return None
 
 
-def _chequear_fundamentales_cripto(ticker: str, filtros_extra: list) -> dict | None:
+def _chequear_fundamentales_cripto(indice: int, ticker: str, filtros_extra: list) -> dict | None:
     """Verifica si una cripto pasa los filtros. Usa marketCap y rendimiento."""
     try:
-        info = _obtener_info_yf(ticker)
+        info = _obtener_info_yf(ticker, indice)
         market_cap = info.get('marketCap') or 0
         for f in filtros_extra:
             if f["metrica"] == "market_cap":
@@ -632,10 +672,10 @@ def _chequear_fundamentales_cripto(ticker: str, filtros_extra: list) -> dict | N
         return None
 
 
-def _chequear_fundamentales_bono(ticker: str, filtros_extra: list) -> dict | None:
+def _chequear_fundamentales_bono(indice: int, ticker: str, filtros_extra: list) -> dict | None:
     """Verifica si un ETF de bonos pasa los filtros. Usa dividendYield como proxy del cupón/YTM."""
     try:
-        info = _obtener_info_yf(ticker)
+        info = _obtener_info_yf(ticker, indice)
         div_yield = info.get('dividendYield', 0) or 0
         aum = info.get('totalAssets') or 0
         
@@ -659,7 +699,21 @@ def _chequear_fundamentales_bono(ticker: str, filtros_extra: list) -> dict | Non
         return None
 
 
-async def pipeline_hibrido(
+_PIPELINE_SEMA = None
+
+def _get_pipeline_semaphore():
+    global _PIPELINE_SEMA
+    if _PIPELINE_SEMA is None:
+        _PIPELINE_SEMA = asyncio.Semaphore(2)
+    return _PIPELINE_SEMA
+
+
+async def pipeline_hibrido(solicitud: str, msg_espera=None, fuente_datos: str = "yahoo"):
+    sem = _get_pipeline_semaphore()
+    async with sem:
+        return await _pipeline_hibrido_interno(solicitud, msg_espera, fuente_datos)
+
+async def _pipeline_hibrido_interno(
     solicitud: str,
     msg_espera=None,
     fuente_datos: str = "yahoo"
@@ -671,18 +725,20 @@ async def pipeline_hibrido(
     # 1. Extracción de intenciones con IA (con reintentos async no bloqueantes)
     # Se ejecuta en el executor global para no bloquear el event loop de asyncio
     if msg_espera:
-        await msg_espera.edit_text("🔍 Analizando tipo de activo e infiriendo perfil del inversor...")
+        try: await msg_espera.edit_text("🔍 Analizando tipo de activo e infiriendo perfil del inversor...")
+        except BadRequest: pass
 
     extraccion = None
     esperas_retry = [10, 20]
     for i_retry, espera_retry in enumerate(esperas_retry + [None]):
-        # Gemini síncrono en asyncio.to_thread: no bloquea el event loop
-        extraccion = await asyncio.to_thread(extractor_intenciones, solicitud)
+        # Llamada asíncrona nativa a Gemini
+        extraccion = await extractor_intenciones(solicitud)
         if extraccion and extraccion.get("_rate_limit"):
             if espera_retry is not None:
                 logger.warning(f"Rate limit Gemini, reintentando en {espera_retry}s (intento {i_retry+1})...")
                 if msg_espera:
-                    await msg_espera.edit_text(f"⏳ Motor IA ocupado, reintentando en {espera_retry}s...")
+                    try: await msg_espera.edit_text(f"⏳ Motor IA ocupado, reintentando en {espera_retry}s...")
+                    except BadRequest: pass
                 await asyncio.sleep(espera_retry)
                 continue
             else:
@@ -718,11 +774,13 @@ async def pipeline_hibrido(
     emoji_clase = EMOJIS_CLASE.get(clase_activo, "📈")
 
     if msg_espera:
-        await msg_espera.edit_text(
-            f"🛠️ Clase detectada: *{emoji_clase} {clase_activo}* | Perfil: *{perfil}*.\n"
-            f"Lanzando escáner a {len(tickers)} activos simultáneamente...",
-            parse_mode="Markdown"
-        )
+        try:
+            await msg_espera.edit_text(
+                f"🛠️ Clase detectada: <b>{emoji_clase} {clase_activo}</b> | Perfil: <b>{perfil}</b>.\n"
+                f"Lanzando escáner a {len(tickers)} activos simultáneamente...",
+                parse_mode="HTML"
+            )
+        except BadRequest: pass
 
     # 2. Seleccionar checker según clase de activo (loop ya definido arriba)
     # Se usa _YF_EXECUTOR (3 workers) para limitar la concurrencia con Yahoo Finance
@@ -730,58 +788,78 @@ async def pipeline_hibrido(
     # Inicializar filtros con valores por defecto; se sobreescribirán si clase_activo == "ACCION"
     filtros: dict = {"temporalidad": "3mo", "rendimiento_objetivo": 0.0, "rendimiento_op": operator.ge}
 
-    if clase_activo == "ACCION":
-        filtros = _construir_filtros(perfil, filtros_dinamicos_raw)
-        # Paso proporcional: 15% del umbral pedido por intento (mínimo 0.5%pp)
-        # Esto garantiza que umbrales altos (>10%) también se relajen de forma útil
-        _paso_div_pct = max(0.005, filtros["min_div_pct"] * 0.15)
-        max_intentos = 3
-        for intento in range(max_intentos):
-            if intento > 0:
-                if filtros["max_per"] < 99999:
-                    filtros["max_per"] *= 1.2
-                filtros["min_div_pct"] = max(0, filtros["min_div_pct"] - _paso_div_pct)
-                filtros["min_div_abs"] = max(0, filtros["min_div_abs"] - 0.1)
-                if msg_espera:
-                    await msg_espera.edit_text(
-                        f"🔄 Reintentando con filtros relajados (intento {intento+1}/{max_intentos})..."
-                    )
-                await asyncio.sleep(0.5)
-            filtros_snap = {
-                "max_per": filtros["max_per"], "min_div_pct": filtros["min_div_pct"],
-                "min_div_abs": filtros["min_div_abs"], "per_op": filtros["per_op"],
-                "div_op": filtros["div_op"], "div_abs_op": filtros["div_abs_op"],
-                "filtros_extra": list(filtros["filtros_extra"]),
-            }
-            # asyncio.to_thread delega cada chequeo a un hilo nativo (I/O-bound)
-            tareas = [asyncio.to_thread(_chequear_fundamentales_accion, t, filtros_snap) for t in tickers]
-            resultados = await asyncio.gather(*tareas)
-            pre_ganadores = [r for r in resultados if r is not None]
-            if pre_ganadores:
-                break
+    # El semáforo global ahora envuelve la función entera
+    if True:
+        if clase_activo == "ACCION":
+            filtros = _construir_filtros(perfil, filtros_dinamicos_raw)
+            # Paso proporcional: 15% del umbral pedido por intento (mínimo 0.5%pp)
+            # Esto garantiza que umbrales altos (>10%) también se relajen de forma útil
+            _paso_div_pct = max(0.005, filtros["min_div_pct"] * 0.15)
+            max_intentos = 3
+            for intento in range(max_intentos):
+                if intento > 0:
+                    if filtros["max_per"] < 99999:
+                        filtros["max_per"] *= 1.2
+                    filtros["min_div_pct"] = max(0, filtros["min_div_pct"] - _paso_div_pct)
+                    filtros["min_div_abs"] = max(0, filtros["min_div_abs"] - 0.1)
+                    if msg_espera:
+                        try:
+                            await msg_espera.edit_text(
+                                f"🔄 Reintentando con filtros relajados (intento {intento+1}/{max_intentos})..."
+                            )
+                        except BadRequest: pass
+                    await asyncio.sleep(0.5)
+                filtros_snap = {
+                    "max_per": filtros["max_per"], "min_div_pct": filtros["min_div_pct"],
+                    "min_div_abs": filtros["min_div_abs"], "per_op": filtros["per_op"],
+                    "div_op": filtros["div_op"], "div_abs_op": filtros["div_abs_op"],
+                    "filtros_extra": list(filtros["filtros_extra"]),
+                }
+                # asyncio.to_thread delega cada chequeo a un hilo nativo (I/O-bound)
+                tareas = [asyncio.to_thread(_chequear_fundamentales_accion, i, t, filtros_snap) for i, t in enumerate(tickers)]
+                try:
+                    resultados = await asyncio.wait_for(asyncio.gather(*tareas), timeout=25.0)
+                    pre_ganadores = [r for r in resultados if r is not None]
+                except asyncio.TimeoutError:
+                    logger.warning(f"[PIPELINE] Timeout YF en iter ACCION intento {intento}")
+                    pre_ganadores = []
+                if pre_ganadores:
+                    break
 
-    elif clase_activo == "REIT":
-        tareas = [asyncio.to_thread(_chequear_fundamentales_reit, t, filtros_dinamicos_raw) for t in tickers]
-        resultados = await asyncio.gather(*tareas)
-        pre_ganadores = [r for r in resultados if r is not None]
+        elif clase_activo == "REIT":
+            tareas = [asyncio.to_thread(_chequear_fundamentales_reit, i, t, filtros_dinamicos_raw) for i, t in enumerate(tickers)]
+            try:
+                resultados = await asyncio.wait_for(asyncio.gather(*tareas), timeout=25.0)
+                pre_ganadores = [r for r in resultados if r is not None]
+            except asyncio.TimeoutError:
+                pre_ganadores = []
 
-    elif clase_activo == "ETF":
-        tareas = [asyncio.to_thread(_chequear_fundamentales_etf, t, filtros_dinamicos_raw) for t in tickers]
-        resultados = await asyncio.gather(*tareas)
-        pre_ganadores = [r for r in resultados if r is not None]
+        elif clase_activo == "ETF":
+            tareas = [asyncio.to_thread(_chequear_fundamentales_etf, i, t, filtros_dinamicos_raw) for i, t in enumerate(tickers)]
+            try:
+                resultados = await asyncio.wait_for(asyncio.gather(*tareas), timeout=25.0)
+                pre_ganadores = [r for r in resultados if r is not None]
+            except asyncio.TimeoutError:
+                pre_ganadores = []
 
-    elif clase_activo == "CRIPTO":
-        tareas = [asyncio.to_thread(_chequear_fundamentales_cripto, t, filtros_dinamicos_raw) for t in tickers]
-        resultados = await asyncio.gather(*tareas)
-        pre_ganadores = [r for r in resultados if r is not None]
+        elif clase_activo == "CRIPTO":
+            tareas = [asyncio.to_thread(_chequear_fundamentales_cripto, i, t, filtros_dinamicos_raw) for i, t in enumerate(tickers)]
+            try:
+                resultados = await asyncio.wait_for(asyncio.gather(*tareas), timeout=25.0)
+                pre_ganadores = [r for r in resultados if r is not None]
+            except asyncio.TimeoutError:
+                pre_ganadores = []
 
-    elif clase_activo == "BONO":
-        tareas = [asyncio.to_thread(_chequear_fundamentales_bono, t, filtros_dinamicos_raw) for t in tickers]
-        resultados = await asyncio.gather(*tareas)
-        pre_ganadores = [r for r in resultados if r is not None]
+        elif clase_activo == "BONO":
+            tareas = [asyncio.to_thread(_chequear_fundamentales_bono, i, t, filtros_dinamicos_raw) for i, t in enumerate(tickers)]
+            try:
+                resultados = await asyncio.wait_for(asyncio.gather(*tareas), timeout=25.0)
+                pre_ganadores = [r for r in resultados if r is not None]
+            except asyncio.TimeoutError:
+                pre_ganadores = []
 
-    else:
-        return f"❌ Clase de activo no reconocida: {clase_activo}.", None, None, None
+        else:
+            return f"❌ Clase de activo no reconocida: {clase_activo}.", None, None, None
 
     if not pre_ganadores:
         return (
@@ -799,10 +877,12 @@ async def pipeline_hibrido(
         temporalidad = "1mo"
 
     if msg_espera:
-        await msg_espera.edit_text(
-            f"🔥 ¡Criba superada por {len(pre_ganadores)} activos!\n"
-            f"Comprobando rendimiento histórico ({temporalidad})..."
-        )
+        try:
+            await msg_espera.edit_text(
+                f"🔥 ¡Criba superada por {len(pre_ganadores)} activos!\n"
+                f"Comprobando rendimiento histórico ({temporalidad})..."
+            )
+        except BadRequest: pass
 
     mejor_opcion = None
     ruta_captura_final = None
@@ -814,14 +894,12 @@ async def pipeline_hibrido(
 
     for gan in pre_ganadores:
         t = gan["ticker"]
-        ruta, rend = fabricante_de_graficos(t, periodo=temporalidad)
+        buf_graf, rend = await asyncio.to_thread(fabricante_de_graficos, t, temporalidad)
         if rend is not None and rendimiento_op(rend, rendimiento_objetivo):
             mejor_opcion = gan
             mejor_opcion["rendimiento_real"] = round(rend, 2)
-            ruta_captura_final = ruta
+            ruta_captura_final = buf_graf
             break
-        elif ruta and os.path.exists(ruta):
-            os.remove(ruta)
 
     if not mejor_opcion:
         return (
@@ -833,23 +911,21 @@ async def pipeline_hibrido(
         )
 
     if msg_espera:
-        await msg_espera.edit_text(
-            f"✅ ¡Gema {clase_activo} localizada: {mejor_opcion['ticker']}!\n"
-            f"Redactando sumario ejecutivo Goldman Sachs..."
-        )
+        try:
+            await msg_espera.edit_text(
+                f"✅ ¡Gema {clase_activo} localizada: {mejor_opcion['ticker']}!\n"
+                f"Redactando sumario ejecutivo Goldman Sachs..."
+            )
+        except BadRequest: pass
 
-    # 4. Generador Goldman Sachs adaptado (asyncio.to_thread para no bloquear)
+    # 4. Generador Goldman Sachs adaptado (llamada asíncrona nativa)
     ticker_final = mejor_opcion['ticker']
     try:
-        informe_gs = await asyncio.to_thread(
-            generador_informe_goldman,
+        informe_gs = await generador_informe_goldman(
             ticker_final, sector, mejor_opcion, perfil, clase_activo
         )
     except Exception as e:
         logger.error(f"[GS] Error generando informe: {e}")
-        if ruta_captura_final and os.path.exists(ruta_captura_final):
-            try: os.remove(ruta_captura_final)
-            except OSError: pass
         return "❌ Error al generar el informe ejecutivo. Intenta de nuevo.", None, None, None
 
     if not informe_gs:
@@ -882,10 +958,10 @@ async def comando_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Configura tus intenciones. El motor híbrido deducirá automáticamente si buscas:\n"
         "• Blue Chips seguras\n"
         "• Gemas de Mid/Small Cap (Riesgo)\n\n"
-        f"💳 Créditos disponibles: *{creditos}*\n\n"
+        f"💳 Créditos disponibles: <b>{creditos}</b>\n\n"
         "¿Qué nicho investigamos hoy? (Usa /menu para suscripciones)"
     )
-    await update.message.reply_text(mensaje, parse_mode="Markdown")
+    await update.message.reply_text(mensaje, parse_mode="HTML")
 
 
 async def comando_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -903,12 +979,12 @@ async def comando_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton("🛑 Detener Alertas", callback_data="alerta_stop")]
     ])
     await update.message.reply_text(
-        f"⚙️ *MENU DE OPERACIONES CRON*\n\n"
-        f"💳 Créditos disponibles: *{creditos}*\n\n"
+        f"⚙️ <b>MENU DE OPERACIONES CRON</b>\n\n"
+        f"💳 Créditos disponibles: <b>{creditos}</b>\n\n"
         "Permite que nuestro escáner multi-hilos barra el mercado y te entregue reportes "
         "técnicos sobre tu último nicho automáticamente.",
         reply_markup=teclado,
-        parse_mode="Markdown"
+        parse_mode="HTML"
     )
 
 
@@ -928,13 +1004,13 @@ async def manejador_botones(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.answer()  # Cierra el "cargando" del botón
         await query.edit_message_text(
             text=(
-                f"⚠️ *Estado de Moderación*\n\n"
-                f"Strikes acumulados: *{strikes}*\n"
-                f"Nivel de ban: *{ban_level}*\n"
-                f"Cooldown activo: *{str_tiempo}*\n\n"
-                "_Realiza una consulta financiera válida para resetear a 0._"
+                f"⚠️ <b>Estado de Moderación</b>\n\n"
+                f"Strikes acumulados: <b>{strikes}</b>\n"
+                f"Nivel de ban: <b>{ban_level}</b>\n"
+                f"Cooldown activo: <b>{str_tiempo}</b>\n\n"
+                "<i>Realiza una consulta financiera válida para resetear a 0.</i>"
             ),
-            parse_mode="Markdown"
+            parse_mode="HTML"
         )
         return
 
@@ -944,13 +1020,13 @@ async def manejador_botones(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await db.upsert_usuario(chat_id, estado="ESPERANDO_URL")  # Persistente en BD
         await query.edit_message_text(
             text=(
-                "🏦 *CONFIGURACIÓN DE CONEXIÓN A BROKER*\n\n"
+                "🏦 <b>CONFIGURACIÓN DE CONEXIÓN A BROKER</b>\n\n"
                 "Pégame el enlace absoluto de la plataforma o broker donde suelas operar.\n\n"
-                "💡 *Tip Pro:* Puedes incluir `{ticker}` en la URL para enlace dinámico.\n"
-                "Ej: `https://www.degiro.es/trade/{ticker}`\n\n"
-                "Si no incluyes `{ticker}`, el botón redirigirá a la página principal de tu broker."
+                "💡 <b>Tip Pro:</b> Puedes incluir <code>{ticker}</code> en la URL para enlace dinámico.\n"
+                "Ej: <code>https://www.degiro.es/trade/{ticker}</code>\n\n"
+                "Si no incluyes <code>{ticker}</code>, el botón redirigirá a la página principal de tu broker."
             ),
-            parse_mode="Markdown"
+            parse_mode="HTML"
         )
         return
 
@@ -966,9 +1042,9 @@ async def manejador_botones(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )])
         botones.append([InlineKeyboardButton("⬅️ Volver al menú", callback_data="volver_menu")])
         await query.edit_message_text(
-            text="🌐 *FUENTE DE VALIDACIÓN*\n\nElige dónde quieres que apunten los enlaces de los reportes:",
+            text="🌐 <b>FUENTE DE VALIDACIÓN</b>\n\nElige dónde quieres que apunten los enlaces de los reportes:",
             reply_markup=InlineKeyboardMarkup(botones),
-            parse_mode="Markdown"
+            parse_mode="HTML"
         )
         return
 
@@ -978,8 +1054,8 @@ async def manejador_botones(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await db.upsert_usuario(chat_id, fuente_datos=fuente_elegida)
             nombre = FUENTES_DATOS[fuente_elegida]["nombre"]
             await query.edit_message_text(
-                text=f"✅ Fuente de validación actualizada a *{nombre}*.",
-                parse_mode="Markdown"
+                text=f"✅ Fuente de validación actualizada a <b>{nombre}</b>.",
+                parse_mode="HTML"
             )
         else:
             await query.edit_message_text(text="❌ Fuente no reconocida.")
@@ -999,12 +1075,12 @@ async def manejador_botones(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ])
         await query.edit_message_text(
             text=(
-                "⚙️ *MENU DE OPERACIONES CRON*\n\n"
+                "⚙️ <b>MENU DE OPERACIONES CRON</b>\n\n"
                 "Permite que nuestro escáner multi-hilos barra el mercado y te entregue reportes "
                 "técnicos sobre tu último nicho automáticamente."
             ),
             reply_markup=teclado,
-            parse_mode="Markdown"
+            parse_mode="HTML"
         )
         return
 
@@ -1022,8 +1098,8 @@ async def manejador_botones(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 [InlineKeyboardButton("💳 Recargar Créditos", url=os.getenv("STRIPE_PAYMENT_LINK", "https://buy.stripe.com/test"))]
             ])
             await query.edit_message_text(
-                text="💳 *Saldo agotado.*\nHas consumido tus análisis Quant.\nRecarga tus créditos para continuar.",
-                parse_mode="Markdown",
+                text="💳 <b>Saldo agotado.</b>\nHas consumido tus análisis Quant.\nRecarga tus créditos para continuar.",
+                parse_mode="HTML",
                 reply_markup=teclado_pago
             )
             return
@@ -1058,24 +1134,27 @@ async def manejador_botones(update: Update, context: ContextTypes.DEFAULT_TYPE):
         teclado = InlineKeyboardMarkup(botones)
 
         try:
-            if ruta_captura and os.path.exists(ruta_captura):
-                with open(ruta_captura, 'rb') as foto:
-                    try:
+            if ruta_captura:
+                try:
+                    if len(texto_final) > 1000:
+                        await context.bot.send_photo(chat_id=chat_id, photo=InputFile(ruta_captura, filename=f"chart_{ticker}.png"), read_timeout=60, write_timeout=60, connect_timeout=60)
+                        await context.bot.send_message(chat_id=chat_id, text=texto_final, reply_markup=teclado, parse_mode="HTML")
+                    else:
                         await context.bot.send_photo(
-                            chat_id=chat_id, photo=foto, caption=texto_final,
-                            reply_markup=teclado, read_timeout=60, write_timeout=60, connect_timeout=60
+                            chat_id=chat_id, photo=InputFile(ruta_captura, filename=f"chart_{ticker}.png"), caption=texto_final,
+                            reply_markup=teclado, read_timeout=60, write_timeout=60, connect_timeout=60,
+                            parse_mode="HTML"
                         )
-                    except Exception:
-                        await context.bot.send_message(chat_id=chat_id, text=texto_final, reply_markup=teclado)
+                except Exception:
+                    await context.bot.send_message(chat_id=chat_id, text=texto_final, reply_markup=teclado, parse_mode="HTML")
             else:
-                await context.bot.send_message(chat_id=chat_id, text=texto_final, reply_markup=teclado)
-            await msg_espera.delete()
+                await context.bot.send_message(chat_id=chat_id, text=texto_final, reply_markup=teclado, parse_mode="HTML")
+            try:
+                await msg_espera.delete()
+            except Exception:
+                pass
         except Exception as e:
             logger.error(f"Fallo envío reintento: {e}")
-        finally:
-            if ruta_captura and os.path.exists(ruta_captura):
-                try: os.remove(ruta_captura)
-                except OSError: pass
         return
 
     # --- Detener Alertas ---
@@ -1116,115 +1195,14 @@ async def manejador_botones(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         await query.edit_message_text(
             text=(
-                f"✅ *¡ALERTA ACTIVADA!*\n\n"
-                f"Recibirás análisis de '{ultima_busqueda}' cada *{intervalo_horas}h*.\n"
+                f"✅ <b>¡ALERTA ACTIVADA!</b>\n\n"
+                f"Recibirás análisis de '{ultima_busqueda}' cada <b>{intervalo_horas}h</b>.\n"
                 "El sistema es persistente — sobrevive reinicios del servidor.\n"
                 "Desáctivalo desde /menu → Detener Alertas."
             ),
-            parse_mode="Markdown"
+            parse_mode="HTML"
         )
         return
-
-
-async def ejecutar_tarea_programada(context: ContextTypes.DEFAULT_TYPE):
-    """Callback del Cron Job con retry exponencial y notificación de fallos."""
-    chat_id = context.job.chat_id
-    solicitud = context.job.data
-    max_reintentos = 3
-
-    logger.info(f"[CRON] Lanzando pipeline al chat {chat_id}: {solicitud}")
-
-    # Verificar créditos antes de ejecutar
-    creditos = await db.obtener_creditos(chat_id)
-    if creditos <= 0:
-        logger.info(f"[CRON] Chat {chat_id} sin créditos. Cancelando job.")
-        try:
-            teclado_pago = InlineKeyboardMarkup([
-                [InlineKeyboardButton("💳 Recargar Créditos", url=os.getenv("STRIPE_PAYMENT_LINK", "https://buy.stripe.com/test"))]
-            ])
-            await context.bot.send_message(
-                chat_id=chat_id,
-                text=(
-                    "💳 *Alerta Cron Cancelada*\n\n"
-                    "Tus créditos se han agotado. La suscripción ha sido pausada.\n"
-                    "Una vez recargues, reactiva desde /menu."
-                ),
-                parse_mode="Markdown",
-                reply_markup=teclado_pago
-            )
-        except Exception:
-            pass
-        # Cancelar el job
-        context.job.schedule_removal()
-        return
-
-    for intento in range(max_reintentos):
-        try:
-            fuente = await db.obtener_fuente_datos(chat_id)
-            texto_final, ruta_captura, url_compra, ticker = await pipeline_hibrido(
-                solicitud, msg_espera=None, fuente_datos=fuente
-            )
-
-            # Error lógico del pipeline (no de red) → no reintentar, no cobrar
-            if not url_compra:
-                logger.warning(f"[CRON] Pipeline sin resultado para chat {chat_id}")
-                return
-
-            # Cobro Justo: solo cobrar en éxito
-            await db.restar_credito(chat_id)
-            creditos_restantes = await db.obtener_creditos(chat_id)
-            texto_final += f"\n\n_Te quedan {creditos_restantes} créditos._"
-
-            broker_url = await db.obtener_broker_url(chat_id)
-            botones = []
-            if broker_url:
-                url_broker_final = broker_url.replace("{ticker}", ticker) if "{ticker}" in broker_url else broker_url
-                botones.append([InlineKeyboardButton(text="Comprar en tu Broker 🛒", url=url_broker_final)])
-            nombre_fuente = FUENTES_DATOS.get(fuente, FUENTES_DATOS["yahoo"])["nombre"]
-            botones.append([InlineKeyboardButton(text=f"Métricas en {nombre_fuente} 📈", url=url_compra)])
-            teclado = InlineKeyboardMarkup(botones)
-
-            if ruta_captura and os.path.exists(ruta_captura):
-                with open(ruta_captura, 'rb') as foto:
-                    try:
-                        await context.bot.send_photo(
-                            chat_id=chat_id, photo=foto, caption=texto_final,
-                            reply_markup=teclado, read_timeout=60, write_timeout=60, connect_timeout=60
-                        )
-                    except Exception:
-                        await context.bot.send_message(chat_id=chat_id, text=texto_final, reply_markup=teclado)
-            else:
-                await context.bot.send_message(chat_id=chat_id, text=texto_final, reply_markup=teclado)
-            # try/finally garantiza que el PNG se borra aunque send_photo falle
-            if ruta_captura and os.path.exists(ruta_captura):
-                try: os.remove(ruta_captura)
-                except OSError: pass
-
-            return  # Éxito → salir
-
-        except Exception as e:
-            logger.error(f"[CRON] Intento {intento + 1}/{max_reintentos} falló para chat {chat_id}: {e}")
-            if intento < max_reintentos - 1:
-                espera = 2 ** intento * 30  # 30s, 60s, 120s
-                logger.info(f"[CRON] Esperando {espera}s antes de reintentar...")
-                await asyncio.sleep(espera)
-            else:
-                # Reintentos agotados → notificar al usuario
-                try:
-                    await context.bot.send_message(
-                        chat_id=chat_id,
-                        text=(
-                            "⚠️ *Alerta Cron Fallida*\n\n"
-                            f"Tu suscripción a '{solicitud}' falló tras {max_reintentos} intentos.\n"
-                            "Causa probable: fallo de red o API.\n"
-                            "El próximo ciclo programado se ejecutará normalmente."
-                        ),
-                        parse_mode="Markdown"
-                    )
-                except Exception as notify_err:
-                    logger.critical(
-                        f"[CRON] No se pudo notificar fallo al chat {chat_id}: {notify_err}"
-                    )
 
 
 def obtener_penalizacion_por_ban_level(ban_level: int) -> float:
@@ -1314,9 +1292,9 @@ async def conversacion_inversor(update: Update, context: ContextTypes.DEFAULT_TY
             await db.upsert_usuario(tid, broker_url=url_detectada, estado=None)
             context.user_data['estado'] = None
             await update.message.reply_text(
-                f"✅ *Broker conectado.*\n"
+                f"✅ <b>Broker conectado.</b>\n"
                 f"Todas tus señales redirigirán a:\n{url_detectada}",
-                parse_mode="Markdown"
+                parse_mode="HTML"
             )
         else:
             await db.upsert_usuario(tid, estado=None)
@@ -1331,10 +1309,10 @@ async def conversacion_inversor(update: Update, context: ContextTypes.DEFAULT_TY
             [InlineKeyboardButton("💳 Recargar Créditos", url=f"{STRIPE_PAYMENT_URL}?client_reference_id={tid}")]
         ])
         await update.message.reply_text(
-            "💳 *Saldo agotado.*\n"
+            "💳 <b>Saldo agotado.</b>\n"
             "Has consumido tus análisis Quant.\n"
             "Pulsa el nivel de abajo para recargar tus créditos:",
-            parse_mode="Markdown",
+            parse_mode="HTML",
             reply_markup=teclado_pago
         )
         return
@@ -1378,29 +1356,55 @@ async def conversacion_inversor(update: Update, context: ContextTypes.DEFAULT_TY
     teclado = InlineKeyboardMarkup(botones)
 
     try:
-        if ruta_captura and os.path.exists(ruta_captura):
-            with open(ruta_captura, 'rb') as foto:
-                try:
+        if ruta_captura:
+            try:
+                if len(texto_final) > 1000:
+                    await update.message.reply_photo(photo=InputFile(ruta_captura, filename=f"chart_{ticker}.png"), read_timeout=60, write_timeout=60, connect_timeout=60)
+                    await update.message.reply_text(texto_final, reply_markup=teclado, parse_mode="HTML")
+                else:
                     await update.message.reply_photo(
-                        photo=foto, caption=texto_final,
-                        reply_markup=teclado, read_timeout=60, write_timeout=60, connect_timeout=60
+                        photo=InputFile(ruta_captura, filename=f"chart_{ticker}.png"), caption=texto_final,
+                        reply_markup=teclado, read_timeout=60, write_timeout=60, connect_timeout=60, parse_mode="HTML"
                     )
-                except Exception:
-                    await update.message.reply_text(texto_final, reply_markup=teclado)
+            except BadRequest:
+                raise # Delegar al bloque de fallback exterior
+            except Exception:
+                await update.message.reply_text(texto_final, reply_markup=teclado, parse_mode="HTML")
         else:
-            await update.message.reply_text(texto_final, reply_markup=teclado)
-        await msg_espera.delete()
+            await update.message.reply_text(texto_final, reply_markup=teclado, parse_mode="HTML")
+            
+        try:
+            await msg_espera.delete()
+        except Exception:
+            pass
+
+    except BadRequest as e:
+        logger.warning(f"[UI] Fallback a texto crudo por posible HTML inválido: {e}")
+        texto_limpio = re.sub(r'<[^>]+>', '', texto_final)
+        if ruta_captura:
+            try:
+                if len(texto_limpio) > 1000:
+                    await update.message.reply_photo(photo=InputFile(ruta_captura, filename=f"chart_{ticker}.png"), read_timeout=60, write_timeout=60, connect_timeout=60)
+                    await update.message.reply_text(texto_limpio, reply_markup=teclado, parse_mode=None)
+                else:
+                    await update.message.reply_photo(
+                        photo=InputFile(ruta_captura, filename=f"chart_{ticker}.png"), caption=texto_limpio,
+                        reply_markup=teclado, read_timeout=60, write_timeout=60, connect_timeout=60, parse_mode=None
+                    )
+            except Exception:
+                await update.message.reply_text(texto_limpio, reply_markup=teclado, parse_mode=None)
+        else:
+            await update.message.reply_text(texto_limpio, reply_markup=teclado, parse_mode=None)
+        
+        try: await msg_espera.delete()
+        except Exception: pass
+
     except Exception as e:
         logger.error(f"Telegram API: {e}")
         try:
             await msg_espera.edit_text("Fallo propagando la respuesta al chat de Telegram.")
         except Exception:
             pass
-    finally:
-        # Garantizar limpieza del archivo PNG aunque Telegram falle
-        if ruta_captura and os.path.exists(ruta_captura):
-            try: os.remove(ruta_captura)
-            except OSError: pass
 
 
 # ── APP DE TELEGRAM (nivel de módulo) ────────────────────────────────────────
@@ -1430,11 +1434,11 @@ async def comando_comprar(update: Update, context: ContextTypes.DEFAULT_TYPE):
         InlineKeyboardButton(f"💳 Comprar {CREDITOS_POR_COMPRA} créditos →", url=url_pago)
     ]])
     await update.message.reply_text(
-        f"💳 *Recargar Créditos*\n\n"
-        f"Saldo actual: *{creditos}* créditos de análisis.\n\n"
-        f"Cada paquete añade *{CREDITOS_POR_COMPRA} créditos* a tu cuenta "
+        f"💳 <b>Recargar Créditos</b>\n\n"
+        f"Saldo actual: <b>{creditos}</b> créditos de análisis.\n\n"
+        f"Cada paquete añade <b>{CREDITOS_POR_COMPRA} créditos</b> a tu cuenta "
         f"automáticamente tras confirmar el pago.",
-        parse_mode="Markdown",
+        parse_mode="HTML",
         reply_markup=teclado
     )
 
@@ -1473,6 +1477,10 @@ async def lifespan(app: FastAPI):
     await telegram_app.updater.stop()
     await telegram_app.stop()
     await telegram_app.shutdown()
+    
+    logger.info("[LIFESPAN] Cerrando pool de Base de Datos...")
+    await db.cerrar_pool()
+    
     logger.info("[LIFESPAN] Bot detenido correctamente.")
 
 
@@ -1583,27 +1591,46 @@ async def _ejecutar_alerta_usuario(tid: int, solicitud: str, fuente: str):
         teclado = InlineKeyboardMarkup(botones)
 
         try:
-            if ruta_captura and os.path.exists(ruta_captura):
-                with open(ruta_captura, 'rb') as foto:
-                    try:
+            if ruta_captura:
+                try:
+                    if len(texto_final) > 1000:
+                        await telegram_app.bot.send_photo(chat_id=tid, photo=InputFile(ruta_captura, filename=f"chart_{ticker}.png"))
+                        await telegram_app.bot.send_message(chat_id=tid, text=texto_final, reply_markup=teclado, parse_mode="HTML")
+                    else:
                         await telegram_app.bot.send_photo(
-                            chat_id=tid, photo=foto, caption=texto_final, reply_markup=teclado
+                            chat_id=tid, photo=InputFile(ruta_captura, filename=f"chart_{ticker}.png"), caption=texto_final, reply_markup=teclado, parse_mode="HTML"
                         )
-                    except Exception:
-                        await telegram_app.bot.send_message(chat_id=tid, text=texto_final, reply_markup=teclado)
+                except BadRequest:
+                    raise # Delegar fallback HTML exterior
+                except Exception:
+                    await telegram_app.bot.send_message(chat_id=tid, text=texto_final, reply_markup=teclado, parse_mode="HTML")
             else:
-                await telegram_app.bot.send_message(chat_id=tid, text=texto_final, reply_markup=teclado)
-        finally:
-            if ruta_captura and os.path.exists(ruta_captura):
-                try: os.remove(ruta_captura)
-                except OSError: pass
+                await telegram_app.bot.send_message(chat_id=tid, text=texto_final, reply_markup=teclado, parse_mode="HTML")
+        except BadRequest as e:
+            logger.warning(f"[CRON UI] Fallback a texto crudo por posible HTML inválido: {e}")
+            texto_limpio = re.sub(r'<[^>]+>', '', texto_final)
+            if ruta_captura:
+                try:
+                    if len(texto_limpio) > 1000:
+                        await telegram_app.bot.send_photo(chat_id=tid, photo=InputFile(ruta_captura, filename=f"chart_{ticker}.png"))
+                        await telegram_app.bot.send_message(chat_id=tid, text=texto_limpio, reply_markup=teclado, parse_mode=None)
+                    else:
+                        await telegram_app.bot.send_photo(
+                            chat_id=tid, photo=InputFile(ruta_captura, filename=f"chart_{ticker}.png"), caption=texto_limpio, reply_markup=teclado, parse_mode=None
+                        )
+                except Exception:
+                    await telegram_app.bot.send_message(chat_id=tid, text=texto_limpio, reply_markup=teclado, parse_mode=None)
+            else:
+                await telegram_app.bot.send_message(chat_id=tid, text=texto_limpio, reply_markup=teclado, parse_mode=None)
+        except Exception as e:
+            logger.error(f"Fallo envío cron res: {e}")
 
     except Exception as e:
         logger.error(f"[CRON-DB] Error ejecutando alerta para usuario {tid}: {e}")
 
 
 @web_app.post("/cron/ejecutar")
-async def cron_ejecutar(request: Request):
+async def cron_ejecutar(request: Request, background_tasks: BackgroundTasks):
     """
     Endpoint llamado por el servicio externo (cron-job.org) cada hora.
     Lee la BD, localiza usuarios con alerta activa y lanza su pipeline.
@@ -1640,8 +1667,8 @@ async def cron_ejecutar(request: Request):
                 ]])
                 await telegram_app.bot.send_message(
                     chat_id=tid,
-                    text="💳 *Alerta Cron Pausada*\n\nSin créditos. Recarga y reactiva desde /menu.",
-                    parse_mode="Markdown", reply_markup=teclado_pago
+                    text="💳 <b>Alerta Cron Pausada</b>\n\nSin créditos. Recarga y reactiva desde /menu.",
+                    parse_mode="HTML", reply_markup=teclado_pago
                 )
             except Exception:
                 pass
@@ -1649,8 +1676,14 @@ async def cron_ejecutar(request: Request):
 
         # Marcar ANTES de ejecutar (evita doble ejecución si el cron llama dos veces)
         await db.actualizar_ultima_alerta(tid, ahora)
-        # Lanzar en background para no bloquear la respuesta HTTP
-        asyncio.create_task(_ejecutar_alerta_usuario(tid, solicitud, fuente))
+        # JITTER: Lanzar espaciado temporalmente para no golpear la Base de Datos a la vez
+        retraso = ejecutados * 3.5
+        
+        async def _wrapper_con_retraso(user_tid, user_sol, user_fuente, delay):
+            await asyncio.sleep(delay)
+            await _ejecutar_alerta_usuario(user_tid, user_sol, user_fuente)
+            
+        background_tasks.add_task(_wrapper_con_retraso, tid, solicitud, fuente, retraso)
         ejecutados += 1
 
     logger.info(f"[CRON-DB] Ciclo completo: {ejecutados} ejecutados, {omitidos} omitidos de {len(usuarios)} activos.")

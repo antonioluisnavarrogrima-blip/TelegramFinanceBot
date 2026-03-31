@@ -1449,9 +1449,9 @@ async def lifespan(app: FastAPI):
 web_app = FastAPI(title="BotFinanzas Webhook", lifespan=lifespan)
 
 
-@web_app.get("/")
+@web_app.api_route("/", methods=["GET", "HEAD"])
 async def health_check():
-    """Health-check: Render lo usa para confirmar que el servicio está vivo."""
+    """Health-check: Render y UptimeRobot usan este endpoint para confirmar que el servicio está vivo."""
     return {"status": "online", "service": "BotFinanzas"}
 
 

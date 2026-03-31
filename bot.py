@@ -101,12 +101,12 @@ FUENTES_DATOS = {
 
 class FiltroDinamico(BaseModel):
     metrica: str = Field(description="Métrica a filtrar (ej: 'per', 'dividendo_porcentaje', 'beta', etc.)")
-    operador: Literal['>', '<', '>=', '<=', '==', '=']
+    operador: str = Field(description="Operador matemático: '>', '<', '>=', '<=', '==', '='")
     valor: float = Field(description="Umbral numérico exigido")
 
 class RespuestaIA(BaseModel):
-    clase_activo: Literal["ACCION", "REIT", "ETF", "CRIPTO", "BONO"] = Field(description="Tipo de activo financiero detectado")
-    perfil: Literal["Seguro", "Riesgo", "Balanceado"]
+    clase_activo: str = Field(description="Tipo de activo: ACCION, REIT, ETF, CRIPTO, BONO")
+    perfil: str = Field(description="Perfil: Seguro, Riesgo, Balanceado")
     sector: str = Field(description="Sector o categoría inferida")
     tickers: List[str] = Field(description="Exactamente 10 tickers oficiales de Yahoo Finance")
     filtros_dinamicos: List[FiltroDinamico] = Field(default_factory=list, description="Restricciones específicas exigidas")
@@ -205,10 +205,17 @@ async def extractor_intenciones(prompt_del_inversor: str) -> dict | None:
                 response_schema=RespuestaIA
             )
         )
+        
+        # Extracción a prueba de balas (Soporta Pydantic V1, V2 y diccionarios directos)
         if getattr(res, "parsed", None):
-            return res.parsed.model_dump()
+            if isinstance(res.parsed, dict):
+                return res.parsed
+            if hasattr(res.parsed, "model_dump"):
+                return res.parsed.model_dump()
+            if hasattr(res.parsed, "dict"):
+                return res.parsed.dict()
             
-        # Fallback ultra-robusto: buscar el bloque JSON puro entre corchetes
+        # Fallback ultra-robusto si el parser falló pero el texto existe
         texto_limpio = res.text.strip()
         inicio = texto_limpio.find('{')
         fin = texto_limpio.rfind('}')
@@ -216,6 +223,7 @@ async def extractor_intenciones(prompt_del_inversor: str) -> dict | None:
             texto_limpio = texto_limpio[inicio:fin+1]
         
         return json.loads(texto_limpio)
+        
     except json.JSONDecodeError as je:
         logger.error(f"[EXTRACTOR] JSON decode error: {je} | Texto bruto: '{res.text[:400]}'")
         return None

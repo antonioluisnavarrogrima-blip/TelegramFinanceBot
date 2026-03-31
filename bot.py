@@ -9,7 +9,8 @@ import asyncio
 import operator
 import tempfile
 import time
-import concurrent.futures
+import threading
+import random
 import yfinance as yf
 import matplotlib
 matplotlib.use('Agg')
@@ -25,15 +26,11 @@ import stripe
 
 import database as db
 
-# Executor global reutilizable para tareas generales
-_EXECUTOR = concurrent.futures.ThreadPoolExecutor(max_workers=10)
-# Executor dedicado con sólo 3 workers para Yahoo Finance (evita IP ban por exceso de requests)
-_YF_EXECUTOR = concurrent.futures.ThreadPoolExecutor(max_workers=3)
 
 # Configurar logging
 logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO)
 logger = logging.getLogger(__name__)
-logging.getLogger("google_genai").setLevel(logging.WARNING)
+logging.getLogger("google_genai").setLevel(logging.ERROR)
 logging.getLogger("httpx").setLevel(logging.WARNING)
 
 # Cargar las claves API
@@ -141,7 +138,7 @@ def extractor_intenciones(prompt_del_inversor: str) -> dict | None:
         ADM (agro), BG (agro), CF (fertilizantes), NTR (nutrientes), MPC (refino).
     • REIT: Tickers de REITs/SOCIMIs (ej: O, VNQ, STAG, PLD, COL.MC).
     • ETF: Tickers de ETFs (ej: SPY, QQQ, VTI, VUSA.L, IWDA.L).
-    • CRIPTO: Tickers de cripto en Yahoo (ej: BTC-USD, ETH-USD, SOL-USD, LINK-USD).
+    • CRIPTO: Tickers de cripto en Yahoo Finance. OBLIGATORIO: deben llevar el sufijo -USD (ej: BTC-USD, ETH-USD, SOL-USD, LINK-USD, ADA-USD). NUNCA devuelvas un ticker de cripto sin -USD.
     • BONO: Tickers de ETFs de bonos en Yahoo (ej: TLT, IEF, AGG, EMB, TIP).
     Regla Perfil:
       - "Seguro": líderes del sector / large-cap / blue-chip.
@@ -357,8 +354,10 @@ Ejemplo de Flash Note para BONO:
 
 def fabricante_de_graficos(ticker: str, periodo: str = "3mo") -> tuple[str | None, float | None]:
     """Genera gráfico PNG en directorio temporal. Retorna (ruta_archivo, rendimiento_%).
-    Thread-safe: usa la API OOP de Matplotlib en vez del estado global plt.*
+    Thread-safe: usa la API OOP de Matplotlib con liberación garantizada de memoria.
     """
+    fig = None
+    ruta = None
     try:
         historico = yf.Ticker(ticker).history(period=periodo)
         if historico.empty:
@@ -369,7 +368,6 @@ def fabricante_de_graficos(ticker: str, periodo: str = "3mo") -> tuple[str | Non
         rendimiento = ((precio_fin - precio_ini) / precio_ini) * 100
 
         color = '#2ca02c' if rendimiento >= 0 else '#d62728'
-        # API OOP: cada llamada trabaja sobre su propio objeto fig/ax (thread-safe)
         fig, ax = plt.subplots(figsize=(10, 5))
         ax.plot(historico.index, historico['Close'], color=color, linewidth=2.5)
         ax.fill_between(historico.index, historico['Close'], historico['Close'].min(), color=color, alpha=0.1)
@@ -380,12 +378,16 @@ def fabricante_de_graficos(ticker: str, periodo: str = "3mo") -> tuple[str | Non
         fd, ruta = tempfile.mkstemp(suffix=f"_{ticker}.png", prefix="quant_")
         os.close(fd)
         fig.savefig(ruta, bbox_inches='tight', dpi=80)
-        plt.close(fig)  # Cierra SOLO esta figura, no afecta a otros hilos
         return ruta, rendimiento
     except Exception as e:
         logger.error(f"Fallo trazando gráfico de {ticker}: {e}")
-        plt.close('all')
         return None, None
+    finally:
+        # Liberación de memoria GARANTIZADA aunque haya excepción
+        if fig:
+            plt.close(fig)
+        else:
+            plt.close('all')
 
 
 def es_url_valida(texto: str) -> bool:
@@ -484,20 +486,26 @@ def _construir_filtros(perfil: str, filtros_dinamicos: list) -> dict:
     return filtros
 
 
-# --- CACHÉ YFINANCE ---
+# --- CACHÉ YFINANCE (THREAD-SAFE) ---
 _YF_INFO_CACHE = {}
 _YF_CACHE_TTL = 3600  # 1 hora
+_CACHE_LOCK = threading.Lock()
 
 def _obtener_info_yf(ticker: str) -> dict:
-    ahora = time.time()
-    if ticker in _YF_INFO_CACHE:
-        timestamp, info = _YF_INFO_CACHE[ticker]
-        if ahora - timestamp < _YF_CACHE_TTL:
-            return info
+    """Obtiene .info de Yahoo Finance con caché thread-safe y delay anti-ban."""
+    with _CACHE_LOCK:
+        ahora = time.time()
+        if ticker in _YF_INFO_CACHE:
+            timestamp, info = _YF_INFO_CACHE[ticker]
+            if ahora - timestamp < _YF_CACHE_TTL:
+                return info
+    # Delay anti-ban: 0.1s–0.3s aleatorio para no saturar Yahoo con ráfagas
+    time.sleep(random.uniform(0.1, 0.3))
     try:
         info = yf.Ticker(ticker).info
         if info:
-            _YF_INFO_CACHE[ticker] = (ahora, info)
+            with _CACHE_LOCK:
+                _YF_INFO_CACHE[ticker] = (time.time(), info)
         return info
     except Exception:
         return {}
@@ -665,12 +673,11 @@ async def pipeline_hibrido(
     if msg_espera:
         await msg_espera.edit_text("🔍 Analizando tipo de activo e infiriendo perfil del inversor...")
 
-    loop = asyncio.get_running_loop()
     extraccion = None
     esperas_retry = [10, 20]
     for i_retry, espera_retry in enumerate(esperas_retry + [None]):
-        # Gemini síncrono en executor: no bloquea el event loop
-        extraccion = await loop.run_in_executor(_EXECUTOR, extractor_intenciones, solicitud)
+        # Gemini síncrono en asyncio.to_thread: no bloquea el event loop
+        extraccion = await asyncio.to_thread(extractor_intenciones, solicitud)
         if extraccion and extraccion.get("_rate_limit"):
             if espera_retry is not None:
                 logger.warning(f"Rate limit Gemini, reintentando en {espera_retry}s (intento {i_retry+1})...")
@@ -746,30 +753,30 @@ async def pipeline_hibrido(
                 "div_op": filtros["div_op"], "div_abs_op": filtros["div_abs_op"],
                 "filtros_extra": list(filtros["filtros_extra"]),
             }
-            # Usar _YF_EXECUTOR (máx 3 workers) para no saturar a Yahoo Finance
-            tareas = [loop.run_in_executor(_YF_EXECUTOR, _chequear_fundamentales_accion, t, filtros_snap) for t in tickers]
+            # asyncio.to_thread delega cada chequeo a un hilo nativo (I/O-bound)
+            tareas = [asyncio.to_thread(_chequear_fundamentales_accion, t, filtros_snap) for t in tickers]
             resultados = await asyncio.gather(*tareas)
             pre_ganadores = [r for r in resultados if r is not None]
             if pre_ganadores:
                 break
 
     elif clase_activo == "REIT":
-        tareas = [loop.run_in_executor(_YF_EXECUTOR, _chequear_fundamentales_reit, t, filtros_dinamicos_raw) for t in tickers]
+        tareas = [asyncio.to_thread(_chequear_fundamentales_reit, t, filtros_dinamicos_raw) for t in tickers]
         resultados = await asyncio.gather(*tareas)
         pre_ganadores = [r for r in resultados if r is not None]
 
     elif clase_activo == "ETF":
-        tareas = [loop.run_in_executor(_YF_EXECUTOR, _chequear_fundamentales_etf, t, filtros_dinamicos_raw) for t in tickers]
+        tareas = [asyncio.to_thread(_chequear_fundamentales_etf, t, filtros_dinamicos_raw) for t in tickers]
         resultados = await asyncio.gather(*tareas)
         pre_ganadores = [r for r in resultados if r is not None]
 
     elif clase_activo == "CRIPTO":
-        tareas = [loop.run_in_executor(_YF_EXECUTOR, _chequear_fundamentales_cripto, t, filtros_dinamicos_raw) for t in tickers]
+        tareas = [asyncio.to_thread(_chequear_fundamentales_cripto, t, filtros_dinamicos_raw) for t in tickers]
         resultados = await asyncio.gather(*tareas)
         pre_ganadores = [r for r in resultados if r is not None]
 
     elif clase_activo == "BONO":
-        tareas = [loop.run_in_executor(_YF_EXECUTOR, _chequear_fundamentales_bono, t, filtros_dinamicos_raw) for t in tickers]
+        tareas = [asyncio.to_thread(_chequear_fundamentales_bono, t, filtros_dinamicos_raw) for t in tickers]
         resultados = await asyncio.gather(*tareas)
         pre_ganadores = [r for r in resultados if r is not None]
 
@@ -831,12 +838,11 @@ async def pipeline_hibrido(
             f"Redactando sumario ejecutivo Goldman Sachs..."
         )
 
-    # 4. Generador Goldman Sachs adaptado (en executor para no bloquear el event loop)
+    # 4. Generador Goldman Sachs adaptado (asyncio.to_thread para no bloquear)
     ticker_final = mejor_opcion['ticker']
     try:
-        # Gemini síncrono en executor: no bloquea el event loop
-        informe_gs = await loop.run_in_executor(
-            _EXECUTOR, generador_informe_goldman,
+        informe_gs = await asyncio.to_thread(
+            generador_informe_goldman,
             ticker_final, sector, mejor_opcion, perfil, clase_activo
         )
     except Exception as e:
@@ -1482,8 +1488,6 @@ async def health_check():
 @web_app.get("/health/gemini")
 async def health_gemini():
     """Prueba la conectividad con la API de Gemini. Útil para diagnóstico en producción."""
-    import asyncio
-    loop = asyncio.get_running_loop()
     def _test_gemini():
         try:
             res = client.models.generate_content(
@@ -1493,8 +1497,7 @@ async def health_gemini():
             return {"status": "ok", "response": res.text.strip()[:50]}
         except Exception as e:
             return {"status": "error", "type": type(e).__name__, "detail": str(e)[:300]}
-    result = await loop.run_in_executor(None, _test_gemini)
-    return result
+    return await asyncio.to_thread(_test_gemini)
 
 
 @web_app.post("/webhook-pago")
@@ -1521,29 +1524,30 @@ async def webhook_pago(request: Request):
         logger.error(f"[STRIPE] Error procesando evento: {e}")
         raise HTTPException(status_code=400, detail="Evento malformado.")
 
-    # Fix: verificar idempotencia para evitar acreditar créditos dobles
     event_id = event.get("id", "")
-    if event_id and await db.evento_ya_procesado(event_id):
-        logger.info(f"[STRIPE] Evento {event_id} ya procesado. Ignorando duplicado.")
-        return {"ok": True, "duplicado": True}
 
     if event["type"] == "checkout.session.completed":
         session     = event["data"]["object"]
         telegram_id = session.get("client_reference_id")
-        if telegram_id:
+        if telegram_id and event_id:
             try:
-                await db.actualizar_creditos(int(telegram_id), CREDITOS_POR_COMPRA)
-                # Marcar evento procesado DESPUÉS de acreditar (orden correcto)
-                if event_id:
-                    await db.marcar_evento_procesado(event_id)
-                logger.info(
-                    f"[STRIPE] Pago completado → +{CREDITOS_POR_COMPRA} créditos "
-                    f"al usuario {telegram_id}"
+                # Transacción atómica: inserta evento + acredita créditos en un solo paso.
+                # Si el evento ya existe (duplicado de Stripe), retorna False sin acreditar.
+                acreditado = await db.acreditar_pago_atomico(
+                    event_id, int(telegram_id), CREDITOS_POR_COMPRA
                 )
+                if acreditado:
+                    logger.info(
+                        f"[STRIPE] Pago completado → +{CREDITOS_POR_COMPRA} créditos "
+                        f"al usuario {telegram_id}"
+                    )
+                else:
+                    logger.info(f"[STRIPE] Evento {event_id} duplicado. Sin acreditar.")
+                    return {"ok": True, "duplicado": True}
             except Exception as e:
                 logger.error(f"[STRIPE] Error acreditando créditos: {e}")
         else:
-            logger.warning("[STRIPE] Evento sin client_reference_id.")
+            logger.warning("[STRIPE] Evento sin client_reference_id o event_id.")
     else:
         logger.debug(f"[STRIPE] Evento ignorado: {event['type']}")
         # Marcar igualmente para no reprocesar otros tipos de eventos

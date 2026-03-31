@@ -280,6 +280,42 @@ async def actualizar_creditos(telegram_id: int, cantidad: int):
     logger.info(f"[DB] actualizar_creditos: usuario {telegram_id} += {cantidad} créditos")
 
 
+async def acreditar_pago_atomico(event_id: str, telegram_id: int, cantidad: int) -> bool:
+    """
+    Acredita créditos y marca el evento Stripe como procesado en UNA SOLA transacción SQL.
+    Si el event_id ya existe (duplicado), la transacción hace rollback y retorna False.
+    Esto elimina la race condition entre la comprobación y la inserción.
+    """
+    async with _pool.acquire() as conn:
+        async with conn.transaction():
+            # Intentar insertar el evento; si ya existe, lanzará UniqueViolationError
+            try:
+                await conn.execute(
+                    "INSERT INTO stripe_eventos (event_id) VALUES ($1)", event_id
+                )
+            except asyncpg.UniqueViolationError:
+                logger.info(f"[DB] Evento Stripe {event_id} duplicado (transacción abortada).")
+                return False
+
+            # Si llegamos aquí, el evento es nuevo → acreditar
+            existe = await conn.fetchval(
+                "SELECT 1 FROM usuarios WHERE id = $1", telegram_id
+            )
+            if existe:
+                await conn.execute(
+                    "UPDATE usuarios SET creditos = creditos + $2, pagos = pagos + 1 "
+                    "WHERE id = $1",
+                    telegram_id, cantidad
+                )
+            else:
+                await conn.execute(
+                    "INSERT INTO usuarios (id, creditos, pagos) VALUES ($1, $2, 1)",
+                    telegram_id, max(0, cantidad)
+                )
+    logger.info(f"[DB] acreditar_pago_atomico: evento {event_id} → +{cantidad} créditos al usuario {telegram_id}")
+    return True
+
+
 async def sumar_strike(telegram_id: int) -> int:
     """
     Suma 1 strike, recalcula banLevel y lo persiste.

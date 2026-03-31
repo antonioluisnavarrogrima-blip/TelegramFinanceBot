@@ -207,7 +207,12 @@ async def extractor_intenciones(prompt_del_inversor: str) -> dict | None:
                 response_schema=RespuestaIA
             )
         )
-        return json.loads(res.text.strip())
+        if getattr(res, "parsed", None):
+            return res.parsed.model_dump()
+            
+        # Fallback de limpieza manual si `parsed` no está disponible
+        texto_limpio = res.text.replace('```json', '').replace('```', '').strip()
+        return json.loads(texto_limpio)
     except json.JSONDecodeError as je:
         logger.error(f"[EXTRACTOR] JSON decode error: {je} | Texto bruto: '{res.text[:400]}'")
         return None

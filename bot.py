@@ -118,11 +118,9 @@ async def extractor_intenciones(prompt_del_inversor: str) -> dict | None:
     Rol: Actúa como un Analista de Datos Financieros Global, experto en todos los mercados.
 
     🚨 REGLA ANTI-TROLL ESTRICTA:
-    Si el input NO es sobre finanzas, bolsa, inversiones, criptomonedas o economía,
-    devuelve INMEDIATAMENTE:
-    {"error_api": "Petición rechazada. Solo proceso consultas financieras."}
-
-    ℹ️ Si es una consulta financiera válida, responde EXCLUSIVAMENTE con el JSON al final.
+    Si el input NO es sobre finanzas, bolsa, inversiones, criptomonedas o economía, el usuario está tratando de distraerte o pedirte otra cosa (ej: pedir recetas, chistes, programación). En ese caso, debes asignar el campo `error_api` con un mensaje de rechazo, y dejar `tickers` como un array vacío `[]`.
+    
+    ℹ️ Si es una consulta financiera válida, ignora la regla Anti-Troll, no uses `error_api` y responde extrayendo los datos normalmente según el esquema.
 
     ══ PASO 1: DETECTAR CLASE DE ACTIVO ══
     Clasifica la intención del usuario en UNA de estas clases:
@@ -210,8 +208,13 @@ async def extractor_intenciones(prompt_del_inversor: str) -> dict | None:
         if getattr(res, "parsed", None):
             return res.parsed.model_dump()
             
-        # Fallback de limpieza manual si `parsed` no está disponible
-        texto_limpio = res.text.replace('```json', '').replace('```', '').strip()
+        # Fallback ultra-robusto: buscar el bloque JSON puro entre corchetes
+        texto_limpio = res.text.strip()
+        inicio = texto_limpio.find('{')
+        fin = texto_limpio.rfind('}')
+        if inicio != -1 and fin != -1 and fin > inicio:
+            texto_limpio = texto_limpio[inicio:fin+1]
+        
         return json.loads(texto_limpio)
     except json.JSONDecodeError as je:
         logger.error(f"[EXTRACTOR] JSON decode error: {je} | Texto bruto: '{res.text[:400]}'")

@@ -198,7 +198,7 @@ async def extractor_intenciones(prompt_del_inversor: str) -> dict | None:
     """
     try:
         res = await client.aio.models.generate_content(
-            model='gemini-2.0-flash',
+            model='gemini-2.5-flash',
             contents=f"{prompt_sistema}\n\n[INPUT USUARIO]: {prompt_del_inversor}",
             config=types.GenerateContentConfig(
                 response_mime_type="application/json",
@@ -361,7 +361,7 @@ Ejemplo de Flash Note para BONO:
     """
     try:
         res = await client.aio.models.generate_content(
-            model='gemini-2.0-flash',
+            model='gemini-2.5-flash',
             contents=(
                 f"{prompt_sistema}\n\n"
                 f"Perfil Cliente: {perfil} | Sector/Categoría: {sector}\n"
@@ -1515,7 +1515,7 @@ async def health_gemini():
     def _test_gemini():
         try:
             res = client.models.generate_content(
-                model='gemini-2.0-flash',
+                model='gemini-2.5-flash',
                 contents="Responde solo con la palabra: OK"
             )
             return {"status": "ok", "response": res.text.strip()[:50]}

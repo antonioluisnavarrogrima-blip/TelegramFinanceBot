@@ -28,15 +28,15 @@ class RespuestaIA(BaseModel):
     error_api: Optional[str] = Field(None, description='Mensaje de error')
 
 async def test():
-    prompt_sistema = \"\"\"
+    prompt_sistema = """
     Rol: Actúa como un Analista de Datos Financieros Global.
     🚨 REGLA ANTI-TROLL ESTRICTA:
     Si el input NO es sobre finanzas, bolsa, inversiones, scripto o economía,
     devuelve INMEDIATAMENTE:
     {"error_api": "Petición rechazada. Solo proceso consultas financieras."}
-    \"\"\"
+    """
     res = await client.aio.models.generate_content(
-        model='gemini-2.0-flash',
+        model='gemini-2.5-flash',
         contents=f"{prompt_sistema}\n\n[INPUT USUARIO]: Hazme una tortilla de patata",
         config=types.GenerateContentConfig(
             response_mime_type='application/json',

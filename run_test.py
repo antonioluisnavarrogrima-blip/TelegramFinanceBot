@@ -39,7 +39,7 @@ async def test():
     ℹ️ Si es una consulta financiera válida, responde EXCLUSIVAMENTE con el JSON configurado.
     """
     res = await client.aio.models.generate_content(
-        model='gemini-2.0-flash',
+        model='gemini-2.5-flash',
         contents=f"{prompt_sistema}\n\n[INPUT USUARIO]: Búscame una empresa de crecimiento estable y con altos dividendos",
         config=types.GenerateContentConfig(
             response_mime_type="application/json",

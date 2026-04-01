@@ -13,11 +13,12 @@ import threading
 import random
 import requests
 import functools
+import httpx
 import yfinance as yf
 import matplotlib
-matplotlib.use('Agg')
 from matplotlib.figure import Figure
 from matplotlib.backends.backend_agg import FigureCanvasAgg as FigureCanvas
+from cachetools import TTLCache
 from google import genai
 from google.genai import types
 from dotenv import load_dotenv
@@ -130,8 +131,8 @@ async def extractor_intenciones(prompt_del_inversor: str) -> dict | None:
     • "CRIPTO"  → Criptomonedas y tokens DeFi. Palabras clave: cripto, bitcoin, ethereum, defi, token, blockchain.
     • "BONO"    → Renta fija, bonos, deuda. Palabras clave: bono, tesoro, deuda, renta fija, obligación.
 
-    ══ PASO 2: GENERAR TICKERS (10 unidades) ══
-    Genera exactamente 10 tickers de Yahoo Finance para la clase de activo detectada.
+    ══ PASO 2: GENERAR TICKERS (hasta 10 unidades) ══
+    Genera hasta 10 tickers de Yahoo Finance para la clase de activo detectada. Si el nicho es muy estrecho, devuelve los que existan válidos.
     • ACCION: Tickers de empresas (ej: AAPL, SAN.MC).
       - Materias primas / Commodities: empresas productoras y distribuidoras. Ejemplos válidos:
         BHP (minería), RIO (minería), VALE (minería), FCX (cobre), MOS (fertilizantes),
@@ -194,7 +195,7 @@ async def extractor_intenciones(prompt_del_inversor: str) -> dict | None:
       }
 
     🚨 MULTI-RESTRICCIÓN: Si el usuario pide 3 cosas, el array DEBE tener 3 objetos.
-    🚨 CRÍTICO SOBRE TICKERS: NO apliques los filtros numéricos (PER, dividendos, etc.) tú mismo. Tu trabajo es SOLO proponer 10 tickers candidatos del sector. El backend verificará los datos en tiempo real. ¡SIEMPRE devuelve 10 tickers aproximados! NUNCA vacío.
+    🚨 CRÍTICO SOBRE TICKERS: NO apliques los filtros numéricos (PER, dividendos, etc.) tú mismo. Tu trabajo es SOLO proponer activos candidatos del sector. El backend verificará los datos en tiempo real. ¡Devuelve al menos 1 ticker aproximado! NUNCA vacío.
     """
     try:
         res = await client.aio.models.generate_content(
@@ -379,9 +380,13 @@ Ejemplo de Flash Note para BONO:
 # --- 2. HERRAMIENTAS MATEMÁTICAS LOCALES ---
 
 def fabricante_de_graficos(ticker: str, periodo: str = "3mo") -> tuple[bytes | None, float | None]:
-    """Genera gráfico PNG en RAM. Retorna (buffer_bytes, rendimiento_%).
-    Thread-safe: usa la API OOP de Matplotlib con liberación garantizada de memoria.
-    """
+    """Genera gráfico WebP en RAM. Thread-safe y con caché de 15 minutos."""
+    cache_key = f"{ticker}_{periodo}"
+    
+    with _GRAFICOS_LOCK:
+        if cache_key in _GRAFICOS_CACHE:
+            return _GRAFICOS_CACHE[cache_key]
+
     try:
         historico = yf.Ticker(ticker).history(period=periodo)
         if historico.empty:
@@ -402,12 +407,18 @@ def fabricante_de_graficos(ticker: str, periodo: str = "3mo") -> tuple[bytes | N
         ax.grid(True, linestyle='--', alpha=0.5)
 
         buf = io.BytesIO()
-        fig.savefig(buf, format='png', bbox_inches='tight', dpi=80)
-        buf.seek(0)
-        import matplotlib.pyplot as plt
-        plt.close(fig)
-        
-        return buf.getvalue(), rendimiento
+        try:
+            fig.savefig(buf, format='webp', bbox_inches='tight', dpi=80)
+            buf.seek(0)
+            resultado = (buf.getvalue(), rendimiento)
+            
+            with _GRAFICOS_LOCK:
+                _GRAFICOS_CACHE[cache_key] = resultado
+                
+            return resultado
+        finally:
+            fig.clf()
+            buf.close()
     except Exception as e:
         logger.error(f"Fallo trazando gráfico de {ticker}: {e}")
         return None, None
@@ -428,19 +439,41 @@ def extraer_url(texto: str) -> str | None:
     enlaces = re.findall(r'(https?://[^\s]+)', texto)
     return enlaces[0] if enlaces else None
 
+def _limpiar_html_telegram(texto: str) -> str:
+    """Pre-procesa el texto y auto-cierra etiquetas para evitar Bad Requests en Telegram."""
+    if not texto: return ""
+    texto = re.sub(r'<\/?ul>', '', texto)
+    texto = re.sub(r'<li>', '• ', texto)
+    texto = re.sub(r'<\/li>', '\n', texto)
+    texto = re.sub(r'<strong>', '<b>', texto)
+    texto = re.sub(r'<\/strong>', '</b>', texto)
+    texto = re.sub(r'<em>', '<i>', texto)
+    texto = re.sub(r'<\/em>', '</i>', texto)
+    texto = re.sub(r'<br\s*\/?>', '\n', texto)
+    texto = texto.strip()
+
+    # Micro-corrector: forzar cierre de etiquetas desemparejadas
+    for tag in ['b', 'i']:
+        aperturas = texto.count(f'<{tag}>')
+        cierres = texto.count(f'</{tag}>')
+        if aperturas > cierres:
+            texto += f'</{tag}>' * (aperturas - cierres)
+
+    return texto
+
 
 # --- 3. EL PIPELINE MAESTRO (ORQUESTADOR) ---
 
 def _construir_filtros(perfil: str, filtros_dinamicos: list) -> dict:
     """Construye el diccionario unificado de filtros combinando perfil base + overrides dinámicos."""
 
-    # Umbrales base según perfil de riesgo
+    # Umbrales base actualizados a la realidad del mercado actual
     if perfil == "Seguro":
-        base_per, base_div_pct, base_div_abs = 15.0, 0.015, 0.0
+        base_per, base_div_pct, base_div_abs = 25.0, 0.015, 0.0  # PER 25 es lo normal hoy para Blue Chips
     elif perfil == "Riesgo":
-        base_per, base_div_pct, base_div_abs = 35.0, 0.0, 0.0
+        base_per, base_div_pct, base_div_abs = 999.0, 0.0, 0.0   # Crecimiento puro, ignoramos el PER
     else:  # Balanceado
-        base_per, base_div_pct, base_div_abs = 23.0, 0.005, 0.0
+        base_per, base_div_pct, base_div_abs = 35.0, 0.005, 0.0
 
     filtros = {
         "max_per": base_per,
@@ -513,10 +546,13 @@ def _construir_filtros(perfil: str, filtros_dinamicos: list) -> dict:
 
 
 # --- CACHÉ YFINANCE Y POOLING (THREAD-SAFE) ---
-_YF_INFO_CACHE = {}
-_YF_CACHE_TTL = 3600  # 1 hora
+_YF_INFO_CACHE = TTLCache(maxsize=1000, ttl=3600)
 _CACHE_LOCK = threading.Lock()
 _thread_local = threading.local()
+
+# --- CACHÉ DE GRÁFICOS ---
+_GRAFICOS_CACHE = TTLCache(maxsize=200, ttl=900)  # 15 minutos
+_GRAFICOS_LOCK = threading.Lock()
 
 def _get_yf_session() -> requests.Session:
     """Instancia y retiene una sesión de requests de forma única por hilo (Pooling + Thread-Safety)."""
@@ -526,26 +562,11 @@ def _get_yf_session() -> requests.Session:
         _thread_local.session = session
     return _thread_local.session
 
-def _obtener_info_yf(ticker: str, indice: int = 0) -> dict:
-    """Obtiene .info con caché, GC automático, session timeout y delay escalonado."""
+def _obtener_info_yf(ticker: str) -> dict:
+    """Obtiene .info con caché automático TTLCache y session timeout."""
     with _CACHE_LOCK:
-        ahora = time.time()
-        # Limpieza activa de _YF_INFO_CACHE si crece demasiado (Garbage Collector)
-        if len(_YF_INFO_CACHE) > 200:
-            claves_borrar = [k for k, (ts, _) in _YF_INFO_CACHE.items() if ahora - ts >= _YF_CACHE_TTL]
-            for k in claves_borrar:
-                del _YF_INFO_CACHE[k]
-            
-            # Botón de pánico anti-fugas severas:
-            if len(_YF_INFO_CACHE) > 1000:
-                _YF_INFO_CACHE.clear()
-
         if ticker in _YF_INFO_CACHE:
-            timestamp, info = _YF_INFO_CACHE[ticker]
-            if ahora - timestamp < _YF_CACHE_TTL:
-                return info
-    # Delay anti-ban: 0.1s–0.3s aleatorio + escalonamiento basado en el índice
-    time.sleep((indice * 0.15) + random.uniform(0.1, 0.2))
+            return _YF_INFO_CACHE[ticker]
     
     # Usar sesión compartida por el hilo (Connection Pooling)
     session = _get_yf_session()
@@ -554,23 +575,27 @@ def _obtener_info_yf(ticker: str, indice: int = 0) -> dict:
         info = yf.Ticker(ticker, session=session).info
         if info:
             with _CACHE_LOCK:
-                _YF_INFO_CACHE[ticker] = (time.time(), info)
+                _YF_INFO_CACHE[ticker] = info
         return info
     except Exception:
         return {}
 
 
-def _chequear_fundamentales_accion(indice: int, ticker: str, filtros: dict) -> dict | None:
+def _chequear_fundamentales_accion(ticker: str, filtros: dict) -> dict | None:
     """Verifica si una ACCION pasa los filtros fundamentales."""
     try:
-        info = _obtener_info_yf(ticker, indice)
-        per = info.get('trailingPE', 999)
-        div_yield = info.get('dividendYield', 0) or 0
-        div_rate = info.get('dividendRate', 0) or 0
+        info = _obtener_info_yf(ticker)
+        # EL FIX: Añadimos fallbacks (alternativas) por si Yahoo cambia el nombre del campo
+        per = info.get('trailingPE') or info.get('forwardPE') or 999
+        div_yield = info.get('dividendYield')
+        div_rate = info.get('dividendRate') or info.get('trailingAnnualDividendRate') or 0
         
-        # Solución Bug 2: Normalización pre-filtro para dividendYield
-        if div_yield > 1:
-            div_yield /= 100.0
+        if div_yield is None or div_yield > 1:
+            prev_close = info.get('previousClose')
+            if prev_close and prev_close > 0:
+                div_yield = div_rate / prev_close
+            else:
+                div_yield = 0
             
         if not filtros["per_op"](per, filtros["max_per"]):
             return None
@@ -593,15 +618,19 @@ def _chequear_fundamentales_accion(indice: int, ticker: str, filtros: dict) -> d
         return None
 
 
-def _chequear_fundamentales_reit(indice: int, ticker: str, filtros_extra: list) -> dict | None:
+def _chequear_fundamentales_reit(ticker: str, filtros_extra: list) -> dict | None:
     """Verifica si un REIT pasa los filtros. Usa FFO (proxy: operatingCashflow/shares) y Dividend Yield."""
     try:
-        info = _obtener_info_yf(ticker, indice)
-        div_yield = info.get('dividendYield', 0) or 0
+        info = _obtener_info_yf(ticker)
+        div_yield = info.get('dividendYield')
+        div_rate = info.get('dividendRate') or info.get('trailingAnnualDividendRate') or 0
         
-        # Solución Bug 2: Normalización pre-filtro
-        if div_yield > 1:
-            div_yield /= 100.0
+        if div_yield is None or div_yield > 1:
+            prev_close = info.get('previousClose')
+            if prev_close and prev_close > 0:
+                div_yield = div_rate / prev_close
+            else:
+                div_yield = 0
             
         # Yahoo no ofrece FFO directo. Proxy prioritario: operatingCashflow
         ocf = info.get('operatingCashflow')
@@ -635,18 +664,22 @@ def _chequear_fundamentales_reit(indice: int, ticker: str, filtros_extra: list) 
         return None
 
 
-def _chequear_fundamentales_etf(indice: int, ticker: str, filtros_extra: list) -> dict | None:
+def _chequear_fundamentales_etf(ticker: str, filtros_extra: list) -> dict | None:
     """Verifica si un ETF pasa los filtros. Usa TER y AUM."""
     try:
-        info = _obtener_info_yf(ticker, indice)
+        info = _obtener_info_yf(ticker)
         # TER: annualReportExpenseRatio o totalAssets para AUM
         ter = info.get('annualReportExpenseRatio') or info.get('expenseRatio') or None
         aum = info.get('totalAssets') or 0
-        div_yield = info.get('dividendYield', 0) or 0
+        div_yield = info.get('dividendYield')
+        div_rate = info.get('dividendRate') or info.get('trailingAnnualDividendRate') or 0
         
-        # Solución Bug 2: Normalización
-        if div_yield > 1:
-            div_yield /= 100.0
+        if div_yield is None or div_yield > 1:
+            prev_close = info.get('previousClose')
+            if prev_close and prev_close > 0:
+                div_yield = div_rate / prev_close
+            else:
+                div_yield = 0
             
         for f in filtros_extra:
             if f["metrica"] == "ter" and ter is not None:
@@ -668,10 +701,10 @@ def _chequear_fundamentales_etf(indice: int, ticker: str, filtros_extra: list) -
         return None
 
 
-def _chequear_fundamentales_cripto(indice: int, ticker: str, filtros_extra: list) -> dict | None:
+def _chequear_fundamentales_cripto(ticker: str, filtros_extra: list) -> dict | None:
     """Verifica si una cripto pasa los filtros. Usa marketCap y rendimiento."""
     try:
-        info = _obtener_info_yf(ticker, indice)
+        info = _obtener_info_yf(ticker)
         market_cap = info.get('marketCap') or 0
         for f in filtros_extra:
             if f["metrica"] == "market_cap":
@@ -688,16 +721,21 @@ def _chequear_fundamentales_cripto(indice: int, ticker: str, filtros_extra: list
         return None
 
 
-def _chequear_fundamentales_bono(indice: int, ticker: str, filtros_extra: list) -> dict | None:
+def _chequear_fundamentales_bono(ticker: str, filtros_extra: list) -> dict | None:
     """Verifica si un ETF de bonos pasa los filtros. Usa dividendYield como proxy del cupón/YTM."""
     try:
-        info = _obtener_info_yf(ticker, indice)
-        div_yield = info.get('dividendYield', 0) or 0
-        aum = info.get('totalAssets') or 0
+        info = _obtener_info_yf(ticker)
+        div_yield = info.get('dividendYield')
+        div_rate = info.get('dividendRate') or info.get('trailingAnnualDividendRate') or 0
         
-        # Solución Bug 2: Normalización
-        if div_yield > 1:
-            div_yield /= 100.0
+        if div_yield is None or div_yield > 1:
+            prev_close = info.get('previousClose')
+            if prev_close and prev_close > 0:
+                div_yield = div_rate / prev_close
+            else:
+                div_yield = 0
+                
+        aum = info.get('totalAssets') or 0
             
         for f in filtros_extra:
             if f["metrica"] == "dividend_yield":
@@ -728,6 +766,11 @@ async def pipeline_hibrido(solicitud: str, msg_espera=None, fuente_datos: str = 
     sem = _get_pipeline_semaphore()
     async with sem:
         return await _pipeline_hibrido_interno(solicitud, msg_espera, fuente_datos)
+
+async def _chequeo_asincrono(indice: int, func, ticker: str, args):
+    """Wrapper asíncrono para rate-limiting antes de delegar al ThreadPool."""
+    await asyncio.sleep((indice * 0.15) + random.uniform(0.1, 0.2))
+    return await asyncio.to_thread(func, ticker, args)
 
 async def _pipeline_hibrido_interno(
     solicitud: str,
@@ -831,10 +874,10 @@ async def _pipeline_hibrido_interno(
                     "div_op": filtros["div_op"], "div_abs_op": filtros["div_abs_op"],
                     "filtros_extra": list(filtros["filtros_extra"]),
                 }
-                # asyncio.to_thread delega cada chequeo a un hilo nativo (I/O-bound)
-                tareas = [asyncio.to_thread(_chequear_fundamentales_accion, i, t, filtros_snap) for i, t in enumerate(tickers)]
+                # Delegación asíncrona con sleep previo para rate-limit, sin ahogar los workers
+                tareas = [_chequeo_asincrono(i, _chequear_fundamentales_accion, t, filtros_snap) for i, t in enumerate(tickers)]
                 try:
-                    resultados = await asyncio.wait_for(asyncio.gather(*tareas), timeout=25.0)
+                    resultados = await asyncio.wait_for(asyncio.gather(*tareas), timeout=15.0)
                     pre_ganadores = [r for r in resultados if r is not None]
                 except asyncio.TimeoutError:
                     logger.warning(f"[PIPELINE] Timeout YF en iter ACCION intento {intento}")
@@ -843,33 +886,33 @@ async def _pipeline_hibrido_interno(
                     break
 
         elif clase_activo == "REIT":
-            tareas = [asyncio.to_thread(_chequear_fundamentales_reit, i, t, filtros_dinamicos_raw) for i, t in enumerate(tickers)]
+            tareas = [_chequeo_asincrono(i, _chequear_fundamentales_reit, t, filtros_dinamicos_raw) for i, t in enumerate(tickers)]
             try:
-                resultados = await asyncio.wait_for(asyncio.gather(*tareas), timeout=25.0)
+                resultados = await asyncio.wait_for(asyncio.gather(*tareas), timeout=15.0)
                 pre_ganadores = [r for r in resultados if r is not None]
             except asyncio.TimeoutError:
                 pre_ganadores = []
 
         elif clase_activo == "ETF":
-            tareas = [asyncio.to_thread(_chequear_fundamentales_etf, i, t, filtros_dinamicos_raw) for i, t in enumerate(tickers)]
+            tareas = [_chequeo_asincrono(i, _chequear_fundamentales_etf, t, filtros_dinamicos_raw) for i, t in enumerate(tickers)]
             try:
-                resultados = await asyncio.wait_for(asyncio.gather(*tareas), timeout=25.0)
+                resultados = await asyncio.wait_for(asyncio.gather(*tareas), timeout=15.0)
                 pre_ganadores = [r for r in resultados if r is not None]
             except asyncio.TimeoutError:
                 pre_ganadores = []
 
         elif clase_activo == "CRIPTO":
-            tareas = [asyncio.to_thread(_chequear_fundamentales_cripto, i, t, filtros_dinamicos_raw) for i, t in enumerate(tickers)]
+            tareas = [_chequeo_asincrono(i, _chequear_fundamentales_cripto, t, filtros_dinamicos_raw) for i, t in enumerate(tickers)]
             try:
-                resultados = await asyncio.wait_for(asyncio.gather(*tareas), timeout=25.0)
+                resultados = await asyncio.wait_for(asyncio.gather(*tareas), timeout=15.0)
                 pre_ganadores = [r for r in resultados if r is not None]
             except asyncio.TimeoutError:
                 pre_ganadores = []
 
         elif clase_activo == "BONO":
-            tareas = [asyncio.to_thread(_chequear_fundamentales_bono, i, t, filtros_dinamicos_raw) for i, t in enumerate(tickers)]
+            tareas = [_chequeo_asincrono(i, _chequear_fundamentales_bono, t, filtros_dinamicos_raw) for i, t in enumerate(tickers)]
             try:
-                resultados = await asyncio.wait_for(asyncio.gather(*tareas), timeout=25.0)
+                resultados = await asyncio.wait_for(asyncio.gather(*tareas), timeout=15.0)
                 pre_ganadores = [r for r in resultados if r is not None]
             except asyncio.TimeoutError:
                 pre_ganadores = []
@@ -959,6 +1002,8 @@ async def _pipeline_hibrido_interno(
         f"{informe_gs}"
     )
 
+    texto_final = _limpiar_html_telegram(texto_final)
+
     return texto_final, ruta_captura_final, url_compra, ticker_final
 
 
@@ -970,12 +1015,17 @@ async def comando_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await db.upsert_usuario(user.id, username=user.username or user.first_name)
     creditos = await db.obtener_creditos(user.id)
     mensaje = (
-        f"🤖 Plataforma Ejecutiva de Banca y Quants, Sr. {user.first_name}.\n\n"
-        "Configura tus intenciones. El motor híbrido deducirá automáticamente si buscas:\n"
-        "• Blue Chips seguras\n"
-        "• Gemas de Mid/Small Cap (Riesgo)\n\n"
-        f"💳 Créditos disponibles: <b>{creditos}</b>\n\n"
-        "¿Qué nicho investigamos hoy? (Usa /menu para suscripciones)"
+        f"🤖 <b>Plataforma Ejecutiva Quant</b>, bienvenido/a {user.first_name}.\n\n"
+        "Soy tu analista financiero personal impulsado por IA. Entiendo tus palabras, infiero tu nivel de riesgo y escaneo miles de activos en tiempo real.\n\n"
+        "🔍 <b>Cobertura de Mercado:</b>\n"
+        "• 🏢 <b>Acciones</b> (Crecimiento, Valor, Dividendos)\n"
+        "• 📈 <b>ETFs</b> (Indexados, Sectoriales)\n"
+        "• 🏗️ <b>REITs</b> (Renta Inmobiliaria)\n"
+        "• 🪙 <b>Cripto</b> (Tokens de capitalización robusta)\n"
+        "• 📊 <b>Bonos</b> (Refugio, Deuda Soberana)\n\n"
+        f"💳 Créditos Quant disponibles: <b>{creditos}</b>\n\n"
+        "<i>¿Qué sector, activo o estrategia quieres analizar hoy?</i>\n"
+        "(Para suscripciones periódicas e integraciones, usa /menu)"
     )
     await update.message.reply_text(mensaje, parse_mode="HTML")
 
@@ -990,15 +1040,15 @@ async def comando_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton(f"⚠️ Ver mis Strikes ({strikes})", callback_data="ver_strikes")],
         [InlineKeyboardButton("🔗 Configurar mi Broker (URL)", callback_data="pedir_url")],
         [InlineKeyboardButton("🌐 Fuente de Validación", callback_data="pedir_fuente")],
+        [InlineKeyboardButton("⌨️ Búsqueda Manual (Bypass IA)", callback_data="manual_input")],
         [InlineKeyboardButton("🔔 Configurar Alerta (6h)", callback_data="alerta_6")],
         [InlineKeyboardButton("🔔 Configurar Alerta (12h)", callback_data="alerta_12")],
         [InlineKeyboardButton("🛑 Detener Alertas", callback_data="alerta_stop")]
     ])
     await update.message.reply_text(
-        f"⚙️ <b>MENU DE OPERACIONES CRON</b>\n\n"
+        f"⚙️ <b>PANEL DE CONTROL CUANTITATIVO</b>\n\n"
         f"💳 Créditos disponibles: <b>{creditos}</b>\n\n"
-        "Permite que nuestro escáner multi-hilos barra el mercado y te entregue reportes "
-        "técnicos sobre tu último nicho automáticamente.",
+        "Configura tus enlaces al Broker, cambia las fuentes de datos, o activa el <b>Motor Inteligente de Alertas</b> para automatizar la búsqueda de tu nicho favorito.",
         reply_markup=teclado,
         parse_mode="HTML"
     )
@@ -1017,7 +1067,7 @@ async def manejador_botones(update: Update, context: ContextTypes.DEFAULT_TYPE):
         cooldown  = obtener_penalizacion_por_ban_level(ban_level)
         str_tiempo = formatear_tiempo(cooldown)
         # Fix: el popup de query.answer tiene límite de 200 chars; usamos edit_message_text
-        await query.answer()  # Cierra el "cargando" del botón
+        teclado_volver = InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Volver al Panel", callback_data="volver_menu")]])
         await query.edit_message_text(
             text=(
                 f"⚠️ <b>Estado de Moderación</b>\n\n"
@@ -1026,6 +1076,7 @@ async def manejador_botones(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"Cooldown activo: <b>{str_tiempo}</b>\n\n"
                 "<i>Realiza una consulta financiera válida para resetear a 0.</i>"
             ),
+            reply_markup=teclado_volver,
             parse_mode="HTML"
         )
         return
@@ -1034,6 +1085,7 @@ async def manejador_botones(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if query.data == "pedir_url":
         context.user_data['estado'] = "ESPERANDO_URL"  # En memoria (rápido)
         await db.upsert_usuario(chat_id, estado="ESPERANDO_URL")  # Persistente en BD
+        teclado_volver = InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Cancelar y Volver", callback_data="volver_menu")]])
         await query.edit_message_text(
             text=(
                 "🏦 <b>CONFIGURACIÓN DE CONEXIÓN A BROKER</b>\n\n"
@@ -1042,6 +1094,7 @@ async def manejador_botones(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "Ej: <code>https://www.degiro.es/trade/{ticker}</code>\n\n"
                 "Si no incluyes <code>{ticker}</code>, el botón redirigirá a la página principal de tu broker."
             ),
+            reply_markup=teclado_volver,
             parse_mode="HTML"
         )
         return
@@ -1077,23 +1130,77 @@ async def manejador_botones(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text(text="❌ Fuente no reconocida.")
         return
 
+    if query.data == "manual_input":
+        botones = [
+            [InlineKeyboardButton("🏢 Acciones", callback_data="manual_clase_ACCION"),
+             InlineKeyboardButton("📈 ETFs", callback_data="manual_clase_ETF")],
+            [InlineKeyboardButton("🏗️ REITs", callback_data="manual_clase_REIT"),
+             InlineKeyboardButton("🪙 Cripto", callback_data="manual_clase_CRIPTO")],
+            [InlineKeyboardButton("📊 Bonos", callback_data="manual_clase_BONO")],
+            [InlineKeyboardButton("⬅️ Volver", callback_data="volver_menu")]
+        ]
+        await query.edit_message_text(
+            text="⌨️ <b>Entrada Manual de Tickers</b>\n\n¿Qué <b>clase de activo</b> vas a introducir?\n\n<i>Esto permite al motor validar los filtros matemáticos correctos (PER, FFO, TER, etc).</i>",
+            reply_markup=InlineKeyboardMarkup(botones),
+            parse_mode="HTML"
+        )
+        return
+
+    if query.data.startswith("manual_clase_"):
+        clase_elegida = query.data.split("_")[2]
+        context.user_data['manual_clase'] = clase_elegida
+        botones = [
+            [InlineKeyboardButton("🛡️ Seguro / Conservador", callback_data="manual_perfil_Seguro")],
+            [InlineKeyboardButton("⚖️ Balanceado", callback_data="manual_perfil_Balanceado")],
+            [InlineKeyboardButton("🚀 Riesgo / Crecimiento", callback_data="manual_perfil_Riesgo")],
+            [InlineKeyboardButton("⬅️ Volver", callback_data="volver_menu")]
+        ]
+        await query.edit_message_text(
+            text=f"Seleccionado: <b>{clase_elegida}</b>\n\n¿Qué <b>perfil de exigencia</b> matemática deben cumplir tus tickers en Yahoo Finance?",
+            reply_markup=InlineKeyboardMarkup(botones),
+            parse_mode="HTML"
+        )
+        return
+
+    if query.data.startswith("manual_perfil_"):
+        perfil_elegido = query.data.split("_")[2]
+        context.user_data['manual_perfil'] = perfil_elegido
+        clase = context.user_data.get('manual_clase', 'ACCION')
+        
+        context.user_data['estado'] = "ESPERANDO_TICKERS_MANUALES"
+        await db.upsert_usuario(chat_id, estado="ESPERANDO_TICKERS_MANUALES")
+        
+        teclado = InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Cancelar", callback_data="volver_menu")]])
+        await query.edit_message_text(
+            text=f"☑️ <b>Modo Manual (Bypass IA)</b>\n\nClase: <b>{clase}</b>\nFiltros: <b>{perfil_elegido}</b>\n\n✍️ <i>Escribe los símbolos que quieres escanear separados por espacios o comas.\n(Ejemplo: MSFT NVDA AAPL TSLA)</i>",
+            reply_markup=teclado,
+            parse_mode="HTML"
+        )
+        return
+
     if query.data == "volver_menu":
+        # Limpiar cualquier estado pendiente (ej. si escapan de pedir_url)
+        context.user_data['estado'] = None
+        await db.upsert_usuario(chat_id, estado=None)
+        
         # Fix: leer strikes reales desde BD
         usuario_menu = await db.obtener_usuario(chat_id)
         strikes = usuario_menu["strikes"] if usuario_menu else 0
+        creditos = usuario_menu["creditos"] if usuario_menu else 3
         teclado = InlineKeyboardMarkup([
             [InlineKeyboardButton(f"⚠️ Ver mis Strikes ({strikes})", callback_data="ver_strikes")],
             [InlineKeyboardButton("🔗 Configurar mi Broker (URL)", callback_data="pedir_url")],
             [InlineKeyboardButton("🌐 Fuente de Validación", callback_data="pedir_fuente")],
+            [InlineKeyboardButton("⌨️ Búsqueda Manual (Bypass IA)", callback_data="manual_input")],
             [InlineKeyboardButton("🔔 Configurar Alerta (6h)", callback_data="alerta_6")],
             [InlineKeyboardButton("🔔 Configurar Alerta (12h)", callback_data="alerta_12")],
             [InlineKeyboardButton("🛑 Detener Alertas", callback_data="alerta_stop")]
         ])
         await query.edit_message_text(
             text=(
-                "⚙️ <b>MENU DE OPERACIONES CRON</b>\n\n"
-                "Permite que nuestro escáner multi-hilos barra el mercado y te entregue reportes "
-                "técnicos sobre tu último nicho automáticamente."
+                f"⚙️ <b>PANEL DE CONTROL CUANTITATIVO</b>\n\n"
+                f"💳 Créditos disponibles: <b>{creditos}</b>\n\n"
+                "Configura tus enlaces al Broker, cambia las fuentes de datos, o activa el <b>Motor Inteligente de Alertas</b> para automatizar la búsqueda de tu nicho favorito."
             ),
             reply_markup=teclado,
             parse_mode="HTML"
@@ -1111,28 +1218,42 @@ async def manejador_botones(update: Update, context: ContextTypes.DEFAULT_TYPE):
         creditos = await db.obtener_creditos(chat_id)
         if creditos <= 0:
             teclado_pago = InlineKeyboardMarkup([
-                [InlineKeyboardButton("💳 Recargar Créditos", url=os.getenv("STRIPE_PAYMENT_LINK", "https://buy.stripe.com/test"))]
+                [InlineKeyboardButton("💳 Recargar Créditos", url=f"{STRIPE_PAYMENT_URL}?client_reference_id={chat_id}")]
             ])
             await query.edit_message_text(
                 text="💳 <b>Saldo agotado.</b>\nHas consumido tus análisis Quant.\nRecarga tus créditos para continuar.",
-                parse_mode="HTML",
-                reply_markup=teclado_pago
+                parse_mode="HTML", reply_markup=teclado_pago
             )
             return
 
-        await query.edit_message_text(text="🔄 Relanzando pipeline con nuevos tickers...")
-        msg_espera = await query.message.reply_text("⏳ Reconectando con los Agentes Quants...")
+        await query.edit_message_text(text="🔄 Forzando a los agentes a buscar activos alternativos...")
+        msg_espera = await query.message.reply_text("⏳ Explorando rincones secundarios del mercado...")
 
         fuente = await db.obtener_fuente_datos(chat_id)
+        
+        # EL FIX: Inyectar orden secreta para evitar bucle de tickers idénticos
+        busqueda_forzada = busqueda + " (IMPORTANTE: Esto es un reintento. Dame 10 tickers COMPLETAMENTE DISTINTOS a los habituales. Sé muy flexible con los números)."
+        
         texto_final, ruta_captura, url_compra, ticker = await pipeline_hibrido(
-            busqueda, msg_espera=msg_espera, fuente_datos=fuente
+            busqueda_forzada, msg_espera=msg_espera, fuente_datos=fuente
         )
 
         if not url_compra:
+            if texto_final and "Petición rechazada" in texto_final:
+                 await msg_espera.edit_text(texto_final)
+                 return
+                 
             teclado_error = InlineKeyboardMarkup([
                 [InlineKeyboardButton("🔄 Reintentar con otros tickers", callback_data="reintentar")]
             ])
-            await msg_espera.edit_text(texto_final, reply_markup=teclado_error)
+            # EL FIX: Añadir la hora para que Telegram no bloquee la edición por ser texto duplicado
+            hora_actual = time.strftime('%H:%M:%S')
+            texto_error_unico = f"{texto_final}\n\n<i>(Intento fallido a las {hora_actual})</i>"
+            
+            try:
+                await msg_espera.edit_text(texto_error_unico, reply_markup=teclado_error, parse_mode="HTML")
+            except BadRequest:
+                pass
             return
 
         # Cobro Justo: solo cobrar en éxito
@@ -1172,6 +1293,7 @@ async def manejador_botones(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception as e:
             logger.error(f"Fallo envío reintento: {e}")
         return
+
 
     # --- Detener Alertas ---
     if query.data == "alerta_stop":
@@ -1347,7 +1469,11 @@ async def conversacion_inversor(update: Update, context: ContextTypes.DEFAULT_TY
         if texto_final and "Petición rechazada" in texto_final:
             # Consulta troll: sumar strike en BD
             await db.sumar_strike(tid)
-        # (si fue un fallo técnico, no sumamos strike)
+            # Evitar que hagan spam de botón reintentar en consultas inválidas
+            await msg_espera.edit_text(texto_final)
+            return
+
+        # (si fue un fallo puramente técnico o de mercado, ponemos botón retry)
         teclado_error = InlineKeyboardMarkup([
             [InlineKeyboardButton("🔄 Reintentar con otros tickers", callback_data="reintentar")]
         ])
@@ -1450,10 +1576,10 @@ async def comando_comprar(update: Update, context: ContextTypes.DEFAULT_TYPE):
         InlineKeyboardButton(f"💳 Comprar {CREDITOS_POR_COMPRA} créditos →", url=url_pago)
     ]])
     await update.message.reply_text(
-        f"💳 <b>Recargar Créditos</b>\n\n"
-        f"Saldo actual: <b>{creditos}</b> créditos de análisis.\n\n"
-        f"Cada paquete añade <b>{CREDITOS_POR_COMPRA} créditos</b> a tu cuenta "
-        f"automáticamente tras confirmar el pago.",
+        f"💎 <b>Terminal de Recarga Segura</b>\n\n"
+        f"📊 Saldo actual: <b>{creditos}</b> análisis Quant.\n\n"
+        "Descubre activos ganadores en segundos y ahorra horas de criba manual frente a miles de gráficos.\n\n"
+        f"⚡ <b>Cada paquete añade {CREDITOS_POR_COMPRA} créditos automáticamente tras completar el pago (Apple Pay / Google Pay / Tarjeta).</b>",
         parse_mode="HTML",
         reply_markup=teclado
     )
@@ -1465,6 +1591,28 @@ telegram_app.add_handler(CommandHandler("comprar", comando_comprar))
 # Uvicorn es el dueño del bucle de eventos. El bot de Telegram arranca y para
 # dentro del lifespan para compartir ese mismo bucle sin conflictos.
 
+async def self_ping_loop():
+    """Mantiene la instancia despierta haciendo auto-peticiones."""
+    await asyncio.sleep(10)
+    
+    url_propia = os.getenv("RENDER_EXTERNAL_URL") 
+    if not url_propia:
+        logger.warning("[SELF-PING] No se detectó URL externa. Auto-ping desactivado.")
+        return
+
+    logger.info(f"[SELF-PING] Iniciando bucle contra: {url_propia}")
+    
+    async with httpx.AsyncClient() as client:
+        while True:
+            try:
+                response = await client.get(url_propia, timeout=10)
+                logger.debug(f"[SELF-PING] Status: {response.status_code}")
+            except Exception as e:
+                logger.warning(f"[SELF-PING] Error de conexión: {e}")
+            
+            await asyncio.sleep(14 * 60)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Gestiona el ciclo de vida del bot de Telegram junto a FastAPI/Uvicorn."""
@@ -1472,6 +1620,10 @@ async def lifespan(app: FastAPI):
     logger.info("[LIFESPAN] Conectando con Supabase...")
     await db.inicializar_pool()              # Crea el pool asyncpg
     await db.inicializar_db()               # Añade columnas extra si faltan
+
+    # Lanzar auto-ping en segundo plano para evitar Cold Starts
+    logger.info("[LIFESPAN] Lanzando auto-ping en segundo plano...")
+    asyncio.create_task(self_ping_loop())
 
     logger.info("[LIFESPAN] Inicializando bot de Telegram...")
     await telegram_app.initialize()
@@ -1553,16 +1705,27 @@ async def webhook_pago(request: Request):
     if event["type"] == "checkout.session.completed":
         session     = event["data"]["object"]
         telegram_id = session.get("client_reference_id")
+        
+        # Calcular creditos dinamicos
+        metadata = session.get("metadata", {})
+        if "creditos" in metadata:
+            creditos_a_sumar = int(metadata["creditos"])
+        else:
+            creditos_a_sumar = CREDITOS_POR_COMPRA # Fallback de seguridad puro
+
+        if creditos_a_sumar <= 0:
+            creditos_a_sumar = CREDITOS_POR_COMPRA # Fallback de seguridad
+
         if telegram_id and event_id:
             try:
                 # Transacción atómica: inserta evento + acredita créditos en un solo paso.
                 # Si el evento ya existe (duplicado de Stripe), retorna False sin acreditar.
                 acreditado = await db.acreditar_pago_atomico(
-                    event_id, int(telegram_id), CREDITOS_POR_COMPRA
+                    event_id, int(telegram_id), creditos_a_sumar
                 )
                 if acreditado:
                     logger.info(
-                        f"[STRIPE] Pago completado → +{CREDITOS_POR_COMPRA} créditos "
+                        f"[STRIPE] Pago completado → +{creditos_a_sumar} créditos "
                         f"al usuario {telegram_id}"
                     )
                 else:
@@ -1591,8 +1754,21 @@ async def _ejecutar_alerta_usuario(tid: int, solicitud: str, fuente: str):
         )
         if not url_compra:
             logger.warning(f"[CRON-DB] Sin resultado para usuario {tid}")
+            fallos = await db.incrementar_fallos_cron(tid)
+            if fallos >= 3:
+                try:
+                    await telegram_app.bot.send_message(
+                        chat_id=tid, 
+                        text="⚠️ <b>Aviso de Sistema:</b>\nHe intentado escanear tu nicho favorito en mis últimas 3 rondas y el mercado actual no ha superado nuestros estrictos filtros.\n\nPrueba a cambiar tu estrategia o fuente en el /menu.",
+                        parse_mode="HTML"
+                    )
+                except Exception:
+                    pass
+                await db.resetear_fallos_cron(tid)
             return
 
+        # Éxito: Reseteamos fallos y procedemos
+        await db.resetear_fallos_cron(tid)
         await db.restar_credito(tid)
         creditos_restantes = await db.obtener_creditos(tid)
         texto_final += f"\n\n_Te quedan {creditos_restantes} créditos._"
@@ -1609,7 +1785,8 @@ async def _ejecutar_alerta_usuario(tid: int, solicitud: str, fuente: str):
         try:
             if ruta_captura:
                 try:
-                    if len(texto_final) > 1000:
+                    # Margen súper conservador para el límite 1024 de Telegram API
+                    if len(texto_final) > 900:
                         await telegram_app.bot.send_photo(chat_id=tid, photo=InputFile(ruta_captura, filename=f"chart_{ticker}.png"))
                         await telegram_app.bot.send_message(chat_id=tid, text=texto_final, reply_markup=teclado, parse_mode="HTML")
                     else:
@@ -1627,7 +1804,7 @@ async def _ejecutar_alerta_usuario(tid: int, solicitud: str, fuente: str):
             texto_limpio = re.sub(r'<[^>]+>', '', texto_final)
             if ruta_captura:
                 try:
-                    if len(texto_limpio) > 1000:
+                    if len(texto_limpio) > 900:
                         await telegram_app.bot.send_photo(chat_id=tid, photo=InputFile(ruta_captura, filename=f"chart_{ticker}.png"))
                         await telegram_app.bot.send_message(chat_id=tid, text=texto_limpio, reply_markup=teclado, parse_mode=None)
                     else:
@@ -1645,6 +1822,24 @@ async def _ejecutar_alerta_usuario(tid: int, solicitud: str, fuente: str):
         logger.error(f"[CRON-DB] Error ejecutando alerta para usuario {tid}: {e}")
 
 
+_usuarios_en_cron = set()
+
+async def procesador_lotes_cron(lista_usuarios: list):
+    """Procesa alertas secuencialmente (Task Queue nativo en memoria) para no tumbar la API ni BD."""
+    for item in lista_usuarios:
+        tid = item['tid']
+        try:
+            # Sleep ligero entre ejecuciones para equilibrar carga (Thundering Herd prevention)
+            await asyncio.sleep(3.5)
+            await _ejecutar_alerta_usuario(tid, item['solicitud'], item['fuente'])
+            # Mover la actualización de la BD aquí para confirmar el éxito de ejecución
+            await db.desbloquear_y_actualizar_cron(tid, time.time())
+        except Exception as e:
+            logger.error(f"[CRON QUEUE] Error procesando al usuario {tid}: {e}")
+            await db.desbloquear_cron_fallido(tid)
+        finally:
+            _usuarios_en_cron.discard(tid)
+
 @web_app.post("/cron/ejecutar")
 async def cron_ejecutar(request: Request, background_tasks: BackgroundTasks):
     """
@@ -1660,6 +1855,8 @@ async def cron_ejecutar(request: Request, background_tasks: BackgroundTasks):
     usuarios = await db.obtener_usuarios_con_alerta()
     ejecutados = 0
     omitidos = 0
+    lote_activo = []
+    ids_por_bloquear = []
 
     for usuario in usuarios:
         tid             = usuario["id"]
@@ -1690,19 +1887,26 @@ async def cron_ejecutar(request: Request, background_tasks: BackgroundTasks):
                 pass
             continue
 
-        # Marcar ANTES de ejecutar (evita doble ejecución si el cron llama dos veces)
-        await db.actualizar_ultima_alerta(tid, ahora)
-        # JITTER: Lanzar espaciado temporalmente para no golpear la Base de Datos a la vez
-        retraso = ejecutados * 3.5
-        
-        async def _wrapper_con_retraso(user_tid, user_sol, user_fuente, delay):
-            await asyncio.sleep(delay)
-            await _ejecutar_alerta_usuario(user_tid, user_sol, user_fuente)
-            
-        background_tasks.add_task(_wrapper_con_retraso, tid, solicitud, fuente, retraso)
+        # Control de duplicidad si el cron se dispara doblemente muy rápido
+        if tid in _usuarios_en_cron:
+            omitidos += 1
+            continue
+
+        _usuarios_en_cron.add(tid)
+        lote_activo.append({"tid": tid, "solicitud": solicitud, "fuente": fuente})
+        ids_por_bloquear.append(tid)
         ejecutados += 1
 
-    logger.info(f"[CRON-DB] Ciclo completo: {ejecutados} ejecutados, {omitidos} omitidos de {len(usuarios)} activos.")
+    if lote_activo:
+        try:
+            await db.bloquear_lote_cron(ids_por_bloquear)
+            background_tasks.add_task(procesador_lotes_cron, lote_activo)
+        except Exception as e:
+            logger.error(f"[CRON-DB] Error crítico al bloquear lote en base de datos: {e}")
+            # Si falla la transacción, NO encolamos para evitar procesamientos duplicados/descontrolados
+            return {"ok": False, "error": "Fallo al bloquear transaccionalmente el lote."}
+
+    logger.info(f"[CRON-DB] Ciclo completo: {ejecutados} encolados, {omitidos} omitidos de {len(usuarios)} activos.")
     return {"ok": True, "ejecutados": ejecutados, "omitidos": omitidos, "total_activos": len(usuarios)}
 
 

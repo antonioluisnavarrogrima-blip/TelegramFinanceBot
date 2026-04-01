@@ -89,6 +89,8 @@ async def inicializar_db():
             ("estado",          "TEXT DEFAULT NULL"),    # Estado de conversación persistente
             ("alerta_intervalo","INTEGER DEFAULT NULL"), # Horas entre alertas (NULL = desactivada)
             ("ultima_alerta",   "FLOAT DEFAULT 0"),      # Timestamp Unix de la última alerta enviada
+            ("fallos_cron",     "INTEGER DEFAULT 0"),    # Fallos consecutivos del cron
+            ("cron_procesando", "BOOLEAN DEFAULT FALSE"),# Bloqueo transaccional de cola
         ]
         for col, definition in columnas_extra:
             try:
@@ -108,6 +110,21 @@ async def inicializar_db():
             """)
         except Exception as e:
             logger.warning(f"[DB] No se pudo crear tabla stripe_eventos: {e}")
+
+        # ── Tabla de logs de errores ──────────────────────────────────────────
+        try:
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS logs_errores (
+                    id          SERIAL PRIMARY KEY,
+                    telegram_id BIGINT,
+                    ticker      TEXT,
+                    error_type  TEXT,
+                    reason      TEXT,
+                    created_at  TIMESTAMPTZ DEFAULT now()
+                )
+            """)
+        except Exception as e:
+            logger.warning(f"[DB] No se pudo crear tabla logs_errores: {e}")
 
     logger.info("[DB] BD Supabase lista.")
 
@@ -383,6 +400,7 @@ async def obtener_usuarios_con_alerta() -> list[dict]:
               AND ultima_busqueda IS NOT NULL
               AND ultima_busqueda NOT LIKE '__STATE:%'
               AND ultima_busqueda != '__ESPERANDO_URL__'
+              AND (cron_procesando IS NULL OR cron_procesando = FALSE)
             """
         )
         return [dict(row) for row in rows]
@@ -414,3 +432,68 @@ async def actualizar_ultima_alerta(telegram_id: int, timestamp: float) -> None:
             "UPDATE usuarios SET ultima_alerta = $2 WHERE id = $1",
             telegram_id, timestamp
         )
+
+
+async def bloquear_lote_cron(telegram_ids: list[int]) -> None:
+    """Marca un lote de usuarios como EN PROCESO para evitar dobles ejecuciones."""
+    if not telegram_ids: return
+    async with _pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE usuarios SET cron_procesando = TRUE WHERE id = ANY($1)",
+            telegram_ids
+        )
+
+
+async def desbloquear_y_actualizar_cron(telegram_id: int, timestamp: float) -> None:
+    """Libera el candado tras éxito y graba el timestamp."""
+    async with _pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE usuarios SET cron_procesando = FALSE, ultima_alerta = $2 WHERE id = $1",
+            telegram_id, timestamp
+        )
+
+
+async def desbloquear_cron_fallido(telegram_id: int) -> None:
+    """Libera el candado si el pipeline falla críticamente, sin alterar la ultima_alerta."""
+    async with _pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE usuarios SET cron_procesando = FALSE WHERE id = $1",
+            telegram_id
+        )
+
+
+async def incrementar_fallos_cron(telegram_id: int) -> int:
+    """Incrementa los fallos consecutivos de cron y retorna el total."""
+    async with _pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE usuarios SET fallos_cron = fallos_cron + 1 WHERE id = $1",
+            telegram_id
+        )
+        val = await conn.fetchval(
+            "SELECT fallos_cron FROM usuarios WHERE id = $1", telegram_id
+        )
+        return int(val) if val else 0
+
+
+async def resetear_fallos_cron(telegram_id: int) -> None:
+    """Resetea los fallos de cron a 0."""
+    async with _pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE usuarios SET fallos_cron = 0 WHERE id = $1",
+            telegram_id
+        )
+
+
+async def registrar_error_ticker(telegram_id: int | None, ticker: str, error_type: str, reason: str) -> None:
+    """Guarda un log detallado sobre por qué un ticker falló en pipeline (PER, Dividendo, No existe...)."""
+    try:
+        async with _pool.acquire() as conn:
+            await conn.execute(
+                """
+                INSERT INTO logs_errores (telegram_id, ticker, error_type, reason)
+                VALUES ($1, $2, $3, $4)
+                """,
+                telegram_id, ticker, error_type, reason
+            )
+    except Exception as e:
+        logger.error(f"[DB] Error guardando log ticker {ticker}: {e}")

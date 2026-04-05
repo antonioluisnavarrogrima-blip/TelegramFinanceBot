@@ -126,6 +126,20 @@ async def inicializar_db():
         except Exception as e:
             logger.warning(f"[DB] No se pudo crear tabla logs_errores: {e}")
 
+        # ── Tabla de Semillas para Screener ───────────────────────────────────
+        try:
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS ticker_seeds (
+                    ticker      TEXT PRIMARY KEY,
+                    clase       TEXT NOT NULL,
+                    sector      TEXT,
+                    created_at  TIMESTAMPTZ DEFAULT now()
+                )
+            """)
+            await conn.execute("CREATE INDEX IF NOT EXISTS idx_seeds_clase_sector ON ticker_seeds (clase, sector)")
+        except Exception as e:
+            logger.warning(f"[DB] No se pudo crear tabla ticker_seeds: {e}")
+
     logger.info("[DB] BD Supabase lista.")
 
 
@@ -386,10 +400,9 @@ async def resetear_strikes(telegram_id: int):
 
 # ── ALERTAS PERSISTENTES ──────────────────────────────────────────────────────
 
-async def obtener_usuarios_con_alerta() -> list[dict]:
+async def obtener_usuarios_con_alerta(limit: int = 50, offset: int = 0) -> list[dict]:
     """
-    Retorna todos los usuarios con alerta activa (alerta_intervalo IS NOT NULL)
-    y con una búsqueda guardada válida.
+    Retorna usuarios con alerta activa usando paginación para escalabilidad.
     """
     async with _pool.acquire() as conn:
         rows = await conn.fetch(
@@ -401,7 +414,10 @@ async def obtener_usuarios_con_alerta() -> list[dict]:
               AND ultima_busqueda NOT LIKE '__STATE:%'
               AND ultima_busqueda != '__ESPERANDO_URL__'
               AND (cron_procesando IS NULL OR cron_procesando = FALSE)
-            """
+            ORDER BY id
+            LIMIT $1 OFFSET $2
+            """,
+            limit, offset
         )
         return [dict(row) for row in rows]
 
@@ -434,14 +450,19 @@ async def actualizar_ultima_alerta(telegram_id: int, timestamp: float) -> None:
         )
 
 
-async def bloquear_lote_cron(telegram_ids: list[int]) -> None:
-    """Marca un lote de usuarios como EN PROCESO para evitar dobles ejecuciones."""
-    if not telegram_ids: return
-    async with _pool.acquire() as conn:
-        await conn.execute(
-            "UPDATE usuarios SET cron_procesando = TRUE WHERE id = ANY($1)",
-            telegram_ids
-        )
+async def bloquear_lote_cron(telegram_ids: list[int]) -> bool:
+    """Marca un lote de usuarios como EN PROCESO para evitar dobles ejecuciones. Retorna True si tuvo éxito."""
+    if not telegram_ids: return True
+    try:
+        async with _pool.acquire() as conn:
+            await conn.execute(
+                "UPDATE usuarios SET cron_procesando = TRUE WHERE id = ANY($1)",
+                telegram_ids
+            )
+        return True
+    except Exception as e:
+        logger.error(f"[DB] Fallo bloqueando lote cron: {e}")
+        return False
 
 
 async def desbloquear_y_actualizar_cron(telegram_id: int, timestamp: float) -> None:
@@ -484,16 +505,150 @@ async def resetear_fallos_cron(telegram_id: int) -> None:
         )
 
 
-async def registrar_error_ticker(telegram_id: int | None, ticker: str, error_type: str, reason: str) -> None:
-    """Guarda un log detallado sobre por qué un ticker falló en pipeline (PER, Dividendo, No existe...)."""
-    try:
-        async with _pool.acquire() as conn:
-            await conn.execute(
-                """
-                INSERT INTO logs_errores (telegram_id, ticker, error_type, reason)
-                VALUES ($1, $2, $3, $4)
-                """,
-                telegram_id, ticker, error_type, reason
+# ── SEMILLAS DE TICKERS (SCREENER) ───────────────────────────────────────────
+
+async def obtener_semillas_busqueda(clase: str, sector: str | None = None) -> list[str]:
+    """Recupera lista de tickers candidatos según clase y sector."""
+    async with _pool.acquire() as conn:
+        if sector:
+            rows = await conn.fetch(
+                "SELECT ticker FROM ticker_seeds WHERE clase = $1 AND sector = $2",
+                clase, sector
             )
-    except Exception as e:
-        logger.error(f"[DB] Error guardando log ticker {ticker}: {e}")
+        else:
+            rows = await conn.fetch(
+                "SELECT ticker FROM ticker_seeds WHERE clase = $1",
+                clase
+            )
+        return [r["ticker"] for r in rows]
+
+
+async def actualizar_semillas(lote_seeds: list[dict]) -> int:
+    """UPSERT masivo de semillas (ticker, clase, sector). Retorna total procesado."""
+    async with _pool.acquire() as conn:
+        async with conn.transaction():
+            count = 0
+            for item in lote_seeds:
+                await conn.execute(
+                    """
+                    INSERT INTO ticker_seeds (ticker, clase, sector)
+                    VALUES ($1, $2, $3)
+                    ON CONFLICT (ticker) DO UPDATE 
+                    SET clase = EXCLUDED.clase, sector = EXCLUDED.sector
+                    """,
+                    item["ticker"], item["clase"], item.get("sector")
+                )
+                count += 1
+            return count
+
+
+async def precargar_semillas_basicas():
+    """Inserta top 100 tickers globales si la tabla está vacía para funcionalidad inmediata."""
+    async with _pool.acquire() as conn:
+        actual = await conn.fetchval("SELECT COUNT(*) FROM ticker_seeds")
+        if actual > 0:
+            return
+            
+        # Lista ampliada — 80+ tickers globales
+        semillas = [
+            # ── ACCIONES: Tecnología USA ──────────────────────────────────
+            {"ticker": "AAPL",  "clase": "ACCION", "sector": "tecnologia"},
+            {"ticker": "MSFT",  "clase": "ACCION", "sector": "tecnologia"},
+            {"ticker": "GOOGL", "clase": "ACCION", "sector": "tecnologia"},
+            {"ticker": "NVDA",  "clase": "ACCION", "sector": "tecnologia"},
+            {"ticker": "META",  "clase": "ACCION", "sector": "tecnologia"},
+            {"ticker": "AMZN",  "clase": "ACCION", "sector": "tecnologia"},
+            {"ticker": "AMD",   "clase": "ACCION", "sector": "tecnologia"},
+            {"ticker": "INTC",  "clase": "ACCION", "sector": "tecnologia"},
+            {"ticker": "QCOM",  "clase": "ACCION", "sector": "tecnologia"},
+            {"ticker": "ORCL",  "clase": "ACCION", "sector": "tecnologia"},
+            # ── ACCIONES: Salud ───────────────────────────────────────────
+            {"ticker": "JNJ",   "clase": "ACCION", "sector": "salud"},
+            {"ticker": "PFE",   "clase": "ACCION", "sector": "salud"},
+            {"ticker": "ABBV",  "clase": "ACCION", "sector": "salud"},
+            {"ticker": "MRK",   "clase": "ACCION", "sector": "salud"},
+            {"ticker": "LLY",   "clase": "ACCION", "sector": "salud"},
+            {"ticker": "ABT",   "clase": "ACCION", "sector": "salud"},
+            # ── ACCIONES: Energía / Petróleo ─────────────────────────────
+            {"ticker": "XOM",   "clase": "ACCION", "sector": "energia"},
+            {"ticker": "CVX",   "clase": "ACCION", "sector": "energia"},
+            {"ticker": "COP",   "clase": "ACCION", "sector": "energia"},
+            {"ticker": "SLB",   "clase": "ACCION", "sector": "energia"},
+            {"ticker": "BP",    "clase": "ACCION", "sector": "energia"},
+            {"ticker": "SHEL",  "clase": "ACCION", "sector": "energia"},
+            {"ticker": "REP.MC","clase": "ACCION", "sector": "energia"},
+            {"ticker": "IBE.MC","clase": "ACCION", "sector": "energia"},
+            # ── ACCIONES: Consumo / Retail ────────────────────────────────
+            {"ticker": "KO",    "clase": "ACCION", "sector": "consumo"},
+            {"ticker": "PEP",   "clase": "ACCION", "sector": "consumo"},
+            {"ticker": "PG",    "clase": "ACCION", "sector": "consumo"},
+            {"ticker": "MCD",   "clase": "ACCION", "sector": "consumo"},
+            {"ticker": "WMT",   "clase": "ACCION", "sector": "consumo"},
+            {"ticker": "COST",  "clase": "ACCION", "sector": "consumo"},
+            {"ticker": "NKE",   "clase": "ACCION", "sector": "consumo"},
+            # ── ACCIONES: Industria / Materiales ─────────────────────────
+            {"ticker": "CAT",   "clase": "ACCION", "sector": "industria"},
+            {"ticker": "BA",    "clase": "ACCION", "sector": "industria"},
+            {"ticker": "HON",   "clase": "ACCION", "sector": "industria"},
+            {"ticker": "GE",    "clase": "ACCION", "sector": "industria"},
+            {"ticker": "MMM",   "clase": "ACCION", "sector": "industria"},
+            {"ticker": "BHP",   "clase": "ACCION", "sector": "materias_primas"},
+            {"ticker": "RIO",   "clase": "ACCION", "sector": "materias_primas"},
+            {"ticker": "FCX",   "clase": "ACCION", "sector": "materias_primas"},
+            {"ticker": "VALE",  "clase": "ACCION", "sector": "materias_primas"},
+            {"ticker": "NUE",   "clase": "ACCION", "sector": "materias_primas"},
+            # ── ACCIONES: Banca / Finanzas ────────────────────────────────
+            {"ticker": "JPM",   "clase": "ACCION", "sector": "banca"},
+            {"ticker": "BAC",   "clase": "ACCION", "sector": "banca"},
+            {"ticker": "WFC",   "clase": "ACCION", "sector": "banca"},
+            {"ticker": "GS",    "clase": "ACCION", "sector": "banca"},
+            {"ticker": "SAN.MC","clase": "ACCION", "sector": "banca"},
+            {"ticker": "BBVA.MC","clase":"ACCION", "sector": "banca"},
+            {"ticker": "BNP.PA","clase": "ACCION", "sector": "banca"},
+            # ── ACCIONES: Telecomunicaciones ─────────────────────────────
+            {"ticker": "T",     "clase": "ACCION", "sector": "telecomunicaciones"},
+            {"ticker": "VZ",    "clase": "ACCION", "sector": "telecomunicaciones"},
+            {"ticker": "TEF.MC","clase": "ACCION", "sector": "telecomunicaciones"},
+            {"ticker": "DTE.DE","clase": "ACCION", "sector": "telecomunicaciones"},
+            # ── REITS ─────────────────────────────────────────────────────
+            {"ticker": "O",     "clase": "REIT",   "sector": "inmobiliario"},
+            {"ticker": "STAG",  "clase": "REIT",   "sector": "logistica"},
+            {"ticker": "PLD",   "clase": "REIT",   "sector": "logistica"},
+            {"ticker": "SPG",   "clase": "REIT",   "sector": "comercial"},
+            {"ticker": "AMT",   "clase": "REIT",   "sector": "infraestructura"},
+            {"ticker": "SBAC",  "clase": "REIT",   "sector": "infraestructura"},
+            {"ticker": "EQR",   "clase": "REIT",   "sector": "residencial"},
+            {"ticker": "VICI",  "clase": "REIT",   "sector": "ocio"},
+            {"ticker": "WPC",   "clase": "REIT",   "sector": "diversificado"},
+            {"ticker": "COL.MC","clase": "REIT",   "sector": "oficinas"},
+            # ── ETFs ──────────────────────────────────────────────────────
+            {"ticker": "SPY",   "clase": "ETF",    "sector": "global"},
+            {"ticker": "QQQ",   "clase": "ETF",    "sector": "tecnologia"},
+            {"ticker": "VTI",   "clase": "ETF",    "sector": "global"},
+            {"ticker": "IWDA.L","clase": "ETF",    "sector": "global"},
+            {"ticker": "VUSA.L","clase": "ETF",    "sector": "usa"},
+            {"ticker": "CSPX.L","clase": "ETF",    "sector": "usa"},
+            {"ticker": "VYM",   "clase": "ETF",    "sector": "dividendos"},
+            {"ticker": "SCHD",  "clase": "ETF",    "sector": "dividendos"},
+            {"ticker": "XLE",   "clase": "ETF",    "sector": "energia"},
+            {"ticker": "XLF",   "clase": "ETF",    "sector": "banca"},
+            {"ticker": "XLK",   "clase": "ETF",    "sector": "tecnologia"},
+            # ── CRIPTO ────────────────────────────────────────────────────
+            {"ticker": "BTC-USD",  "clase": "CRIPTO", "sector": "moneda"},
+            {"ticker": "ETH-USD",  "clase": "CRIPTO", "sector": "plataforma"},
+            {"ticker": "SOL-USD",  "clase": "CRIPTO", "sector": "plataforma"},
+            {"ticker": "BNB-USD",  "clase": "CRIPTO", "sector": "exchange"},
+            {"ticker": "XRP-USD",  "clase": "CRIPTO", "sector": "pagos"},
+            {"ticker": "ADA-USD",  "clase": "CRIPTO", "sector": "plataforma"},
+            {"ticker": "LINK-USD", "clase": "CRIPTO", "sector": "infraestructura"},
+            {"ticker": "AVAX-USD", "clase": "CRIPTO", "sector": "plataforma"},
+            # ── BONOS (ETFs de renta fija) ────────────────────────────────
+            {"ticker": "TLT",   "clase": "BONO",   "sector": "largo_plazo"},
+            {"ticker": "IEF",   "clase": "BONO",   "sector": "medio_plazo"},
+            {"ticker": "AGG",   "clase": "BONO",   "sector": "agregado"},
+            {"ticker": "EMB",   "clase": "BONO",   "sector": "emergentes"},
+            {"ticker": "TIP",   "clase": "BONO",   "sector": "inflacion"},
+            {"ticker": "HYG",   "clase": "BONO",   "sector": "alto_rendimiento"},
+        ]
+        await actualizar_semillas(semillas)
+        logger.info(f"[DB] Precarga de {len(semillas)} semillas completada.")

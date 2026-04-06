@@ -16,6 +16,5 @@ stripe==11.5.0
 cachetools==5.3.3
 
 # --- Gráficos e Imágenes (Solución Render) ---
-matplotlib>=3.9.0
-# NOTA: Pillow no se incluye aquí intencionadamente para evitar el fallo de compilación.
-# Matplotlib instalará automáticamente el binario compatible.
+matplotlib==3.9.2
+Pillow==10.3.0

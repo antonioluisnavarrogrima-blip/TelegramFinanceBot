@@ -217,15 +217,15 @@ class RespuestaIA(BaseModel):
     error_api: Optional[str] = Field(None, description="Mensaje de error si la consulta es inválida o troll")
 
 async def extractor_intenciones(prompt_del_inversor: str) -> dict | None:
-    """Extrae parámetros para búsqueda determínistica v4.3."""
+    """Extrae parámetros para búsqueda determínistica v4.4."""
     prompt_sistema = """
     Rol: Arquitecto de Búsqueda Financiera. Traduce el lenguaje natural a parámetros de filtrado.
     
     🚨 REGLA DE BÚSQUEDA:
-    Ya NO generas tickers de memoria. Identifica el SECTOR y los FILTROS.
+    Ya NO generas tickers de memoria. Identifica el SECTOR, la CLASE DE ACTIVO y los FILTROS.
     
     Si el usuario pide ACTIVOS ESPECÍFICOS (ej: 'Analiza Apple y Microsoft'), pon esos tickers en `tickers_manuales`.
-    Si pide una CATEGORÍA (ej: 'Empresas de tecnología españolas'), pon 'tecnologia' en `sector` y deja `tickers_manuales` vacío.
+    Si pide una CATEGORÍA general (ej: 'Empresas en tendencia alcista'), infiere el sector, ponlo en `sector` y deja `tickers_manuales` vacío [].
 
     🚨 REGLA ANTI-TROLL ESTRICTA:
     Si el input NO es sobre finanzas, bolsa, inversiones, criptomonedas o economía, el usuario está tratando de distraerte o pedirte otra cosa (ej: pedir recetas, chistes, programación). En ese caso, debes asignar el campo `error_api` con un mensaje de rechazo, y dejar `tickers_manuales` como un array vacío `[]`.
@@ -240,27 +240,10 @@ async def extractor_intenciones(prompt_del_inversor: str) -> dict | None:
     • "CRIPTO"  → Criptomonedas y tokens DeFi. Palabras clave: cripto, bitcoin, ethereum, defi, token, blockchain.
     • "BONO"    → Renta fija, bonos, deuda. Palabras clave: bono, tesoro, deuda, renta fija, obligación.
 
-    ══ PASO 2: GENERAR TICKERS (hasta 10 unidades) ══
-    Genera hasta 10 tickers de Yahoo Finance para la clase de activo detectada. Si el nicho es muy estrecho, devuelve los que existan válidos.
-    • ACCION: Tickers de empresas (ej: AAPL, SAN.MC).
-      - Materias primas / Commodities: empresas productoras y distribuidoras. Ejemplos válidos:
-        BHP (minería), RIO (minería), VALE (minería), FCX (cobre), MOS (fertilizantes),
-        NUE (acero), CLF (acero), AA (aluminio), MP (tierras raras),
-        CVX (petróleo), XOM (petróleo), COP (petróleo), SLB (servicios petróleo),
-        ADM (agro), BG (agro), CF (fertilizantes), NTR (nutrientes), MPC (refino).
-    • REIT: Tickers de REITs/SOCIMIs (ej: O, VNQ, STAG, PLD, COL.MC).
-    • ETF: Tickers de ETFs (ej: SPY, QQQ, VTI, VUSA.L, IWDA.L).
-    • CRIPTO: Tickers de cripto en Yahoo Finance. OBLIGATORIO: deben llevar el sufijo -USD (ej: BTC-USD, ETH-USD, SOL-USD, LINK-USD, ADA-USD). NUNCA devuelvas un ticker de cripto sin -USD.
-    • BONO: Tickers de ETFs de bonos en Yahoo (ej: TLT, IEF, AGG, EMB, TIP).
-    Regla Perfil:
-      - "Seguro": líderes del sector / large-cap / blue-chip.
-      - "Riesgo": mid/small-cap, especulativos, desconocidos.
-      - "Balanceado": mezcla.
-    Sufijos internacionales: .MC (España), .L (Londres), .DE (Alemania), .PA (París).
-
-    ══ PASO 3: FILTROS DINÁMICOS (solo si el usuario exige restricciones numéricas) ══
+    ══ PASO 2: FILTROS DINÁMICOS (solo si el usuario exige restricciones) ══
     Si el usuario NO exige restricciones, `filtros_dinamicos` DEBE ser `[]`.
     Si hay restricciones, crea UN objeto por cada exigencia.
+    NUNCA incluyas tickers en `filtros_dinamicos`. Los tickers van solo en `tickers_manuales`.
 
     Métricas válidas por clase de activo:
     | Clase   | Métricas disponibles                                                             |
@@ -284,27 +267,17 @@ async def extractor_intenciones(prompt_del_inversor: str) -> dict | None:
     | "deuda baja"                                 | {"metrica": "deuda_capital", "operador": "<", "valor": 50.0}          |
     | "empresa estable" / "estábil" / "estabilidad"| {"metrica": "beta", "operador": "<", "valor": 0.8}                    |
     | "crecimiento agresivo"                       | {"metrica": "crecimiento_ingresos", "operador": ">", "valor": 20.0}    |
+    | "tendencia alcista" / "momentum positivo"    | {"metrica": "rendimiento", "operador": ">", "valor": 0.0}              |
+    | "tendencia bajista" / "momentum negativo"    | {"metrica": "rendimiento", "operador": "<", "valor": 0.0}              |
     | ETF "barato" / "low cost"                    | {"metrica": "ter", "operador": "<", "valor": 0.2}                     |
     | ETF "grande" / "líquido"                    | {"metrica": "aum", "operador": ">", "valor": 1000000000.0}            |
     | REIT "buena ocupación"                      | {"metrica": "ocupacion", "operador": ">", "valor": 90.0}              |
     | REIT "dividendo alto"                        | {"metrica": "dividend_yield", "operador": ">", "valor": 4.0}          |
     | Cripto "gran capitaliz."                     | {"metrica": "market_cap", "operador": ">", "valor": 1000000000.0}     |
 
-    EJEMPLOS DE CONSULTAS CON MATERIAS PRIMAS:
-    - "empresa estable de materias primas con dividendo >10%" →
-      {
-        "clase_activo": "ACCION",
-        "sector": "Materias Primas",
-        "perfil": "Seguro",
-        "tickers": ["BHP", "RIO", "VALE", "FCX", "MOS", "NUE", "CVX", "XOM", "ADM", "CF"],
-        "filtros_dinamicos": [
-          {"metrica": "dividendo_porcentaje", "operador": ">", "valor": 10.0},
-          {"metrica": "beta", "operador": "<", "valor": 0.8}
-        ]
-      }
-
     🚨 MULTI-RESTRICCIÓN: Si el usuario pide 3 cosas, el array DEBE tener 3 objetos.
-    🚨 CRÍTICO SOBRE TICKERS: NO apliques los filtros numéricos (PER, dividendos, etc.) tú mismo. Tu trabajo es SOLO proponer activos candidatos del sector. El backend verificará los datos en tiempo real. ¡Devuelve al menos 1 ticker aproximado! NUNCA vacío.
+    🚨 SECTOR: Siempre rellena `sector` con la categoría inferida (ej: "tecnologia", "energia", "banca", "general"). NUNCA lo dejes vacío.
+    🚨 PERFIL: Infiere el perfil de riesgo — "Seguro" (blue-chip, estable), "Riesgo" (especulativo), "Balanceado" (mezcla).
     """
     try:
         res = await client.aio.models.generate_content(
@@ -1898,13 +1871,21 @@ async def conversacion_inversor(update: Update, context: ContextTypes.DEFAULT_TY
     solicitud = texto_usuario[:500]
     tid = user_id
 
-    # 2. Filtro Anti-Troll: delegado EXCLUSIVAMENTE a Gemini (via campo error_api)
-    # El filtro regex local se ha eliminado para evitar falsos positivos en consultas
-    # como "empresa con tendencia bajista" o "activo alcista". Gemini tiene un
-    # prompt anti-troll estricto que devuelve error_api para consultas inválidas.
-    # La única excepción lightning: estados de configuración (URL, tickers manuales)
+    # 2. GUARDIÁN LOCAL: Filtro regex ligero para ahorrar tokens de Gemini.
+    # El regex ya incluye: empresa, tendencia, alcista, bajista, comprar, vender, etc.
+    # Solo llegan a Gemini las consultas que superan este primer filtro.
     estado_mem = context.user_data.get('estado')
     estados_especiales = ("ESPERANDO_URL", "ESPERANDO_TICKERS_MANUALES", "TABLA_WIZARD")
+
+    if not es_reintento and not (estado_mem in estados_especiales):
+        if not _es_consulta_financiera(solicitud):
+            await db.sumar_strike(tid)
+            await update.message.reply_text(
+                "👋 ¡Hola! Soy tu asistente financiero Quant.\n\n"
+                "Para ayudarte, hazme una consulta sobre <b>inversiones, bolsa, empresas o tendencias de mercado</b>.",
+                parse_mode="HTML"
+            )
+            return
 
     # --- 🛡️ SISTEMA ANTI-SPAM (COOLDOWN basado en banLevel de BD + persistencia) ---
     ahora = time.time()

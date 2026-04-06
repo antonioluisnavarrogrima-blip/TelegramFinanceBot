@@ -17,4 +17,4 @@ cachetools==5.3.3
 
 # --- Gráficos e Imágenes (Solución Render) ---
 matplotlib==3.10.0
-Pillow==11.1.0
+Pillow>=10.0.0

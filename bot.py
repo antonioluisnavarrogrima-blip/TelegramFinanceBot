@@ -96,12 +96,30 @@ class TokenBucket:
 
 
 def _es_consulta_financiera(texto: str) -> bool:
-    """Filtro Anti-Troll local ligero para ahorrar tokens de Gemini."""
+    """Filtro Anti-Troll local ligero. Ya NO se usa como guardián en conversacion_inversor
+    (Gemini actúa como único árbitro). Se mantiene como utilidad interna."""
     patrones = [
-        r"bolsa", r"invertir", r"acci[oó]n", r"mercado", r"cripto", r"bitcoin",
-        r"dividend", r"per ", r"yield", r"etf", r"reit", r"bono", r"dinero",
-        r"finanza", r"econom[ií]a", r"ticker", r"portafolio", r"cartera",
-        r"sector", r"ingresos"
+        # Activos y mercados
+        r"bolsa", r"invertir", r"inversi[oó]n", r"acci[oó]n", r"acciones",
+        r"mercado", r"cripto", r"bitcoin", r"ethereum", r"token", r"blockchain",
+        r"dividend", r"per ", r"yield", r"etf", r"reit", r"bono", r"bonos",
+        r"dinero", r"finanza", r"econom[ií]a", r"ticker", r"portafolio",
+        r"cartera", r"sector", r"ingresos", r"empresa", r"empresas",
+        # Tendencias y análisis técnico
+        r"tendencia", r"bajista", r"alcista", r"soporte", r"resistencia",
+        r"momentum", r"gr[áa]fico", r"chart", r"velas", r"media m[oó]vil",
+        r"rsi", r"macd", r"fibonacci",
+        # Operativa
+        r"comprar", r"vender", r"operar", r"trading", r"posici[oó]n",
+        r"largo", r"corto", r"stop.?loss", r"take.?profit",
+        # Finanzas y valoración
+        r"activo", r"precio", r"fondo", r"fondos", r"indexado",
+        r"renta fija", r"renta variable", r"commodity", r"materias primas",
+        r"petróleo", r"oro", r"plata", r"divisas",
+        # Métricas
+        r"per", r"peg", r"roe", r"roa", r"ebitda", r"margen", r"deuda",
+        r"capitalizaci[oó]n", r"capital", r"patrimonio", r"beneficio",
+        r"valoraci[oó]n", r"an[áa]lisis", r"rentabilidad", r"rendimiento",
     ]
     regex = re.compile("|".join(patrones), re.IGNORECASE)
     return bool(regex.search(texto))
@@ -1880,20 +1898,13 @@ async def conversacion_inversor(update: Update, context: ContextTypes.DEFAULT_TY
     solicitud = texto_usuario[:500]
     tid = user_id
 
-    # 2. Filtro Anti-Troll Local (Regex) - Ahorro de Tokens
-    if not es_reintento and not _es_consulta_financiera(solicitud):
-        # Permitir comandos de configuración o estados especiales
-        estado_mem = context.user_data.get('estado')
-        estados_especiales = ("ESPERANDO_URL", "ESPERANDO_TICKERS_MANUALES", "TABLA_WIZARD")
-        if not (estado_mem in estados_especiales or solicitud.startswith("http")):
-            # BUG FIX 1: sumar strike por consulta no financiera
-            await db.sumar_strike(tid)
-            await update.message.reply_text(
-                "👋 ¡Hola! Soy tu asistente financiero Quant.\n\n"
-                "Para ayudarte, por favor hazme una consulta sobre <b>inversiones, bolsa, dividendos o criptomonedas</b>.",
-                parse_mode="HTML"
-            )
-            return
+    # 2. Filtro Anti-Troll: delegado EXCLUSIVAMENTE a Gemini (via campo error_api)
+    # El filtro regex local se ha eliminado para evitar falsos positivos en consultas
+    # como "empresa con tendencia bajista" o "activo alcista". Gemini tiene un
+    # prompt anti-troll estricto que devuelve error_api para consultas inválidas.
+    # La única excepción lightning: estados de configuración (URL, tickers manuales)
+    estado_mem = context.user_data.get('estado')
+    estados_especiales = ("ESPERANDO_URL", "ESPERANDO_TICKERS_MANUALES", "TABLA_WIZARD")
 
     # --- 🛡️ SISTEMA ANTI-SPAM (COOLDOWN basado en banLevel de BD + persistencia) ---
     ahora = time.time()

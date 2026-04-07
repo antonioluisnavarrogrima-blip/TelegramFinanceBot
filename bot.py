@@ -9,23 +9,17 @@ import asyncio
 import operator
 import io
 import time
-import threading
 import random
 import requests
 import functools
 import httpx
-import yfinance as yf
-import matplotlib
-from matplotlib.figure import Figure
-from matplotlib.backends.backend_agg import FigureCanvasAgg as FigureCanvas
-from cachetools import TTLCache
 from google import genai
 from google.genai import types
 from dotenv import load_dotenv
 from telegram import Update, BotCommand, BotCommandScopeDefault, InlineKeyboardButton, InlineKeyboardMarkup, InputFile
 from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, filters, ContextTypes
 from telegram.error import BadRequest
-from fastapi import FastAPI, HTTPException, Request, BackgroundTasks
+from fastapi import FastAPI, HTTPException, Request, BackgroundTasks, Response
 import uvicorn
 import stripe
 
@@ -42,6 +36,8 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 load_dotenv()
 TELEGRAM_TOKEN   = os.getenv("TELEGRAM_TOKEN")
 GEMINI_API_KEY   = os.getenv("GEMINI_API_KEY")
+FMP_API_KEY      = os.getenv("FMP_API_KEY")
+RENDER_EXTERNAL_URL = os.getenv("RENDER_EXTERNAL_URL", "")
 STRIPE_API_KEY   = os.getenv("STRIPE_API_KEY", "")   # sk_live_... o sk_test_...
 stripe.api_key = STRIPE_API_KEY
 
@@ -63,83 +59,47 @@ CREDITOS_POR_COMPRA   = int(os.getenv("CREDITOS_POR_COMPRA", "10"))
 STRIPE_PAYMENT_URL    = "https://buy.stripe.com/28EcN70yD05tcjHgZm3VC00"
 # Secret para proteger el endpoint /cron/ejecutar de llamadas no autorizadas
 CRON_SECRET = os.getenv("CRON_SECRET", "")
+http_client: httpx.AsyncClient = None
 
 OPS = {
     ">": operator.gt, "<": operator.lt, ">=": operator.ge,
     "<=": operator.le, "==": operator.eq, "=": operator.eq
 }
 
-class TokenBucket:
-    """Implementación nativa de Token Bucket para rate-limiting asíncrono."""
-    def __init__(self, tps: int):
-        self.tps = tps
-        self.tokens = float(tps)
-        self.last_update = time.monotonic()
-        self.lock = asyncio.Lock()
-
-    async def wait(self):
-        while True:
-            async with self.lock:
-                now = time.monotonic()
-                self.tokens += (now - self.last_update) * self.tps
-                self.last_update = now
-                if self.tokens > self.tps:
-                    self.tokens = self.tps # Evitar desbordamiento
-                
-                if self.tokens >= 1.0:
-                    self.tokens -= 1.0
-                    return # Éxito: Salimos del lock y del bucle
-
-            # Si no hay tokens, calculamos espera exacta FUERA del lock
-            timeout = max(0.05, 1.0 / self.tps)
-            await asyncio.sleep(timeout)
-
+# Regex compilado UNA VEZ al cargar el módulo (evita recompilación en cada mensaje)
+_REGEX_FINANCIERO = re.compile(
+    r"bolsa|invertir|inversi[oó]n|acci[oó]n|acciones|mercado|cripto|bitcoin|ethereum"
+    r"|token|blockchain|dividend|yield|etf|reit|bono|bonos|dinero|finanza"
+    r"|econom[ií]a|ticker|portafolio|cartera|sector|ingresos|empresa|empresas"
+    r"|tendencia|bajista|alcista|soporte|resistencia|momentum|gr[áa]fico|chart"
+    r"|velas|rsi|macd|fibonacci|comprar|vender|operar|trading|posici[oó]n"
+    r"|activo|precio|fondo|fondos|indexado|renta fija|renta variable"
+    r"|commodity|petr[oó]leo|oro|plata|divisas"
+    r"|per|peg|roe|roa|ebitda|margen|deuda|capital|patrimonio|beneficio"
+    r"|valoraci[oó]n|an[áa]lisis|rentabilidad|rendimiento",
+    re.IGNORECASE
+)
 
 def _es_consulta_financiera(texto: str) -> bool:
-    """Filtro Anti-Troll local ligero. Ya NO se usa como guardián en conversacion_inversor
-    (Gemini actúa como único árbitro). Se mantiene como utilidad interna."""
-    patrones = [
-        # Activos y mercados
-        r"bolsa", r"invertir", r"inversi[oó]n", r"acci[oó]n", r"acciones",
-        r"mercado", r"cripto", r"bitcoin", r"ethereum", r"token", r"blockchain",
-        r"dividend", r"per ", r"yield", r"etf", r"reit", r"bono", r"bonos",
-        r"dinero", r"finanza", r"econom[ií]a", r"ticker", r"portafolio",
-        r"cartera", r"sector", r"ingresos", r"empresa", r"empresas",
-        # Tendencias y análisis técnico
-        r"tendencia", r"bajista", r"alcista", r"soporte", r"resistencia",
-        r"momentum", r"gr[áa]fico", r"chart", r"velas", r"media m[oó]vil",
-        r"rsi", r"macd", r"fibonacci",
-        # Operativa
-        r"comprar", r"vender", r"operar", r"trading", r"posici[oó]n",
-        r"largo", r"corto", r"stop.?loss", r"take.?profit",
-        # Finanzas y valoración
-        r"activo", r"precio", r"fondo", r"fondos", r"indexado",
-        r"renta fija", r"renta variable", r"commodity", r"materias primas",
-        r"petróleo", r"oro", r"plata", r"divisas",
-        # Métricas
-        r"per", r"peg", r"roe", r"roa", r"ebitda", r"margen", r"deuda",
-        r"capitalizaci[oó]n", r"capital", r"patrimonio", r"beneficio",
-        r"valoraci[oó]n", r"an[áa]lisis", r"rentabilidad", r"rendimiento",
-    ]
-    regex = re.compile("|".join(patrones), re.IGNORECASE)
-    return bool(regex.search(texto))
+    """Guardián local: filtra mensajes no financieros sin gastar tokens de Gemini."""
+    return bool(_REGEX_FINANCIERO.search(texto))
 
 
-METRICAS_YF = {
-    "per": "trailingPE",
-    "dividendos_yield": "dividendYield",
-    "dividendo_porcentaje": "dividendYield",
-    "dividendo_absoluto": "dividendRate",
+METRICAS_FMP = {
+    "per": "peRatioTTM",
+    "dividendos_yield": "dividendYieldTTM",
+    "dividendo_porcentaje": "dividendYieldTTM",
+    "dividendo_absoluto": "lastDiv",
     "beta": "beta",
     "crecimiento_ingresos": "revenueGrowth",
-    "precio_ventas": "priceToSalesTrailing12Months",
-    "precio_valor_contable": "priceToBook",
-    "per_futuro": "forwardPE",
-    "roe": "returnOnEquity",
-    "margen_beneficio": "profitMargins",
-    "deuda_capital": "debtToEquity",
-    "deuda_equity": "debtToEquity",
-    "precio_book": "priceToBook",
+    "precio_ventas": "priceToSalesRatioTTM",
+    "precio_valor_contable": "pbRatioTTM",
+    "per_futuro": "peRatioTTM",
+    "roe": "roeTTM",
+    "margen_beneficio": "netProfitMarginTTM",
+    "deuda_capital": "debtToEquityTTM",
+    "deuda_equity": "debtToEquityTTM",
+    "precio_book": "pbRatioTTM",
 }
 
 METRICAS_PORCENTUALES = {
@@ -257,13 +217,13 @@ async def extractor_intenciones(prompt_del_inversor: str) -> dict | None:
     TABLA DE TRADUCCIÓN (acciones y equivalentes):
     | Expresión del usuario                        | Traducción                                                               |
     |----------------------------------------------|--------------------------------------------------------------------------|
-    | "PER bajo"                                   | {"metrica": "per", "operador": "<", "valor": 15.0}                    |
+    | "PER bajo"                                   | {"metrica": "per", "operador": "<", "valor": 45.0}                    |
     | "dividendo alto" / "generoso"                | {"metrica": "dividendo_porcentaje", "operador": ">", "valor": 4.0}      |
     | "dividendo estable"                          | {"metrica": "dividendo_porcentaje", "operador": ">", "valor": 2.0}      |
     | "dividendo > X%" (ej: >5%, >8%, >10%)        | {"metrica": "dividendo_porcentaje", "operador": ">", "valor": X.0}     |
     | "tasa de dividendos superior al X%"          | {"metrica": "dividendo_porcentaje", "operador": ">", "valor": X.0}     |
     | "rentabilidad por dividendo > X%"            | {"metrica": "dividendo_porcentaje", "operador": ">", "valor": X.0}     |
-    | "alta rentabilidad"                          | {"metrica": "roe", "operador": ">", "valor": 15.0}                    |
+    | "alta rentabilidad"                          | {"metrica": "roe", "operador": ">", "valor": 45.0}                    |
     | "deuda baja"                                 | {"metrica": "deuda_capital", "operador": "<", "valor": 50.0}          |
     | "empresa estable" / "estábil" / "estabilidad"| {"metrica": "beta", "operador": "<", "valor": 0.8}                    |
     | "crecimiento agresivo"                       | {"metrica": "crecimiento_ingresos", "operador": ">", "valor": 20.0}    |
@@ -460,51 +420,64 @@ Ejemplo de Flash Note para BONO:
 
 
 # --- 2. HERRAMIENTAS MATEMÁTICAS LOCALES ---
-
-def fabricante_de_graficos(ticker: str, periodo: str = "3mo") -> tuple[bytes | None, float | None]:
-    """Genera gráfico WebP en RAM. Thread-safe y con caché de 15 minutos."""
-    cache_key = f"{ticker}_{periodo}"
+async def fabricante_de_graficos(ticker: str, periodo: str = "3mo") -> tuple[bytes | None, float]:
+    """Genera un gráfico usando FMP y QuickChart.io de forma asíncrona y ligera."""
+    if not FMP_API_KEY: 
+        return None, 0.0
     
-    with _GRAFICOS_LOCK:
-        if cache_key in _GRAFICOS_CACHE:
-            return _GRAFICOS_CACHE[cache_key]
-
+    # 1. Obtener datos históricos de FMP (60 días laborables = ~3 meses)
+    url_hist = f"https://financialmodelingprep.com/api/v3/historical-price-full/{ticker}?timeseries=60&apikey={FMP_API_KEY}"
+    
     try:
-        historico = yf.Ticker(ticker).history(period=periodo)
-        if historico.empty:
-            return None, None
-
-        precio_ini = historico['Close'].iloc[0]
-        precio_fin = historico['Close'].iloc[-1]
-        rendimiento = ((precio_fin - precio_ini) / precio_ini) * 100
-
-        color = '#2ca02c' if rendimiento >= 0 else '#d62728'
-        fig = Figure(figsize=(10, 5))
-        canvas = FigureCanvas(fig)
-        ax = fig.add_subplot(111)
-        ax.plot(historico.index, historico['Close'], color=color, linewidth=2.5)
-        ax.fill_between(historico.index, historico['Close'], historico['Close'].min(), color=color, alpha=0.1)
-        ax.set_title(f"Evolución de Alpha: {ticker.upper()} ({periodo})", fontsize=14, fontweight='bold', color='#333333')
-        ax.set_ylabel('Precio por Acción', fontsize=12)
-        ax.grid(True, linestyle='--', alpha=0.5)
-
-        buf = io.BytesIO()
-        try:
-            fig.savefig(buf, format='webp', bbox_inches='tight', dpi=80)
-            buf.seek(0)
-            resultado = (buf.getvalue(), rendimiento)
-            
-            with _GRAFICOS_LOCK:
-                _GRAFICOS_CACHE[cache_key] = resultado
-                
-            return resultado
-        finally:
-            fig.clf()
-            buf.close()
+        global http_client
+        resp = await http_client.get(url_hist)
+        if resp.status_code != 200: return None, 0.0
+        
+        data = resp.json()
+        if "historical" not in data or not data["historical"]: return None, 0.0
+        
+        hist = data["historical"][::-1] # Invertir para orden cronológico
+        labels = [d["date"] for d in hist]
+        prices = [d["close"] for d in hist]
+        
+        if len(prices) < 2: return None, 0.0
+        
+        rendimiento = ((prices[-1] - prices[0]) / prices[0]) * 100
+        color = "rgb(44, 160, 44)" if rendimiento >= 0 else "rgb(214, 39, 40)"
+        
+        # 2. Construir payload para QuickChart
+        qc_payload = {
+            "chart": {
+                "type": "line",
+                "data": {
+                    "labels": labels,
+                    "datasets": [{
+                        "label": f"Precio {ticker}",
+                        "data": prices,
+                        "borderColor": color,
+                        "backgroundColor": "rgba(0,0,0,0)",
+                        "borderWidth": 2,
+                        "pointRadius": 0
+                    }]
+                },
+                "options": {
+                    "legend": {"display": False},
+                    "title": {"display": True, "text": f"Evolución {ticker} ({periodo})"}
+                }
+            },
+            "width": 600,
+            "height": 300,
+            "format": "webp"
+        }
+        
+        # 3. Solicitar imagen a QuickChart
+        resp_qc = await http_client.post("https://quickchart.io/chart", json=qc_payload)
+        if resp_qc.status_code == 200:
+            return resp_qc.content, rendimiento
+        return None, rendimiento
     except Exception as e:
-        logger.error(f"Fallo trazando gráfico de {ticker}: {e}")
-        return None, None
-
+        logger.error(f"[CHART] Error generando gráfico para {ticker}: {e}")
+        return None, 0.0
 
 def es_url_valida(texto: str) -> bool:
     regex = re.compile(
@@ -551,7 +524,7 @@ def _construir_filtros(perfil: str, filtros_dinamicos: list) -> dict:
 
     # Umbrales base actualizados a la realidad del mercado actual
     if perfil == "Seguro":
-        base_per, base_div_pct, base_div_abs = 25.0, 0.015, 0.0  # PER 25 es lo normal hoy para Blue Chips
+        base_per, base_div_pct, base_div_abs = 45.0, 0.015, 0.0  # PER 25 es lo normal hoy para Blue Chips
     elif perfil == "Riesgo":
         base_per, base_div_pct, base_div_abs = 999.0, 0.0, 0.0   # Crecimiento puro, ignoramos el PER
     else:  # Balanceado
@@ -627,217 +600,161 @@ def _construir_filtros(perfil: str, filtros_dinamicos: list) -> dict:
     return filtros
 
 
-# --- CACHÉ YFINANCE Y POOLING (THREAD-SAFE) ---
-_YF_INFO_CACHE = TTLCache(maxsize=1000, ttl=3600)
-_CACHE_LOCK = threading.Lock()
-_thread_local = threading.local()
+# --- CACHÉ YFINANCE Y POOLING (FMP ASYNC) ---
+# EL PORTERO DE DISCOTECA: Evita que FMP te banee por exceso de peticiones concurrentes
+_FMP_SEMA = asyncio.Semaphore(5) 
 
-# --- CACHÉ DE GRÁFICOS ---
-_GRAFICOS_CACHE = TTLCache(maxsize=200, ttl=900)  # 15 minutos
-_GRAFICOS_LOCK = threading.Lock()
+async def _obtener_info_fmp(ticker: str, clase: str = "ACCION") -> dict:
+    cached = await db.obtener_fmp_cache(ticker)
+    if cached is not None:
+        return cached
 
-# Limiter Global para Yahoo Finance (10 req/s)
-_YF_LIMITER = TokenBucket(tps=10)
-
-
-def _get_yf_session() -> requests.Session:
-    """Instancia y retiene una sesión de requests de forma única por hilo (Pooling + Thread-Safety)."""
-    if not hasattr(_thread_local, "session"):
-        session = requests.Session()
-        session.request = functools.partial(session.request, timeout=10)
-        _thread_local.session = session
-    return _thread_local.session
-
-def _obtener_info_yf(ticker: str) -> dict:
-    """Obtiene .info con caché automático TTLCache y session timeout."""
-    with _CACHE_LOCK:
-        if ticker in _YF_INFO_CACHE:
-            return _YF_INFO_CACHE[ticker]
-    
-    # Usar sesión compartida por el hilo (Connection Pooling)
-    session = _get_yf_session()
-    
-    try:
-        info = yf.Ticker(ticker, session=session).info
-        if info:
-            with _CACHE_LOCK:
-                _YF_INFO_CACHE[ticker] = info
-        return info
-    except Exception:
+    if not FMP_API_KEY:
+        logger.error(f"Falta FMP_API_KEY para {ticker}")
         return {}
 
+    url_profile = f"https://financialmodelingprep.com/api/v3/profile/{ticker}?apikey={FMP_API_KEY}"
+    url_metrics = f"https://financialmodelingprep.com/api/v3/key-metrics-ttm/{ticker}?apikey={FMP_API_KEY}"
+    
+    data = {}
+    
+    global http_client
+    # Aquí aplicamos el cerrojo. Solo 5 tickers a la vez pueden entrar a este bloque.
+    async with _FMP_SEMA:
+        for intento in range(3):
+            try:
+                resp_prof, resp_metr = await asyncio.gather(
+                    http_client.get(url_profile),
+                    http_client.get(url_metrics),
+                    return_exceptions=True
+                )
+                
+                if isinstance(resp_prof, httpx.Response) and resp_prof.status_code == 200:
+                    rp = resp_prof.json()
+                    if rp and len(rp) > 0:
+                        data.update(rp[0])
+                elif isinstance(resp_prof, httpx.Response) and resp_prof.status_code == 429:
+                    await asyncio.sleep(1 + intento)
+                    continue
+                
+                if isinstance(resp_metr, httpx.Response) and resp_metr.status_code == 200:
+                    rm = resp_metr.json()
+                    if rm and len(rm) > 0:
+                        data.update(rm[0])
+                elif isinstance(resp_metr, httpx.Response) and resp_metr.status_code == 429:
+                    await asyncio.sleep(1 + intento)
+                    continue
+                    
+                break
+            except Exception as e:
+                logger.warning(f"[FMP] Error conectando para {ticker}: {e}")
+                await asyncio.sleep(1 + intento)
 
-def _chequear_fundamentales_accion(ticker: str, filtros: dict) -> dict | None:
-    """Verifica si una ACCION pasa los filtros fundamentales."""
+    if data:
+        await db.guardar_fmp_cache(ticker, data, clase)
+
+    return data
+
+
+async def _chequear_fundamentales_accion(ticker: str, filtros: dict) -> dict | None:
     try:
-        info = _obtener_info_yf(ticker)
-        # EL FIX: Añadimos fallbacks (alternativas) por si Yahoo cambia el nombre del campo
-        per = info.get('trailingPE') or info.get('forwardPE') or 999
-        div_yield = info.get('dividendYield')
-        div_rate = info.get('dividendRate') or info.get('trailingAnnualDividendRate') or 0
+        info = await _obtener_info_fmp(ticker, "ACCION")
+        if not info: return None
+        per = info.get('peRatioTTM') or 999
+        div_yield_dec = info.get('dividendYieldTTM', 0)
+        div_yield = div_yield_dec if div_yield_dec is not None else 0
+        div_rate = info.get('lastDiv', 0) or 0
         
-        if div_yield is None or div_yield > 1:
-            prev_close = info.get('previousClose')
-            if prev_close and prev_close > 0:
-                div_yield = div_rate / prev_close
-            else:
-                div_yield = 0
-            
-        if not filtros["per_op"](per, filtros["max_per"]):
-            return None
-        if not filtros["div_op"](div_yield, filtros["min_div_pct"]):
-            return None
-        if not filtros["div_abs_op"](div_rate, filtros["min_div_abs"]):
-            return None
+        if not filtros["per_op"](per, filtros["max_per"]): return None
+        if not filtros["div_op"](div_yield, filtros["min_div_pct"]): return None
+        if not filtros["div_abs_op"](div_rate, filtros["min_div_abs"]): return None
         for fex in filtros["filtros_extra"]:
-            yfin_val = info.get(fex["key"])
-            if yfin_val is None or not fex["op"](float(yfin_val), fex["val"]):
-                return None
-        div_pct = round(div_yield * 100, 2) if div_yield < 1 else round(div_yield, 2)
+            fmp_val = info.get(fex["key"])
+            if fmp_val is None or not fex["op"](float(fmp_val), fex["val"]): return None
+            
+        div_pct = round(div_yield * 100, 2)
         return {
             "ticker": ticker,
             "per": round(per, 2) if per != 999 else "N/A",
             "div_yield_pct": div_pct,
             "div_rate_abs": round(div_rate, 2),
         }
-    except Exception:
-        return None
+    except Exception: return None
 
-
-def _chequear_fundamentales_reit(ticker: str, filtros_extra: list) -> dict | None:
-    """Verifica si un REIT pasa los filtros. Usa FFO (proxy: operatingCashflow/shares) y Dividend Yield."""
+async def _chequear_fundamentales_reit(ticker: str, filtros_extra: list) -> dict | None:
     try:
-        info = _obtener_info_yf(ticker)
-        div_yield = info.get('dividendYield')
-        div_rate = info.get('dividendRate') or info.get('trailingAnnualDividendRate') or 0
+        info = await _obtener_info_fmp(ticker, "REIT")
+        if not info: return None
+        div_yield_dec = info.get('dividendYieldTTM', 0)
+        div_yield = div_yield_dec if div_yield_dec is not None else 0
+        p_ffo_proxy = info.get('pbRatioTTM', 999) or 999
         
-        if div_yield is None or div_yield > 1:
-            prev_close = info.get('previousClose')
-            if prev_close and prev_close > 0:
-                div_yield = div_rate / prev_close
-            else:
-                div_yield = 0
-            
-        # Yahoo no ofrece FFO directo. Proxy prioritario: operatingCashflow
-        ocf = info.get('operatingCashflow')
-        market_cap = info.get('marketCap')
-        
-        p_ffo_proxy = 999.0
-        if ocf and market_cap and ocf > 0:
-            p_ffo_proxy = market_cap / ocf
-        else:
-            p_ffo_proxy = info.get('priceToBook', 999) or 999
-
         for f in filtros_extra:
-            if f["metrica"] == "dividend_yield":
-                # Convertimos div_yield a porcentaje para compararlo con el valor que introdujo el usuario
-                if not OPS.get(f["operador"], operator.ge)(div_yield * 100, f["valor"]):
-                    return None
-            elif f["metrica"] == "p_ffo":
-                if not OPS.get(f["operador"], operator.lt)(p_ffo_proxy, f["valor"]):
-                    return None
-        # Requisito mínimo: que pague algún dividendo
-        if div_yield <= 0:
-            return None
-        div_pct = round(div_yield * 100, 2) if div_yield < 1 else round(div_yield, 2)
+            if f["metrica"] == "dividend_yield" and not OPS.get(f["operador"], operator.ge)(div_yield * 100, f["valor"]): return None
+            elif f["metrica"] == "p_ffo" and not OPS.get(f["operador"], operator.lt)(p_ffo_proxy, f["valor"]): return None
+        
+        if div_yield <= 0: return None
         return {
             "ticker": ticker,
-            "div_yield_pct": div_pct,
+            "div_yield_pct": round(div_yield * 100, 2),
             "p_ffo_proxy": round(p_ffo_proxy, 2) if p_ffo_proxy != 999 else "N/A",
             "sector": info.get("sector", "Real Estate"),
         }
-    except Exception:
-        return None
+    except Exception: return None
 
-
-def _chequear_fundamentales_etf(ticker: str, filtros_extra: list) -> dict | None:
-    """Verifica si un ETF pasa los filtros. Usa TER y AUM."""
+async def _chequear_fundamentales_etf(ticker: str, filtros_extra: list) -> dict | None:
     try:
-        info = _obtener_info_yf(ticker)
-        # TER: annualReportExpenseRatio o totalAssets para AUM
-        ter = info.get('annualReportExpenseRatio') or info.get('expenseRatio') or None
-        aum = info.get('totalAssets') or 0
-        div_yield = info.get('dividendYield')
-        div_rate = info.get('dividendRate') or info.get('trailingAnnualDividendRate') or 0
+        info = await _obtener_info_fmp(ticker, "ETF")
+        if not info: return None
+        aum = info.get('mktCap', 0) or 0
+        div_yield_dec = info.get('dividendYieldTTM', 0)
+        div_yield = div_yield_dec if div_yield_dec is not None else 0
         
-        if div_yield is None or div_yield > 1:
-            prev_close = info.get('previousClose')
-            if prev_close and prev_close > 0:
-                div_yield = div_rate / prev_close
-            else:
-                div_yield = 0
-            
         for f in filtros_extra:
-            if f["metrica"] == "ter" and ter is not None:
-                if not OPS.get(f["operador"], operator.lt)(ter, f["valor"]):
-                    return None
-            elif f["metrica"] == "aum":
-                if not OPS.get(f["operador"], operator.ge)(aum, f["valor"]):
-                    return None
-        # Requisito mínimo: que tenga activos bajo gestión > 0
-        if aum <= 0:
-            return None
+            if f["metrica"] == "aum" and not OPS.get(f["operador"], operator.ge)(aum, f["valor"]): return None
+            # Nota: TER ya no está tan claro en el profile gratuito de FMP.
+        
+        if aum <= 0: return None
         return {
             "ticker": ticker,
-            "ter_pct": round(ter * 100, 3) if ter else "N/A",
+            "ter_pct": "N/A",
             "aum_bn": round(aum / 1e9, 2),
-            "div_yield_pct": round(div_yield * 100, 2) if div_yield < 1 else round(div_yield, 2),
+            "div_yield_pct": round(div_yield * 100, 2),
         }
-    except Exception:
-        return None
+    except Exception: return None
 
-
-def _chequear_fundamentales_cripto(ticker: str, filtros_extra: list) -> dict | None:
-    """Verifica si una cripto pasa los filtros. Usa marketCap y rendimiento."""
+async def _chequear_fundamentales_cripto(ticker: str, filtros_extra: list) -> dict | None:
     try:
-        info = _obtener_info_yf(ticker)
-        market_cap = info.get('marketCap') or 0
+        info = await _obtener_info_fmp(ticker, "CRIPTO")
+        if not info: return None
+        market_cap = info.get('mktCap', 0) or 0
         for f in filtros_extra:
-            if f["metrica"] == "market_cap":
-                if not OPS.get(f["operador"], operator.ge)(market_cap, f["valor"]):
-                    return None
-        if market_cap <= 0:
-            return None
+            if f["metrica"] == "market_cap" and not OPS.get(f["operador"], operator.ge)(market_cap, f["valor"]): return None
+        if market_cap <= 0: return None
         return {
             "ticker": ticker,
             "market_cap_bn": round(market_cap / 1e9, 2),
-            "nombre": info.get("shortName", ticker),
+            "nombre": info.get("companyName", ticker),
         }
-    except Exception:
-        return None
+    except Exception: return None
 
-
-def _chequear_fundamentales_bono(ticker: str, filtros_extra: list) -> dict | None:
-    """Verifica si un ETF de bonos pasa los filtros. Usa dividendYield como proxy del cupón/YTM."""
+async def _chequear_fundamentales_bono(ticker: str, filtros_extra: list) -> dict | None:
     try:
-        info = _obtener_info_yf(ticker)
-        div_yield = info.get('dividendYield')
-        div_rate = info.get('dividendRate') or info.get('trailingAnnualDividendRate') or 0
-        
-        if div_yield is None or div_yield > 1:
-            prev_close = info.get('previousClose')
-            if prev_close and prev_close > 0:
-                div_yield = div_rate / prev_close
-            else:
-                div_yield = 0
-                
-        aum = info.get('totalAssets') or 0
-            
+        info = await _obtener_info_fmp(ticker, "BONO")
+        if not info: return None
+        div_yield_dec = info.get('dividendYieldTTM', 0)
+        div_yield = div_yield_dec if div_yield_dec is not None else 0
+        aum = info.get('mktCap', 0) or 0
         for f in filtros_extra:
-            if f["metrica"] == "dividend_yield":
-                if not OPS.get(f["operador"], operator.ge)(div_yield * 100, f["valor"]):
-                    return None
-        if div_yield <= 0 or aum <= 0:
-            return None
+            if f["metrica"] == "dividend_yield" and not OPS.get(f["operador"], operator.ge)(div_yield * 100, f["valor"]): return None
+        if div_yield <= 0 or aum <= 0: return None
         return {
             "ticker": ticker,
-            "ytm_proxy_pct": round(div_yield * 100, 2) if div_yield < 1 else round(div_yield, 2),
+            "ytm_proxy_pct": round(div_yield * 100, 2),
             "aum_bn": round(aum / 1e9, 2),
-            "nombre": info.get("shortName", ticker),
+            "nombre": info.get("companyName", ticker),
         }
-    except Exception:
-        return None
-
+    except Exception: return None
 
 _PIPELINE_SEMA = None
 
@@ -847,16 +764,10 @@ def _get_pipeline_semaphore():
         _PIPELINE_SEMA = asyncio.Semaphore(2)
     return _PIPELINE_SEMA
 
-
 async def pipeline_hibrido(solicitud: str, msg_espera=None, fuente_datos: str = "yahoo"):
     sem = _get_pipeline_semaphore()
     async with sem:
         return await _pipeline_hibrido_interno(solicitud, msg_espera, fuente_datos)
-
-async def _chequeo_asincrono(indice: int, func, ticker: str, args):
-    """Wrapper asíncrono para rate-limiting usando TokenBucket antes de delegar al ThreadPool."""
-    await _YF_LIMITER.wait()
-    return await asyncio.to_thread(func, ticker, args)
 
 async def _pipeline_hibrido_interno(
     solicitud: str,
@@ -949,78 +860,75 @@ async def _pipeline_hibrido_interno(
     # Inicializar filtros con valores por defecto; se sobreescribirán si clase_activo == "ACCION"
     filtros: dict = {"temporalidad": "3mo", "rendimiento_objetivo": 0.0, "rendimiento_op": operator.ge}
 
-    # El semáforo global ahora envuelve la función entera
-    if True:
-        if clase_activo == "ACCION":
-            filtros = _construir_filtros(perfil, filtros_dinamicos_raw)
-            # Paso proporcional: 15% del umbral pedido por intento (mínimo 0.5%pp)
-            # Esto garantiza que umbrales altos (>10%) también se relajen de forma útil
-            _paso_div_pct = max(0.005, filtros["min_div_pct"] * 0.15)
-            max_intentos = 3
-            for intento in range(max_intentos):
-                if intento > 0:
-                    if filtros["max_per"] < 99999:
-                        filtros["max_per"] *= 1.2
-                    filtros["min_div_pct"] = max(0, filtros["min_div_pct"] - _paso_div_pct)
-                    filtros["min_div_abs"] = max(0, filtros["min_div_abs"] - 0.1)
-                    if msg_espera:
-                        try:
-                            await msg_espera.edit_text(
-                                f"🔄 Reintentando con filtros relajados (intento {intento+1}/{max_intentos})..."
-                            )
-                        except BadRequest: pass
-                    await asyncio.sleep(0.5)
-                filtros_snap = {
-                    "max_per": filtros["max_per"], "min_div_pct": filtros["min_div_pct"],
-                    "min_div_abs": filtros["min_div_abs"], "per_op": filtros["per_op"],
-                    "div_op": filtros["div_op"], "div_abs_op": filtros["div_abs_op"],
-                    "filtros_extra": list(filtros["filtros_extra"]),
-                }
-                # Delegación asíncrona con sleep previo para rate-limit, sin ahogar los workers
-                tareas = [_chequeo_asincrono(i, _chequear_fundamentales_accion, t, filtros_snap) for i, t in enumerate(tickers)]
-                try:
-                    resultados = await asyncio.wait_for(asyncio.gather(*tareas), timeout=15.0)
-                    pre_ganadores = [r for r in resultados if r is not None]
-                except asyncio.TimeoutError:
-                    logger.warning(f"[PIPELINE] Timeout YF en iter ACCION intento {intento}")
-                    pre_ganadores = []
-                if pre_ganadores:
-                    break
-
-        elif clase_activo == "REIT":
-            tareas = [_chequeo_asincrono(i, _chequear_fundamentales_reit, t, filtros_dinamicos_raw) for i, t in enumerate(tickers)]
+    # Dispatch por clase de activo
+    if clase_activo == "ACCION":
+        filtros = _construir_filtros(perfil, filtros_dinamicos_raw)
+        # Paso proporcional: 15% del umbral pedido por intento (mínimo 0.5%pp)
+        _paso_div_pct = max(0.005, filtros["min_div_pct"] * 0.15)
+        max_intentos = 3
+        for intento in range(max_intentos):
+            if intento > 0:
+                if filtros["max_per"] < 99999:
+                    filtros["max_per"] *= 1.2
+                filtros["min_div_pct"] = max(0, filtros["min_div_pct"] - _paso_div_pct)
+                filtros["min_div_abs"] = max(0, filtros["min_div_abs"] - 0.1)
+                if msg_espera:
+                    try:
+                        await msg_espera.edit_text(
+                            f"🔄 Reintentando con filtros relajados (intento {intento+1}/{max_intentos})..."
+                        )
+                    except BadRequest: pass
+                await asyncio.sleep(0.5)
+            filtros_snap = {
+                "max_per": filtros["max_per"], "min_div_pct": filtros["min_div_pct"],
+                "min_div_abs": filtros["min_div_abs"], "per_op": filtros["per_op"],
+                "div_op": filtros["div_op"], "div_abs_op": filtros["div_abs_op"],
+                "filtros_extra": list(filtros["filtros_extra"]),
+            }
+            tareas = [_chequear_fundamentales_accion(t, filtros_snap) for t in tickers]
             try:
-                resultados = await asyncio.wait_for(asyncio.gather(*tareas), timeout=15.0)
+                resultados = await asyncio.wait_for(asyncio.gather(*tareas), timeout=45.0)
                 pre_ganadores = [r for r in resultados if r is not None]
             except asyncio.TimeoutError:
+                logger.warning(f"[PIPELINE] Timeout FMP en iter ACCION intento {intento}")
                 pre_ganadores = []
+            if pre_ganadores:
+                break
 
-        elif clase_activo == "ETF":
-            tareas = [_chequeo_asincrono(i, _chequear_fundamentales_etf, t, filtros_dinamicos_raw) for i, t in enumerate(tickers)]
-            try:
-                resultados = await asyncio.wait_for(asyncio.gather(*tareas), timeout=15.0)
-                pre_ganadores = [r for r in resultados if r is not None]
-            except asyncio.TimeoutError:
-                pre_ganadores = []
+    elif clase_activo == "REIT":
+        tareas = [_chequear_fundamentales_reit(t, filtros_dinamicos_raw) for t in tickers]
+        try:
+            resultados = await asyncio.wait_for(asyncio.gather(*tareas), timeout=45.0)
+            pre_ganadores = [r for r in resultados if r is not None]
+        except asyncio.TimeoutError:
+            pre_ganadores = []
 
-        elif clase_activo == "CRIPTO":
-            tareas = [_chequeo_asincrono(i, _chequear_fundamentales_cripto, t, filtros_dinamicos_raw) for i, t in enumerate(tickers)]
-            try:
-                resultados = await asyncio.wait_for(asyncio.gather(*tareas), timeout=15.0)
-                pre_ganadores = [r for r in resultados if r is not None]
-            except asyncio.TimeoutError:
-                pre_ganadores = []
+    elif clase_activo == "ETF":
+        tareas = [_chequear_fundamentales_etf(t, filtros_dinamicos_raw) for t in tickers]
+        try:
+            resultados = await asyncio.wait_for(asyncio.gather(*tareas), timeout=45.0)
+            pre_ganadores = [r for r in resultados if r is not None]
+        except asyncio.TimeoutError:
+            pre_ganadores = []
 
-        elif clase_activo == "BONO":
-            tareas = [_chequeo_asincrono(i, _chequear_fundamentales_bono, t, filtros_dinamicos_raw) for i, t in enumerate(tickers)]
-            try:
-                resultados = await asyncio.wait_for(asyncio.gather(*tareas), timeout=15.0)
-                pre_ganadores = [r for r in resultados if r is not None]
-            except asyncio.TimeoutError:
-                pre_ganadores = []
+    elif clase_activo == "CRIPTO":
+        tareas = [_chequear_fundamentales_cripto(t, filtros_dinamicos_raw) for t in tickers]
+        try:
+            resultados = await asyncio.wait_for(asyncio.gather(*tareas), timeout=45.0)
+            pre_ganadores = [r for r in resultados if r is not None]
+        except asyncio.TimeoutError:
+            pre_ganadores = []
 
-        else:
-            return f"❌ Clase de activo no reconocida: {clase_activo}.", None, None, None
+    elif clase_activo == "BONO":
+        tareas = [_chequear_fundamentales_bono(t, filtros_dinamicos_raw) for t in tickers]
+        try:
+            resultados = await asyncio.wait_for(asyncio.gather(*tareas), timeout=45.0)
+            pre_ganadores = [r for r in resultados if r is not None]
+        except asyncio.TimeoutError:
+            pre_ganadores = []
+
+    else:
+        return f"❌ Clase de activo no reconocida: {clase_activo}.", None, None, None
 
     if not pre_ganadores:
         return (
@@ -1055,7 +963,7 @@ async def _pipeline_hibrido_interno(
 
     for gan in pre_ganadores:
         t = gan["ticker"]
-        buf_graf, rend = await asyncio.to_thread(fabricante_de_graficos, t, temporalidad)
+        buf_graf, rend = await fabricante_de_graficos(t, temporalidad)
         if rend is not None and rendimiento_op(rend, rendimiento_objetivo):
             mejor_opcion = gan
             mejor_opcion["rendimiento_real"] = round(rend, 2)
@@ -1146,9 +1054,9 @@ async def _pipeline_por_tabla(
             "temporalidad": "3mo", "ignorar_per_estricto": per_max >= 9999,
             "filtros_extra": [{"key": "beta", "op": operator.le, "val": beta_max}] if beta_max < 99 else [],
         }
-        tareas = [_chequeo_asincrono(i, _chequear_fundamentales_accion, t, filtros_a) for i, t in enumerate(tickers)]
+        tareas = [_chequear_fundamentales_accion(t, filtros_a) for t in tickers]
         try:
-            resultados = await asyncio.wait_for(asyncio.gather(*tareas), timeout=25.0)
+            resultados = await asyncio.wait_for(asyncio.gather(*tareas), timeout=45.0)
             ganadores = [r for r in resultados if r is not None]
         except asyncio.TimeoutError:
             ganadores = []
@@ -1158,9 +1066,9 @@ async def _pipeline_por_tabla(
         p_ffo_max = float(filtros_tabla.get("p_ffo_max", 999))
         fe = [{"metrica": "dividend_yield", "operador": ">=", "valor": div_min},
               {"metrica": "p_ffo",           "operador": "<=", "valor": p_ffo_max}]
-        tareas = [_chequeo_asincrono(i, _chequear_fundamentales_reit, t, fe) for i, t in enumerate(tickers)]
+        tareas = [_chequear_fundamentales_reit(t, fe) for t in tickers]
         try:
-            resultados = await asyncio.wait_for(asyncio.gather(*tareas), timeout=25.0)
+            resultados = await asyncio.wait_for(asyncio.gather(*tareas), timeout=45.0)
             ganadores = [r for r in resultados if r is not None]
         except asyncio.TimeoutError:
             ganadores = []
@@ -1170,9 +1078,9 @@ async def _pipeline_por_tabla(
         aum_min = float(filtros_tabla.get("aum_min_bn", 0)) * 1e9
         fe = [{"metrica": "ter", "operador": "<=", "valor": ter_max},
               {"metrica": "aum", "operador": ">=", "valor": aum_min}]
-        tareas = [_chequeo_asincrono(i, _chequear_fundamentales_etf, t, fe) for i, t in enumerate(tickers)]
+        tareas = [_chequear_fundamentales_etf(t, fe) for t in tickers]
         try:
-            resultados = await asyncio.wait_for(asyncio.gather(*tareas), timeout=25.0)
+            resultados = await asyncio.wait_for(asyncio.gather(*tareas), timeout=45.0)
             ganadores = [r for r in resultados if r is not None]
         except asyncio.TimeoutError:
             ganadores = []
@@ -1180,9 +1088,9 @@ async def _pipeline_por_tabla(
     elif clase_activo == "CRIPTO":
         mcap_min = float(filtros_tabla.get("market_cap_min_bn", 0)) * 1e9
         fe = [{"metrica": "market_cap", "operador": ">=", "valor": mcap_min}]
-        tareas = [_chequeo_asincrono(i, _chequear_fundamentales_cripto, t, fe) for i, t in enumerate(tickers)]
+        tareas = [_chequear_fundamentales_cripto(t, fe) for t in tickers]
         try:
-            resultados = await asyncio.wait_for(asyncio.gather(*tareas), timeout=25.0)
+            resultados = await asyncio.wait_for(asyncio.gather(*tareas), timeout=45.0)
             ganadores = [r for r in resultados if r is not None]
         except asyncio.TimeoutError:
             ganadores = []
@@ -1190,9 +1098,9 @@ async def _pipeline_por_tabla(
     elif clase_activo == "BONO":
         ytm_min = float(filtros_tabla.get("ytm_min", 0))
         fe = [{"metrica": "dividend_yield", "operador": ">=", "valor": ytm_min}]
-        tareas = [_chequeo_asincrono(i, _chequear_fundamentales_bono, t, fe) for i, t in enumerate(tickers)]
+        tareas = [_chequear_fundamentales_bono(t, fe) for t in tickers]
         try:
-            resultados = await asyncio.wait_for(asyncio.gather(*tareas), timeout=25.0)
+            resultados = await asyncio.wait_for(asyncio.gather(*tareas), timeout=45.0)
             ganadores = [r for r in resultados if r is not None]
         except asyncio.TimeoutError:
             ganadores = []
@@ -1210,7 +1118,7 @@ async def _pipeline_por_tabla(
     grafico_bytes = None
     temporalidad  = "1mo" if clase_activo == "CRIPTO" else "3mo"
     for gan in ganadores:
-        buf_graf, rend = await asyncio.to_thread(fabricante_de_graficos, gan["ticker"], temporalidad)
+        buf_graf, rend = await fabricante_de_graficos(gan["ticker"], temporalidad)
         if rend is not None:
             gan["rendimiento_real"] = round(rend, 2)
             mejor = gan
@@ -1358,7 +1266,7 @@ async def _ejecutar_tabla_wizard(query, context, chat_id: int):
     try:
         if grafico_bytes:
             await query.message.reply_photo(
-                photo=InputFile(grafico_bytes, filename=f"chart_{ticker}.webp"),
+                photo=InputFile(io.BytesIO(grafico_bytes), filename=f"chart_{ticker}.webp"),
                 caption=texto, reply_markup=teclado, parse_mode="HTML"
             )
             try: await query.message.delete()
@@ -1399,7 +1307,7 @@ async def _ejecutar_tabla_desde_message(update, context, chat_id: int):
     try:
         if grafico_bytes:
             await update.message.reply_photo(
-                photo=InputFile(grafico_bytes, filename=f"chart_{ticker}.webp"),
+                photo=InputFile(io.BytesIO(grafico_bytes), filename=f"chart_{ticker}.webp"),
                 caption=texto, reply_markup=teclado, parse_mode="HTML"
             )
             try: await msg.delete()
@@ -1419,6 +1327,14 @@ async def comando_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     # Registrar/actualizar usuario en BD (guarda username si lo tiene)
     await db.upsert_usuario(user.id, username=user.username or user.first_name)
+    # SINGLE SOURCE OF TRUTH: limpiar cualquier estado bloqueante en BD Y en RAM.
+    # Esto previene soft-locks si Render reinicia el servidor mientras el usuario
+    # estaba en medio de un flujo (ESPERANDO_URL, TABLA_WIZARD, etc.).
+    await db.upsert_usuario(user.id, estado=None)
+    context.user_data.pop('estado', None)
+    context.user_data.pop('tabla_wizard', None)
+    context.user_data.pop('manual_clase', None)
+    context.user_data.pop('manual_perfil', None)
     creditos = await db.obtener_creditos(user.id)
     mensaje = (
         f"🤖 <b>Plataforma Ejecutiva Quant</b>, bienvenido/a {user.first_name}.\n\n"
@@ -1967,13 +1883,6 @@ async def conversacion_inversor(update: Update, context: ContextTypes.DEFAULT_TY
         msg_espera = await update.message.reply_text(
             f"⏳ Validando {len(tickers_validos)} ticker(s) en Yahoo Finance sin IA..."
         )
-        # Construir extraccion sintética y llamar pipeline omitiendo Gemini
-        from types import SimpleNamespace
-        extraccion_sint = {
-            'clase_activo': clase_elegida, 'perfil': perfil_elegido,
-            'sector': 'manual', 'tickers_manuales': tickers_validos,
-            'filtros_dinamicos': [], 'error_api': None
-        }
         # Guardar como última búsqueda para alertas
         await db.upsert_usuario(tid, ultima_busqueda=" ".join(tickers_validos))
         fuente = await db.obtener_fuente_datos(tid)
@@ -2202,7 +2111,7 @@ telegram_app.add_handler(CommandHandler("comprar", comando_comprar))
 # dentro del lifespan para compartir ese mismo bucle sin conflictos.
 
 async def self_ping_loop():
-    """Mantiene la instancia despierta haciendo auto-peticiones."""
+    """Mantiene la instancia despierta haciendo auto-peticiones con el cliente global."""
     await asyncio.sleep(10)
     
     url_propia = os.getenv("RENDER_EXTERNAL_URL") 
@@ -2212,20 +2121,27 @@ async def self_ping_loop():
 
     logger.info(f"[SELF-PING] Iniciando bucle contra: {url_propia}")
     
-    async with httpx.AsyncClient() as client:
-        while True:
-            try:
-                response = await client.get(url_propia, timeout=10)
-                logger.debug(f"[SELF-PING] Status: {response.status_code}")
-            except Exception as e:
-                logger.warning(f"[SELF-PING] Error de conexión: {e}")
-            
-            await asyncio.sleep(14 * 60)
+    while True:
+        try:
+            global http_client
+            response = await http_client.get(url_propia, timeout=10)
+            logger.debug(f"[SELF-PING] Status: {response.status_code}")
+        except Exception as e:
+            logger.warning(f"[SELF-PING] Error de conexión: {e}")
+        
+        await asyncio.sleep(14 * 60)
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Gestiona el ciclo de vida del bot de Telegram junto a FastAPI/Uvicorn."""
+    global http_client
+    logger.info("[LIFESPAN] Iniciando Connection Pool Global (httpx)...")
+    http_client = httpx.AsyncClient(
+        timeout=15, 
+        limits=httpx.Limits(max_connections=100, max_keepalive_connections=20)
+    )
+
     # ── STARTUP ──
     logger.info("[LIFESPAN] Conectando con Supabase...")
     await db.inicializar_pool()              # Crea el pool asyncpg
@@ -2245,50 +2161,65 @@ async def lifespan(app: FastAPI):
     ]
     await telegram_app.bot.set_my_commands(comandos, scope=BotCommandScopeDefault())
 
+    # --- INYECCIÓN DEL WEBHOOK SEGURO ---
+    webhook_url = f"{RENDER_EXTERNAL_URL}/webhook/telegram"
+    logger.info(f"[LIFESPAN] Configurando webhook en: {webhook_url}")
+    await telegram_app.bot.set_webhook(url=webhook_url, secret_token=CRON_SECRET)
+
     await telegram_app.start()
-    await telegram_app.updater.start_polling(drop_pending_updates=True)
-    logger.info("[LIFESPAN] Bot de Telegram en polling. Plataforma ONLINE.")
+    logger.info("[LIFESPAN] Bot de Telegram en modo Webhook protegido. Plataforma ONLINE.")
 
     yield  # ← FastAPI sirve peticiones aquí
 
     # ── SHUTDOWN ──
     logger.info("[LIFESPAN] Apagando bot de Telegram...")
-    await telegram_app.updater.stop()
     await telegram_app.stop()
     await telegram_app.shutdown()
     
-    logger.info("[LIFESPAN] Cerrando pool de Base de Datos...")
+    logger.info("[LIFESPAN] Cerrando pool de Base de Datos y HTTP Client...")
     await db.cerrar_pool()
+    await http_client.aclose()
     
     logger.info("[LIFESPAN] Bot detenido correctamente.")
 
-
 web_app = FastAPI(title="BotFinanzas Webhook", lifespan=lifespan)
 
+@web_app.post("/webhook/telegram")
+async def telegram_webhook(request: Request):
+    """Endpoint principal de Telegram Webhook validado criptográficamente."""
+    secret = request.headers.get("X-Telegram-Bot-Api-Secret-Token")
+    if secret != CRON_SECRET:
+        logger.warning("[WEBHOOK] Intento de acceso no autorizado o malicioso.")
+        raise HTTPException(status_code=403, detail="Forbidden")
 
-@web_app.api_route("/", methods=["GET", "HEAD"])
-async def health_check():
-    """Health-check: Render y UptimeRobot usan este endpoint para confirmar que el servicio está vivo."""
-    return {"status": "online", "service": "BotFinanzas"}
-
+    data = await request.json()
+    try:
+        update = Update.de_json(data, telegram_app.bot)
+        # Uso correcto de la cola asíncrona de python-telegram-bot en lugar de threads/bypasses
+        await telegram_app.update_queue.put(update)
+    except Exception as e:
+        logger.error(f"[WEBHOOK] Error procesando update: {e}")
+        
+    return Response(status_code=200)
 
 @web_app.get("/health/gemini")
 async def health_gemini():
-    """Prueba la conectividad con la API de Gemini. Rate-limitado a 1 req/60s para no gastar tokens."""
+    """Prueba la conectividad con la API de Gemini usando rutinas 100% asíncronas."""
     ahora = time.time()
     cached = _HEALTH_GEMINI_CACHE
     if ahora - cached["ts"] < 60 and cached["data"] is not None:
         return {**cached["data"], "cached": True}
-    def _test_gemini():
-        try:
-            res = client.models.generate_content(
-                model='gemini-2.5-flash',
-                contents="Responde solo con la palabra: OK"
-            )
-            return {"status": "ok", "response": res.text.strip()[:50]}
-        except Exception as e:
-            return {"status": "error", "type": type(e).__name__, "detail": str(e)[:300]}
-    result = await asyncio.to_thread(_test_gemini)
+        
+    try:
+        # Reemplazo de asyncio.to_thread por asincronía nativa real (.aio)
+        res = await client.aio.models.generate_content(
+            model='gemini-2.5-flash',
+            contents="Responde solo con la palabra: OK"
+        )
+        result = {"status": "ok", "response": res.text.strip()[:50]}
+    except Exception as e:
+        result = {"status": "error", "type": type(e).__name__, "detail": str(e)[:300]}
+        
     _HEALTH_GEMINI_CACHE["ts"] = ahora
     _HEALTH_GEMINI_CACHE["data"] = result
     return result
@@ -2475,6 +2406,12 @@ async def cron_ejecutar(request: Request, background_tasks: BackgroundTasks):
     secret = request.headers.get("X-Cron-Secret", "")
     if not CRON_SECRET or secret != CRON_SECRET:
         raise HTTPException(status_code=403, detail="Forbidden")
+
+    # ── SWEEPER: Rescate de deadlocks (Enterprise Pattern) ────────────────────
+    # Si el proceso del cron murió en una ejecución anterior, los usuarios con
+    # cron_procesando = TRUE quedan bloqueados para siempre. Esta llamada los
+    # libera automáticamente si llevan más de 60 minutos bloqueados.
+    await db.rescatar_bloqueos_cron_muertos(max_edad_segundos=3600)
 
     ahora = time.time()
     ejecutados = 0

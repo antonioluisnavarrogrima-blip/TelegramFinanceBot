@@ -188,33 +188,33 @@ REGLAS FINALES:
             contents=f"{prompt_sistema}\n\n[INPUT USUARIO]: {prompt_del_inversor}",
             config=types.GenerateContentConfig(
                 response_mime_type="application/json",
-                response_schema=types.Schema(
-                    type=types.Type.OBJECT,
-                    properties={
-                        "clase_activo": types.Schema(type=types.Type.STRING),
-                        "perfil":       types.Schema(type=types.Type.STRING),
-                        "sector":       types.Schema(type=types.Type.STRING),
-                        "tickers_manuales": types.Schema(
-                            type=types.Type.ARRAY,
-                            items=types.Schema(type=types.Type.STRING)
-                        ),
-                        "filtros_dinamicos": types.Schema(
-                            type=types.Type.ARRAY,
-                            items=types.Schema(
-                                type=types.Type.OBJECT,
-                                properties={
-                                    "metrica":  types.Schema(type=types.Type.STRING),
-                                    "operador": types.Schema(type=types.Type.STRING),
-                                    "valor":    types.Schema(type=types.Type.NUMBER),
+                response_schema={
+                    "type": "OBJECT",
+                    "properties": {
+                        "clase_activo": {"type": "STRING"},
+                        "perfil":       {"type": "STRING"},
+                        "sector":       {"type": "STRING"},
+                        "tickers_manuales": {
+                            "type": "ARRAY",
+                            "items": {"type": "STRING"}
+                        },
+                        "filtros_dinamicos": {
+                            "type": "ARRAY",
+                            "items": {
+                                "type": "OBJECT",
+                                "properties": {
+                                    "metrica":  {"type": "STRING"},
+                                    "operador": {"type": "STRING"},
+                                    "valor":    {"type": "NUMBER"}
                                 }
-                            )
-                        ),
-                        "error_api": types.Schema(
-                            type=types.Type.STRING,
-                            description="Dejar vacío si no hay error"
-                        ),
+                            }
+                        },
+                        "error_api": {
+                            "type": "STRING",
+                            "description": "Dejar vac\u00edo si no hay error"
+                        }
                     }
-                )
+                }
             )
         )
 

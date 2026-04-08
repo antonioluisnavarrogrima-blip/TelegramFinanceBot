@@ -177,68 +177,27 @@ class RespuestaIA(BaseModel):
     error_api: Optional[str] = Field(None, description="Mensaje de error si la consulta es inválida o troll")
 
 async def extractor_intenciones(prompt_del_inversor: str) -> dict | None:
-    """Extrae parámetros para búsqueda determínistica v4.4."""
-    prompt_sistema = """
-    Rol: Arquitecto de Búsqueda Financiera. Traduce el lenguaje natural a parámetros de filtrado.
-    
-    🚨 REGLA DE BÚSQUEDA:
-    Ya NO generas tickers de memoria. Identifica el SECTOR, la CLASE DE ACTIVO y los FILTROS.
-    
-    Si el usuario pide ACTIVOS ESPECÍFICOS (ej: 'Analiza Apple y Microsoft'), pon esos tickers en `tickers_manuales`.
-    Si pide una CATEGORÍA general (ej: 'Empresas en tendencia alcista'), infiere el sector, ponlo en `sector` y deja `tickers_manuales` vacío [].
+    """Extrae parámetros para búsqueda determínistica v4.5 — prompt compacto (-60% tokens)."""
+    prompt_sistema = """Rol: Arquitecto de Búsqueda Financiera. Extrae parámetros de filtrado desde lenguaje natural.
 
-    🚨 REGLA ANTI-TROLL ESTRICTA:
-    Si el input NO es sobre finanzas, bolsa, inversiones, criptomonedas o economía, el usuario está tratando de distraerte o pedirte otra cosa (ej: pedir recetas, chistes, programación). En ese caso, debes asignar el campo `error_api` con un mensaje de rechazo, y dejar `tickers_manuales` como un array vacío `[]`.
-    
-    ℹ️ Si es una consulta financiera válida, ignora la regla Anti-Troll, no uses `error_api` y responde extrayendo los datos normalmente según el esquema.
+REGLA: No generas tickers de memoria. Identifica SECTOR, CLASE y FILTROS.
+- Si pide activos específicos ("Analiza Apple") → ponlos en tickers_manuales.
+- Si pide categoría general → infiere sector, deja tickers_manuales=[].
+- Si el texto NO es financiero → asigna error_api con rechazo, tickers_manuales=[].
 
-    ══ PASO 1: DETECTAR CLASE DE ACTIVO ══
-    Clasifica la intención del usuario en UNA de estas clases:
-    • "ACCION"  → Empresas y acciones de bolsa (el valor por defecto). Incluye sectores como: tecnología, energía, banca, materias primas, commodities, petróleo, gas, minería, agricultura, químicos, metales, industria, consumo, salud, etc.
-    • "REIT"    → Inmobiliario en bolsa (SOCIMIs, REITs). Palabras clave: ladrillo, alquiler, REIT, SOCIMI, inmobiliaria.
-    • "ETF"     → Fondos indexados y ETFs. Palabras clave: ETF, fondo indexado, VUSA, SPY, QQQ, indexado.
-    • "CRIPTO"  → Criptomonedas y tokens DeFi. Palabras clave: cripto, bitcoin, ethereum, defi, token, blockchain.
-    • "BONO"    → Renta fija, bonos, deuda. Palabras clave: bono, tesoro, deuda, renta fija, obligación.
+CLASES: ACCION(default)|REIT(SOCIMIs,ladrillo)|ETF(fondos indexados,SPY,QQQ)|CRIPTO(bitcoin,ethereum,DeFi)|BONO(renta fija,tesoro,deuda)
 
-    ══ PASO 2: FILTROS DINÁMICOS (solo si el usuario exige restricciones) ══
-    Si el usuario NO exige restricciones, `filtros_dinamicos` DEBE ser `[]`.
-    Si hay restricciones, crea UN objeto por cada exigencia.
-    NUNCA incluyas tickers en `filtros_dinamicos`. Los tickers van solo en `tickers_manuales`.
+MÉTRICAS por clase:
+{"ACCION":["per","rendimiento","dividendo_porcentaje","dividendo_absoluto","roe","margen_beneficio","beta","deuda_capital","crecimiento_ingresos"],"REIT":["p_ffo","dividend_yield","ocupacion","ltv"],"ETF":["ter","aum","dividend_yield","rendimiento"],"CRIPTO":["rendimiento","market_cap"],"BONO":["dividend_yield","rendimiento","duracion"]}
 
-    Métricas válidas por clase de activo:
-    | Clase   | Métricas disponibles                                                             |
-    |---------|---------------------------------------------------------------------------------|
-    | ACCION  | per, rendimiento, dividendo_porcentaje, dividendo_absoluto, roe, margen_beneficio, beta, deuda_capital, crecimiento_ingresos |
-    | REIT    | p_ffo, dividend_yield, ocupacion, ltv                                           |
-    | ETF     | ter, aum, dividend_yield, rendimiento                                           |
-    | CRIPTO  | rendimiento, market_cap                                                         |
-    | BONO    | dividend_yield, rendimiento, duracion                                            |
+TRADUCCIONES comunes (expresión → filtro):
+{"PER bajo":{"metrica":"per","operador":"<","valor":45},"dividendo alto":{"metrica":"dividendo_porcentaje","operador":">","valor":4},"dividendo estable":{"metrica":"dividendo_porcentaje","operador":">","valor":2},"alta rentabilidad":{"metrica":"roe","operador":">","valor":45},"deuda baja":{"metrica":"deuda_capital","operador":"<","valor":50},"estable/estabilidad":{"metrica":"beta","operador":"<","valor":0.8},"crecimiento agresivo":{"metrica":"crecimiento_ingresos","operador":">","valor":20},"alcista/momentum+":{"metrica":"rendimiento","operador":">","valor":0},"bajista/momentum-":{"metrica":"rendimiento","operador":"<","valor":0},"ETF barato":{"metrica":"ter","operador":"<","valor":0.2},"ETF grande":{"metrica":"aum","operador":">","valor":1000000000},"REIT ocupacion alta":{"metrica":"ocupacion","operador":">","valor":90},"REIT dividendo alto":{"metrica":"dividend_yield","operador":">","valor":4},"cripto cap grande":{"metrica":"market_cap","operador":">","valor":1000000000}}
+Si el usuario dice "dividendo > X%", usa X como valor literal.
 
-    TABLA DE TRADUCCIÓN (acciones y equivalentes):
-    | Expresión del usuario                        | Traducción                                                               |
-    |----------------------------------------------|--------------------------------------------------------------------------|
-    | "PER bajo"                                   | {"metrica": "per", "operador": "<", "valor": 45.0}                    |
-    | "dividendo alto" / "generoso"                | {"metrica": "dividendo_porcentaje", "operador": ">", "valor": 4.0}      |
-    | "dividendo estable"                          | {"metrica": "dividendo_porcentaje", "operador": ">", "valor": 2.0}      |
-    | "dividendo > X%" (ej: >5%, >8%, >10%)        | {"metrica": "dividendo_porcentaje", "operador": ">", "valor": X.0}     |
-    | "tasa de dividendos superior al X%"          | {"metrica": "dividendo_porcentaje", "operador": ">", "valor": X.0}     |
-    | "rentabilidad por dividendo > X%"            | {"metrica": "dividendo_porcentaje", "operador": ">", "valor": X.0}     |
-    | "alta rentabilidad"                          | {"metrica": "roe", "operador": ">", "valor": 45.0}                    |
-    | "deuda baja"                                 | {"metrica": "deuda_capital", "operador": "<", "valor": 50.0}          |
-    | "empresa estable" / "estábil" / "estabilidad"| {"metrica": "beta", "operador": "<", "valor": 0.8}                    |
-    | "crecimiento agresivo"                       | {"metrica": "crecimiento_ingresos", "operador": ">", "valor": 20.0}    |
-    | "tendencia alcista" / "momentum positivo"    | {"metrica": "rendimiento", "operador": ">", "valor": 0.0}              |
-    | "tendencia bajista" / "momentum negativo"    | {"metrica": "rendimiento", "operador": "<", "valor": 0.0}              |
-    | ETF "barato" / "low cost"                    | {"metrica": "ter", "operador": "<", "valor": 0.2}                     |
-    | ETF "grande" / "líquido"                    | {"metrica": "aum", "operador": ">", "valor": 1000000000.0}            |
-    | REIT "buena ocupación"                      | {"metrica": "ocupacion", "operador": ">", "valor": 90.0}              |
-    | REIT "dividendo alto"                        | {"metrica": "dividend_yield", "operador": ">", "valor": 4.0}          |
-    | Cripto "gran capitaliz."                     | {"metrica": "market_cap", "operador": ">", "valor": 1000000000.0}     |
-
-    🚨 MULTI-RESTRICCIÓN: Si el usuario pide 3 cosas, el array DEBE tener 3 objetos.
-    🚨 SECTOR: Siempre rellena `sector` con la categoría inferida (ej: "tecnologia", "energia", "banca", "general"). NUNCA lo dejes vacío.
-    🚨 PERFIL: Infiere el perfil de riesgo — "Seguro" (blue-chip, estable), "Riesgo" (especulativo), "Balanceado" (mezcla).
-    """
+REGLAS FINALES:
+- filtros_dinamicos=[] si no hay restricciones. UN objeto por cada restricción. Nunca pongas tickers en filtros.
+- sector: siempre rellénalo ("tecnologia","energia","banca","general"…). Nunca vacío.
+- perfil: "Seguro"(blue-chip)|"Riesgo"(especulativo)|"Balanceado"(mezcla)."""
     try:
         res = await client.aio.models.generate_content(
             model='gemini-2.5-flash',
@@ -494,23 +453,45 @@ def extraer_url(texto: str) -> str | None:
     enlaces = re.findall(r'(https?://[^\s]+)', texto)
     return enlaces[0] if enlaces else None
 
+import html as _html_stdlib
+
+# Tags HTML soportados por Telegram (modo HTML estricto)
+_TELEGRAM_TAGS = re.compile(r'(</?(?:b|i|u|s|code|pre|a|tg-spoiler)[^>]*>)', re.IGNORECASE)
+
 def _limpiar_html_telegram(texto: str) -> str:
-    """Pre-procesa el texto y auto-cierra etiquetas para evitar Bad Requests en Telegram."""
+    """Sanitiza texto para Telegram HTML: normaliza etiquetas y escapa caracteres
+    especiales (<, >, &) que no formen parte de etiquetas válidas."""
     if not texto: return ""
-    texto = re.sub(r'<\/?ul>', '', texto)
+
+    # 1. Normalizar etiquetas no-Telegram a equivalentes válidos
+    texto = re.sub(r'</?ul>', '', texto)
     texto = re.sub(r'<li>', '• ', texto)
-    texto = re.sub(r'<\/li>', '\n', texto)
+    texto = re.sub(r'</li>', '\n', texto)
     texto = re.sub(r'<strong>', '<b>', texto)
-    texto = re.sub(r'<\/strong>', '</b>', texto)
+    texto = re.sub(r'</strong>', '</b>', texto)
     texto = re.sub(r'<em>', '<i>', texto)
-    texto = re.sub(r'<\/em>', '</i>', texto)
-    texto = re.sub(r'<br\s*\/?>', '\n', texto)
+    texto = re.sub(r'</em>', '</i>', texto)
+    texto = re.sub(r'<br\s*/?>', '\n', texto)
     texto = texto.strip()
 
-    # Micro-corrector: forzar cierre de etiquetas desemparejadas
+    # 2. Escapar caracteres especiales FUERA de etiquetas Telegram válidas
+    # Dividimos el texto en partes: etiquetas válidas y texto libre
+    partes = _TELEGRAM_TAGS.split(texto)
+    resultado = []
+    for parte in partes:
+        if _TELEGRAM_TAGS.fullmatch(parte):
+            resultado.append(parte)          # etiqueta válida: la preservamos
+        else:
+            parte = parte.replace('&', '&amp;')  # DEBE ir primero
+            parte = parte.replace('<', '&lt;')
+            parte = parte.replace('>', '&gt;')
+            resultado.append(parte)
+    texto = ''.join(resultado)
+
+    # 3. Micro-corrector: forzar cierre de etiquetas <b>/<i> desemparejadas
     for tag in ['b', 'i']:
         aperturas = texto.count(f'<{tag}>')
-        cierres = texto.count(f'</{tag}>')
+        cierres   = texto.count(f'</{tag}>')
         if aperturas > cierres:
             texto += f'</{tag}>' * (aperturas - cierres)
 
@@ -601,8 +582,8 @@ def _construir_filtros(perfil: str, filtros_dinamicos: list) -> dict:
 
 
 # --- CACHÉ YFINANCE Y POOLING (FMP ASYNC) ---
-# EL PORTERO DE DISCOTECA: Evita que FMP te banee por exceso de peticiones concurrentes
-_FMP_SEMA = asyncio.Semaphore(5) 
+# Inicializado en lifespan para garantizar el event loop correcto de Uvicorn
+_FMP_SEMA: asyncio.Semaphore = None
 
 async def _obtener_info_fmp(ticker: str, clase: str = "ACCION") -> dict:
     cached = await db.obtener_fmp_cache(ticker)
@@ -618,7 +599,7 @@ async def _obtener_info_fmp(ticker: str, clase: str = "ACCION") -> dict:
     
     data = {}
     
-    global http_client
+    global http_client, _FMP_SEMA
     # Aquí aplicamos el cerrojo. Solo 5 tickers a la vez pueden entrar a este bloque.
     async with _FMP_SEMA:
         for intento in range(3):
@@ -756,17 +737,12 @@ async def _chequear_fundamentales_bono(ticker: str, filtros_extra: list) -> dict
         }
     except Exception: return None
 
-_PIPELINE_SEMA = None
-
-def _get_pipeline_semaphore():
-    global _PIPELINE_SEMA
-    if _PIPELINE_SEMA is None:
-        _PIPELINE_SEMA = asyncio.Semaphore(2)
-    return _PIPELINE_SEMA
+# Inicializado explícitamente en lifespan para garantizar el event loop correcto de Uvicorn
+_PIPELINE_SEMA: asyncio.Semaphore = None
 
 async def pipeline_hibrido(solicitud: str, msg_espera=None, fuente_datos: str = "yahoo"):
-    sem = _get_pipeline_semaphore()
-    async with sem:
+    global _PIPELINE_SEMA
+    async with _PIPELINE_SEMA:
         return await _pipeline_hibrido_interno(solicitud, msg_espera, fuente_datos)
 
 async def _pipeline_hibrido_interno(
@@ -1202,12 +1178,11 @@ async def _enviar_pregunta_tabla(query, context, clase: str, paso: int):
             botones.append(fila); fila = []
     if fila:
         botones.append(fila)
-    botones.append([InlineKeyboardButton("\u270f\ufe0f Valor personalizado", callback_data=f"tabla_texto_{paso}")])
     botones.append([InlineKeyboardButton("\u2b05\ufe0f Cancelar", callback_data="volver_menu")])
     await query.edit_message_text(
         f"\ud83d\udcca <b>AN\u00c1LISIS POR TABLA \u2014 {clase}</b> ({paso+1}/{total})\n\n"
         f"<b>{campo['label']}</b>\n\n"
-        "Elige una opci\u00f3n o escribe tu propio valor:",
+        "Selecciona una opci\u00f3n:",
         reply_markup=InlineKeyboardMarkup(botones),
         parse_mode="HTML"
     )
@@ -1227,12 +1202,11 @@ async def _enviar_pregunta_tabla_message(update, context, clase: str, paso: int)
             botones.append(fila); fila = []
     if fila:
         botones.append(fila)
-    botones.append([InlineKeyboardButton("\u270f\ufe0f Valor personalizado", callback_data=f"tabla_texto_{paso}")])
     botones.append([InlineKeyboardButton("\u2b05\ufe0f Cancelar", callback_data="volver_menu")])
     await update.message.reply_text(
         f"\ud83d\udcca <b>AN\u00c1LISIS POR TABLA \u2014 {clase}</b> ({paso+1}/{total})\n\n"
         f"<b>{campo['label']}</b>\n\n"
-        "Elige una opci\u00f3n o escribe tu propio valor:",
+        "Selecciona una opci\u00f3n:",
         reply_markup=InlineKeyboardMarkup(botones),
         parse_mode="HTML"
     )
@@ -1270,13 +1244,13 @@ async def _ejecutar_tabla_wizard(query, context, chat_id: int):
                 caption=texto, reply_markup=teclado, parse_mode="HTML"
             )
             try: await query.message.delete()
-            except Exception: pass
+            except Exception as e: logger.debug(f"[TABLA] Ignorado al borrar mensaje: {e}")
         else:
             await query.edit_message_text(texto, reply_markup=teclado, parse_mode="HTML")
     except Exception as e:
         logger.error(f"[TABLA] Error enviando resultado: {e}")
         try: await query.edit_message_text(texto[:4096], parse_mode=None)
-        except Exception: pass
+        except Exception as e2: logger.debug(f"[TABLA] Ignorado en fallback edit: {e2}")
 
 
 async def _ejecutar_tabla_desde_message(update, context, chat_id: int):
@@ -1311,13 +1285,13 @@ async def _ejecutar_tabla_desde_message(update, context, chat_id: int):
                 caption=texto, reply_markup=teclado, parse_mode="HTML"
             )
             try: await msg.delete()
-            except Exception: pass
+            except Exception as e: logger.debug(f"[TABLA] Ignorado al borrar msg espera: {e}")
         else:
             await msg.edit_text(texto, reply_markup=teclado, parse_mode="HTML")
     except Exception as e:
         logger.error(f"[TABLA] Error enviando resultado desde msg: {e}")
         try: await msg.edit_text(texto[:4096], parse_mode=None)
-        except Exception: pass
+        except Exception as e2: logger.debug(f"[TABLA] Ignorado en fallback edit msg: {e2}")
 
 
 # --- 4. TELEGRAM BOT HANDLERS ---
@@ -1461,26 +1435,6 @@ async def manejador_botones(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await _ejecutar_tabla_wizard(query, context, chat_id)
         else:
             await _enviar_pregunta_tabla(query, context, clase, siguiente)
-        return
-
-    if query.data.startswith("tabla_texto_"):
-        paso = int(query.data.replace("tabla_texto_", ""))
-        wizard = context.user_data.get("tabla_wizard", {})
-        wizard["esperando_texto"] = True
-        wizard["paso"] = paso
-        context.user_data["tabla_wizard"] = wizard
-        context.user_data["estado"] = "TABLA_WIZARD"
-        await db.upsert_usuario(chat_id, estado="TABLA_WIZARD")
-        clase  = wizard.get("clase", "ACCION")
-        campos = TABLA_CAMPOS.get(clase, [])
-        if paso < len(campos):
-            campo = campos[paso]
-            hint  = "15" if campo["tipo"] == "numero" else "tecnologia"
-            await query.edit_message_text(
-                f"\u270f\ufe0f <b>{campo['label']}</b>\n\n"
-                f"Escribe el valor (ej: <code>{hint}</code>):",
-                parse_mode="HTML"
-            )
         return
 
     # --- Configurar Broker ---
@@ -1791,7 +1745,7 @@ async def conversacion_inversor(update: Update, context: ContextTypes.DEFAULT_TY
     # El regex ya incluye: empresa, tendencia, alcista, bajista, comprar, vender, etc.
     # Solo llegan a Gemini las consultas que superan este primer filtro.
     estado_mem = context.user_data.get('estado')
-    estados_especiales = ("ESPERANDO_URL", "ESPERANDO_TICKERS_MANUALES", "TABLA_WIZARD")
+    estados_especiales = ("ESPERANDO_URL", "ESPERANDO_TICKERS_MANUALES")
 
     if not es_reintento and not (estado_mem in estados_especiales):
         if not _es_consulta_financiera(solicitud):
@@ -1922,36 +1876,6 @@ async def conversacion_inversor(update: Update, context: ContextTypes.DEFAULT_TY
             await msg_espera.edit_text(texto_final or "❌ No se encontraron activos con esos tickers.")
         return
 
-    # BUG FIX 4b: Manejar estado TABLA_WIZARD (valor personalizado escrito por el usuario)
-    if estado_mem == "TABLA_WIZARD" or estado_db == "TABLA_WIZARD":
-        wizard = context.user_data.get('tabla_wizard', {})
-        if wizard and wizard.get('esperando_texto'):
-            paso  = wizard.get('paso', 0)
-            clase = wizard.get('clase', 'ACCION')
-            campos = TABLA_CAMPOS.get(clase, [])
-            if paso < len(campos):
-                campo = campos[paso]
-                if campo['tipo'] == 'numero':
-                    try:
-                        wizard['respuestas'][campo['key']] = float(solicitud.replace(',', '.'))
-                    except ValueError:
-                        await update.message.reply_text("❌ Valor inválido. Escribe un número (ej: 15 o 3.5).")
-                        return
-                else:
-                    wizard['respuestas'][campo['key']] = solicitud.lower().strip()
-                wizard['esperando_texto'] = False
-                siguiente = paso + 1
-                wizard['paso'] = siguiente
-                context.user_data['tabla_wizard'] = wizard
-                if siguiente >= len(campos):
-                    await db.upsert_usuario(tid, estado=None)
-                    context.user_data['estado'] = None
-                    await _ejecutar_tabla_desde_message(update, context, tid)
-                else:
-                    # Enviar siguiente pregunta como nuevo mensaje
-                    await _enviar_pregunta_tabla_message(update, context, clase, siguiente)
-        return
-
     # Verificar créditos
     creditos = await db.obtener_creditos(tid)
     if creditos <= 0:
@@ -2033,8 +1957,8 @@ async def conversacion_inversor(update: Update, context: ContextTypes.DEFAULT_TY
             
         try:
             await msg_espera.delete()
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug(f"[UI] Ignorado al borrar msg espera: {e}")
 
     except BadRequest as e:
         logger.warning(f"[UI] Fallback a texto crudo por posible HTML inválido: {e}")
@@ -2055,7 +1979,7 @@ async def conversacion_inversor(update: Update, context: ContextTypes.DEFAULT_TY
             await update.message.reply_text(texto_limpio, reply_markup=teclado, parse_mode=None)
         
         try: await msg_espera.delete()
-        except Exception: pass
+        except Exception as e: logger.debug(f"[UI] Ignorado al borrar msg espera (fallback): {e}")
 
     except Exception as e:
         logger.error(f"Telegram API: {e}")
@@ -2110,47 +2034,27 @@ telegram_app.add_handler(CommandHandler("comprar", comando_comprar))
 # Uvicorn es el dueño del bucle de eventos. El bot de Telegram arranca y para
 # dentro del lifespan para compartir ese mismo bucle sin conflictos.
 
-async def self_ping_loop():
-    """Mantiene la instancia despierta haciendo auto-peticiones con el cliente global."""
-    await asyncio.sleep(10)
-    
-    url_propia = os.getenv("RENDER_EXTERNAL_URL") 
-    if not url_propia:
-        logger.warning("[SELF-PING] No se detectó URL externa. Auto-ping desactivado.")
-        return
-
-    logger.info(f"[SELF-PING] Iniciando bucle contra: {url_propia}")
-    
-    while True:
-        try:
-            global http_client
-            response = await http_client.get(url_propia, timeout=10)
-            logger.debug(f"[SELF-PING] Status: {response.status_code}")
-        except Exception as e:
-            logger.warning(f"[SELF-PING] Error de conexión: {e}")
-        
-        await asyncio.sleep(14 * 60)
-
-
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Gestiona el ciclo de vida del bot de Telegram junto a FastAPI/Uvicorn."""
-    global http_client
+    global http_client, _PIPELINE_SEMA, _FMP_SEMA
+    
     logger.info("[LIFESPAN] Iniciando Connection Pool Global (httpx)...")
     http_client = httpx.AsyncClient(
-        timeout=15, 
+        timeout=15,
         limits=httpx.Limits(max_connections=100, max_keepalive_connections=20)
     )
+
+    # Inicializar semáforos en el event loop de Uvicorn (evita 'wrong loop' errors)
+    _PIPELINE_SEMA = asyncio.Semaphore(2)
+    _FMP_SEMA      = asyncio.Semaphore(5)
+    logger.info("[LIFESPAN] Semáforos Pipeline y FMP inicializados en el event loop de Uvicorn.")
 
     # ── STARTUP ──
     logger.info("[LIFESPAN] Conectando con Supabase...")
     await db.inicializar_pool()              # Crea el pool asyncpg
     await db.inicializar_db()                # Añade columnas extra si faltan
     await db.precargar_semillas_basicas()    # Asegura operatividad inmediata v4.3
-
-    # Lanzar auto-ping en segundo plano para evitar Cold Starts
-    logger.info("[LIFESPAN] Lanzando auto-ping en segundo plano...")
-    asyncio.create_task(self_ping_loop())
 
     logger.info("[LIFESPAN] Inicializando bot de Telegram...")
     await telegram_app.initialize()
@@ -2239,7 +2143,8 @@ async def webhook_pago(request: Request):
         raise HTTPException(status_code=500, detail="Webhook no configurado en el servidor.")
 
     try:
-        event = stripe.Webhook.construct_event(
+        event = await asyncio.to_thread(
+            stripe.Webhook.construct_event,
             payload, sig_header, STRIPE_WEBHOOK_SECRET
         )
     except stripe.SignatureVerificationError as e:

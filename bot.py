@@ -3,15 +3,11 @@ from contextlib import asynccontextmanager
 import re
 import json
 import logging
-from typing import List, Optional, Literal
-from pydantic import BaseModel, Field
 import asyncio
 import operator
 import io
 import time
 import random
-import requests
-import functools
 import httpx
 from google import genai
 from google.genai import types
@@ -163,18 +159,6 @@ _HEALTH_GEMINI_CACHE: dict = {"ts": 0.0, "data": None}
 
 # --- 1. AGENTES DE IA (EXTRACTOR Y GENERADOR) ---
 
-class FiltroDinamico(BaseModel):
-    metrica: str = Field(description="Métrica a filtrar (ej: 'per', 'dividendo_porcentaje', 'beta', etc.)")
-    operador: str = Field(description="Operador matemático: '>', '<', '>=', '<=', '==', '='")
-    valor: float = Field(description="Umbral numérico exigido")
-
-class RespuestaIA(BaseModel):
-    clase_activo: str = Field(description="Tipo de activo: ACCION, REIT, ETF, CRIPTO, BONO")
-    perfil: str = Field(description="Perfil: Seguro, Riesgo, Balanceado")
-    sector: str = Field(description="Sector o categoría inferida (ej: tecnologia, energia, banca, inmobiliario, moneda)")
-    tickers_manuales: List[str] = Field(default_factory=list, description="Si el usuario pide tickers específicos, escríbelos aquí.")
-    filtros_dinamicos: List[FiltroDinamico] = Field(default_factory=list, description="Restricciones específicas exigidas")
-    error_api: Optional[str] = Field(None, description="Mensaje de error si la consulta es inválida o troll")
 
 async def extractor_intenciones(prompt_del_inversor: str) -> dict | None:
     """Extrae parámetros para búsqueda determínistica v4.5 — prompt compacto (-60% tokens)."""
@@ -204,18 +188,39 @@ REGLAS FINALES:
             contents=f"{prompt_sistema}\n\n[INPUT USUARIO]: {prompt_del_inversor}",
             config=types.GenerateContentConfig(
                 response_mime_type="application/json",
-                response_schema=RespuestaIA
+                response_schema=types.Schema(
+                    type=types.Type.OBJECT,
+                    properties={
+                        "clase_activo": types.Schema(type=types.Type.STRING),
+                        "perfil":       types.Schema(type=types.Type.STRING),
+                        "sector":       types.Schema(type=types.Type.STRING),
+                        "tickers_manuales": types.Schema(
+                            type=types.Type.ARRAY,
+                            items=types.Schema(type=types.Type.STRING)
+                        ),
+                        "filtros_dinamicos": types.Schema(
+                            type=types.Type.ARRAY,
+                            items=types.Schema(
+                                type=types.Type.OBJECT,
+                                properties={
+                                    "metrica":  types.Schema(type=types.Type.STRING),
+                                    "operador": types.Schema(type=types.Type.STRING),
+                                    "valor":    types.Schema(type=types.Type.NUMBER),
+                                }
+                            )
+                        ),
+                        "error_api": types.Schema(
+                            type=types.Type.STRING,
+                            description="Dejar vacío si no hay error"
+                        ),
+                    }
+                )
             )
         )
-        
-        # Extracción a prueba de balas (Soporta Pydantic V1, V2 y diccionarios directos)
-        if getattr(res, "parsed", None):
-            if isinstance(res.parsed, dict):
-                return res.parsed
-            if hasattr(res.parsed, "model_dump"):
-                return res.parsed.model_dump()
-            if hasattr(res.parsed, "dict"):
-                return res.parsed.dict()
+
+        # Con schema nativo, res.parsed es siempre un dict directo
+        if isinstance(getattr(res, "parsed", None), dict):
+            return res.parsed
             
         # Fallback ultra-robusto si el parser falló pero el texto existe
         texto_limpio = res.text.strip()

@@ -25,7 +25,7 @@ _pool: asyncpg.Pool | None = None
 # ── TTL dinámico por clase de activo (en segundos) ───────────────────────────
 # Fundamentales de empresas cambian trimestralmente → 24h es más que suficiente.
 # Criptos cotizan 24/7 con alta volatilidad → 1h para mantener relevancia.
-_FMP_CACHE_TTL: dict[str, int] = {
+_YF_CACHE_TTL: dict[str, int] = {
     "ACCION": 86400,   # 24 horas
     "ETF":    86400,   # 24 horas
     "REIT":   86400,   # 24 horas
@@ -142,9 +142,9 @@ async def inicializar_db():
         """)
 
         # ── Limpieza legacy y Tabla de caché FMP ─────────────────────────────
-        await conn.execute("DROP TABLE IF EXISTS yf_cache;") # Elimina basura legacy
+        await conn.execute("DROP TABLE IF EXISTS fmp_cache;") # Elimina basura legacy
         await conn.execute("""
-            CREATE TABLE IF NOT EXISTS fmp_cache (
+            CREATE TABLE IF NOT EXISTS yf_cache (
                 ticker      TEXT PRIMARY KEY,
                 clase       TEXT NOT NULL DEFAULT 'ACCION',
                 data        JSONB NOT NULL,
@@ -153,9 +153,22 @@ async def inicializar_db():
         """)
         # Índice para búsquedas por expiración (barrido del sweeper)
         await conn.execute("""
-            CREATE INDEX IF NOT EXISTS idx_fmp_cache_updated_at
-            ON fmp_cache (updated_at)
+            CREATE INDEX IF NOT EXISTS idx_yf_cache_updated_at
+            ON yf_cache (updated_at)
         """)
+
+    
+        # ── RLS y Seguridad por DEFECTO ──────────────────────────────────────
+        tablas = ["usuarios", "semillas", "stripe_eventos", "yf_cache"]
+        for t in tablas:
+            try:
+                await conn.execute(f"ALTER TABLE {t} ENABLE ROW LEVEL SECURITY;")
+            except Exception:
+                pass
+        
+        # ── Indices de base de datos ──────────────────────────────────────
+        await conn.execute("CREATE INDEX IF NOT EXISTS idx_usuarios_id ON usuarios (id)")
+        await conn.execute("CREATE INDEX IF NOT EXISTS idx_semillas_clase ON semillas (clase, sector)")
 
     logger.info("[DB] Esquema inicializado/verificado correctamente.")
 
@@ -164,7 +177,7 @@ async def inicializar_db():
 # 3. CACHÉ DE YAHOO FINANCE (yf_cache)
 # ═══════════════════════════════════════════════════════════════════════════════
 
-async def obtener_fmp_cache(ticker: str) -> dict | None:
+async def obtener_yf_cache(ticker: str) -> dict | None:
     """
     Retorna los datos cacheados para el ticker si están vigentes, o None si expiraron.
     El TTL se calcula según la clase de activo almacenada junto al registro.
@@ -173,29 +186,29 @@ async def obtener_fmp_cache(ticker: str) -> dict | None:
     try:
         async with pool.acquire() as conn:
             row = await conn.fetchrow(
-                "SELECT clase, data, updated_at FROM fmp_cache WHERE ticker = $1",
+                "SELECT clase, data, updated_at FROM yf_cache WHERE ticker = $1",
                 ticker.upper()
             )
         if not row:
             return None
 
         clase = row["clase"] or "ACCION"
-        ttl = _FMP_CACHE_TTL.get(clase, _TTL_DEFAULT)
+        ttl = _YF_CACHE_TTL.get(clase, _TTL_DEFAULT)
         age = time.time() - row["updated_at"]
 
         if age > ttl:
-            logger.debug(f"[FMP-CACHE] MISS (expirado {age:.0f}s > TTL {ttl}s): {ticker}")
+            logger.debug(f"[YF-CACHE] MISS (expirado {age:.0f}s > TTL {ttl}s): {ticker}")
             return None
 
-        logger.debug(f"[FMP-CACHE] HIT ({age:.0f}s de antigüedad): {ticker}")
+        logger.debug(f"[YF-CACHE] HIT ({age:.0f}s de antigüedad): {ticker}")
         return json.loads(row["data"]) if isinstance(row["data"], str) else dict(row["data"])
 
     except Exception as e:
-        logger.warning(f"[FMP-CACHE] Error leyendo caché para {ticker}: {e}")
+        logger.warning(f"[YF-CACHE] Error leyendo caché para {ticker}: {e}")
         return None
 
 
-async def guardar_fmp_cache(ticker: str, data: dict, clase: str = "ACCION"):
+async def guardar_yf_cache(ticker: str, data: dict, clase: str = "ACCION"):
     """
     Guarda o actualiza el registro de caché para el ticker.
     El TTL se aplica implícitamente en la próxima lectura según la clase.
@@ -207,7 +220,7 @@ async def guardar_fmp_cache(ticker: str, data: dict, clase: str = "ACCION"):
         async with pool.acquire() as conn:
             await conn.execute(
                 """
-                INSERT INTO fmp_cache (ticker, clase, data, updated_at)
+                INSERT INTO yf_cache (ticker, clase, data, updated_at)
                 VALUES ($1, $2, $3::jsonb, $4)
                 ON CONFLICT (ticker) DO UPDATE
                     SET clase      = EXCLUDED.clase,
@@ -219,14 +232,14 @@ async def guardar_fmp_cache(ticker: str, data: dict, clase: str = "ACCION"):
                 json.dumps(data),
                 time.time(),
             )
-        logger.debug(f"[FMP-CACHE] SAVE {ticker} (clase={clase})")
+        logger.debug(f"[YF-CACHE] SAVE {ticker} (clase={clase})")
     except Exception as e:
-        logger.warning(f"[FMP-CACHE] Error guardando caché para {ticker}: {e}")
+        logger.warning(f"[YF-CACHE] Error guardando caché para {ticker}: {e}")
 
 
-async def purgar_fmp_cache_expirado():
+async def purgar_yf_cache_expirado():
     """
-    Elimina registros expirados de fmp_cache.
+    Elimina registros expirados de yf_cache.
     Llamar ocasionalmente para mantener la tabla ligera (ej: desde el cron).
     """
     pool = _get_pool()
@@ -235,12 +248,12 @@ async def purgar_fmp_cache_expirado():
         async with pool.acquire() as conn:
             # Eliminar entradas donde la antigüedad supera el TTL máximo (24h)
             deleted = await conn.execute(
-                "DELETE FROM fmp_cache WHERE updated_at < $1",
+                "DELETE FROM yf_cache WHERE updated_at < $1",
                 ahora - _TTL_DEFAULT,
             )
-        logger.info(f"[FMP-CACHE] Purga completada: {deleted}")
+        logger.info(f"[YF-CACHE] Purga completada: {deleted}")
     except Exception as e:
-        logger.warning(f"[FMP-CACHE] Error en purga: {e}")
+        logger.warning(f"[YF-CACHE] Error en purga: {e}")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -744,3 +757,55 @@ async def marcar_evento_procesado(event_id: str):
             )
     except Exception:
         pass
+
+
+
+async def obtener_yf_cache_bulk(tickers: list[str]) -> dict:
+    if not tickers: return {}
+    pool = _get_pool()
+    ahora = time.time()
+    try:
+        async with pool.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT ticker, data, updated_at, clase FROM yf_cache 
+                WHERE ticker = ANY($1::text[])
+                """,
+                [t.upper() for t in tickers]
+            )
+            
+        resultados = {}
+        for row in rows:
+            ticker = row["ticker"].upper()
+            clase = row["clase"] or "ACCION"
+            ttl = _YF_CACHE_TTL.get(clase, _TTL_DEFAULT)
+            age = ahora - row["updated_at"]
+            if age <= ttl:
+                resultados[ticker] = json.loads(row["data"]) if isinstance(row["data"], str) else dict(row["data"])
+        return resultados
+    except Exception as e:
+        import logging
+        logging.getLogger(__name__).warning(f"[YF-CACHE] Error en bulk GET: {e}")
+        return {}
+
+async def guardar_yf_cache_bulk(datos: dict[str, dict], clase: str):
+    if not datos: return
+    pool = _get_pool()
+    ahora = time.time()
+    records = [(t.upper(), clase.upper(), json.dumps(d), ahora) for t, d in datos.items()]
+    try:
+        async with pool.acquire() as conn:
+            await conn.executemany(
+                """
+                INSERT INTO yf_cache (ticker, clase, data, updated_at)
+                VALUES ($1, $2, $3::jsonb, $4)
+                ON CONFLICT (ticker) DO UPDATE
+                    SET clase      = EXCLUDED.clase,
+                        data       = EXCLUDED.data,
+                        updated_at = EXCLUDED.updated_at
+                """,
+                records
+            )
+    except Exception as e:
+        import logging
+        logging.getLogger(__name__).warning(f"[YF-CACHE] Error en bulk SAVE: {e}")

@@ -4,6 +4,7 @@ import re
 import json
 import logging
 import asyncio
+import yfinance as yf
 import operator
 import io
 import time
@@ -32,7 +33,6 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 load_dotenv()
 TELEGRAM_TOKEN   = os.getenv("TELEGRAM_TOKEN")
 GEMINI_API_KEY   = os.getenv("GEMINI_API_KEY")
-FMP_API_KEY      = os.getenv("FMP_API_KEY")
 RENDER_EXTERNAL_URL = os.getenv("RENDER_EXTERNAL_URL", "")
 STRIPE_API_KEY   = os.getenv("STRIPE_API_KEY", "")   # sk_live_... o sk_test_...
 stripe.api_key = STRIPE_API_KEY
@@ -81,21 +81,20 @@ def _es_consulta_financiera(texto: str) -> bool:
     return bool(_REGEX_FINANCIERO.search(texto))
 
 
-METRICAS_FMP = {
-    "per": "peRatioTTM",
-    "dividendos_yield": "dividendYieldTTM",
-    "dividendo_porcentaje": "dividendYieldTTM",
-    "dividendo_absoluto": "lastDiv",
+METRICAS_YF = {
+    "per": "trailingPE",
+    "dividendos_yield": "dividendYield",
+    "dividendo_porcentaje": "dividendYield",
+    "dividendo_absoluto": "dividendRate",
     "beta": "beta",
     "crecimiento_ingresos": "revenueGrowth",
-    "precio_ventas": "priceToSalesRatioTTM",
-    "precio_valor_contable": "pbRatioTTM",
-    "per_futuro": "peRatioTTM",
-    "roe": "roeTTM",
-    "margen_beneficio": "netProfitMarginTTM",
-    "deuda_capital": "debtToEquityTTM",
-    "deuda_equity": "debtToEquityTTM",
-    "precio_book": "pbRatioTTM",
+    "precio_ventas": "priceToSalesTrailing12Months",
+    "precio_valor_contable": "priceToBook",
+    "per_futuro": "forwardPE",
+    "roe": "returnOnEquity",
+    "margen_beneficio": "profitMargins",
+    "deuda_capital": "debtToEquity",
+    "deuda_equity": "debtToEquity",
 }
 
 METRICAS_PORCENTUALES = {
@@ -107,6 +106,7 @@ FUENTES_DATOS = {
     "yahoo":       {"nombre": "Yahoo Finance",  "url": "https://finance.yahoo.com/quote/{ticker}"},
     "tradingview": {"nombre": "TradingView",     "url": "https://www.tradingview.com/symbols/{ticker}"},
     "investing":   {"nombre": "Investing.com",   "url": "https://www.investing.com/search/?q={ticker}"},
+    "google":      {"nombre": "Google Finance",  "url": "https://www.google.com/finance/quote/{ticker}"},
 }
 
 # --- CONFIGURACIÓN DE TABLAS DE FILTROS (Análisis sin IA) ---
@@ -162,26 +162,11 @@ _HEALTH_GEMINI_CACHE: dict = {"ts": 0.0, "data": None}
 
 async def extractor_intenciones(prompt_del_inversor: str) -> dict | None:
     """Extrae parámetros para búsqueda determínistica v4.5 — prompt compacto (-60% tokens)."""
-    prompt_sistema = """Rol: Arquitecto de Búsqueda Financiera. Extrae parámetros de filtrado desde lenguaje natural.
-
-REGLA: No generas tickers de memoria. Identifica SECTOR, CLASE y FILTROS.
-- Si pide activos específicos ("Analiza Apple") → ponlos en tickers_manuales.
-- Si pide categoría general → infiere sector, deja tickers_manuales=[].
-- Si el texto NO es financiero → asigna error_api con rechazo, tickers_manuales=[].
-
-CLASES: ACCION(default)|REIT(SOCIMIs,ladrillo)|ETF(fondos indexados,SPY,QQQ)|CRIPTO(bitcoin,ethereum,DeFi)|BONO(renta fija,tesoro,deuda)
-
-MÉTRICAS por clase:
-{"ACCION":["per","rendimiento","dividendo_porcentaje","dividendo_absoluto","roe","margen_beneficio","beta","deuda_capital","crecimiento_ingresos"],"REIT":["p_ffo","dividend_yield","ocupacion","ltv"],"ETF":["ter","aum","dividend_yield","rendimiento"],"CRIPTO":["rendimiento","market_cap"],"BONO":["dividend_yield","rendimiento","duracion"]}
-
-TRADUCCIONES comunes (expresión → filtro):
-{"PER bajo":{"metrica":"per","operador":"<","valor":45},"dividendo alto":{"metrica":"dividendo_porcentaje","operador":">","valor":4},"dividendo estable":{"metrica":"dividendo_porcentaje","operador":">","valor":2},"alta rentabilidad":{"metrica":"roe","operador":">","valor":45},"deuda baja":{"metrica":"deuda_capital","operador":"<","valor":50},"estable/estabilidad":{"metrica":"beta","operador":"<","valor":0.8},"crecimiento agresivo":{"metrica":"crecimiento_ingresos","operador":">","valor":20},"alcista/momentum+":{"metrica":"rendimiento","operador":">","valor":0},"bajista/momentum-":{"metrica":"rendimiento","operador":"<","valor":0},"ETF barato":{"metrica":"ter","operador":"<","valor":0.2},"ETF grande":{"metrica":"aum","operador":">","valor":1000000000},"REIT ocupacion alta":{"metrica":"ocupacion","operador":">","valor":90},"REIT dividendo alto":{"metrica":"dividend_yield","operador":">","valor":4},"cripto cap grande":{"metrica":"market_cap","operador":">","valor":1000000000}}
-Si el usuario dice "dividendo > X%", usa X como valor literal.
-
-REGLAS FINALES:
-- filtros_dinamicos=[] si no hay restricciones. UN objeto por cada restricción. Nunca pongas tickers en filtros.
-- sector: siempre rellénalo ("tecnologia","energia","banca","general"…). Nunca vacío.
-- perfil: "Seguro"(blue-chip)|"Riesgo"(especulativo)|"Balanceado"(mezcla)."""
+    prompt_sistema = """Rol: Arquitecto. Extrae parámetros de filtrado desde lenguaje natural. No generes tickers de memoria. Identifica SECTOR, CLASE y FILTROS en base al USER INPUT. Activos específicos van en tickers_manuales. Si no es financiero, responde error_api.
+CLASES válidas: ACCION|REIT|ETF|CRIPTO|BONO
+MÉTRICAS: {"ACCION":["per","rendimiento","dividendo_porcentaje","dividendo_absoluto","roe","margen_beneficio","beta","deuda_capital","crecimiento_ingresos"],"REIT":["p_ffo","dividend_yield","ocupacion","ltv"],"ETF":["ter","aum","dividend_yield","rendimiento"],"CRIPTO":["rendimiento","market_cap"],"BONO":["dividend_yield","rendimiento","duracion"]}
+TRADUCCIONES: {"PER bajo":{"metrica":"per","operador":"<","valor":45},"dividendo alto":{"metrica":"dividendo_porcentaje","operador":">","valor":4},"dividendo estable":{"metrica":"dividendo_porcentaje","operador":">","valor":2},"alta rentabilidad":{"metrica":"roe","operador":">","valor":45},"deuda baja":{"metrica":"deuda_capital","operador":"<","valor":50},"estable":{"metrica":"beta","operador":"<","valor":0.8},"crecimiento agresivo":{"metrica":"crecimiento_ingresos","operador":">","valor":20},"alcista":{"metrica":"rendimiento","operador":">","valor":0},"bajista":{"metrica":"rendimiento","operador":"<","valor":0},"ETF barato":{"metrica":"ter","operador":"<","valor":0.2},"ETF grande":{"metrica":"aum","operador":">","valor":1000000000},"REIT ocupacion alta":{"metrica":"ocupacion","operador":">","valor":90},"REIT dividendo alto":{"metrica":"dividend_yield","operador":">","valor":4},"cripto cap grande":{"metrica":"market_cap","operador":">","valor":1000000000}}
+REGLAS: sector siempre lleno ("tecnologia","energia","general"...). Perfil: "Seguro"|"Riesgo"|"Balanceado". filtros_dinamicos como objeto por métrica(nunca con tickers)."""
     try:
         res = await client.aio.models.generate_content(
             model='gemini-2.5-flash',
@@ -347,24 +332,16 @@ Ejemplo de Flash Note para BONO:
     restricciones_negativas = prohibiciones_por_clase.get(clase_activo, "")
 
     prompt_sistema = f"""
-    Rol: Eres un Director de Estrategia Cuantitativa (Quants) Tier-1 (estilo Goldman Sachs).
-    Tarea: Redactar un 'Flash Note' ejecutivo ultracorto para banca privada basado ESTRICTAMENTE en los datos proporcionados.
-    Clase de activo analizado: {clase_activo}
+    Rol: Director C-Level Quant.
+    Escribe un Flash Note institucional, crudo, ultracorto limitadamente.
+    LIMITADO a máximo 3 bullets directos al punto para reducir gasto.
+    Clase: {clase_activo}
 
-    === EJEMPLO DE REFERENCIA (imita este estilo y estructura EXACTAMENTE) ===
-    {ejemplo}
-    === FIN DEL EJEMPLO ===
-
-    Tono: Implacable, técnico, institucional.
-    Restricción 1: Habla estrictamente en ESPAÑOL. Usa "Foso económico" en vez de Moat.
-    Restricción 2: PROHIBIDO USAR NEGRITAS, cursivas o asteriscos (*). Escribe en texto plano.
-    Restricción 3: NO INVENTES PROYECCIONES. Si un dato falta en los datos recibidos, omítelo. NO lo inventes.
-    Restricción 4 (CRÍTICA): {restricciones_negativas if restricciones_negativas else 'Usa las métricas que correspondan a la clase de activo.'}
-
-    Estructura Obligatoria (igual que el ejemplo):
-    🎯 Tesis de Inversión: [Una frase lapidaria]
-    📊 Fundamentales: [Métricas en viñetas lisas, SOLO las que aparecen en los datos]
-    ⚖️ Veredicto: [Cierre pragmático]
+    Restricciones: PROHIBIDO NEGRITAS/CURSIVAS. {restricciones_negativas if restricciones_negativas else ''}
+    ESTRUCTURA ESTRICTA:
+    🎯 Tesis: [1 frase lapidaria]
+    📊 Datos: [Max 3 viñetas con métricas del JSON]
+    ⚖️ Veredicto: [Conclusión 1 frase]
     """
     try:
         res = await client.aio.models.generate_content(
@@ -435,7 +412,22 @@ async def fabricante_de_graficos(ticker: str, periodo: str = "3mo") -> tuple[byt
         }
         
         # 3. Solicitar imagen a QuickChart
-        resp_qc = await http_client.post("https://quickchart.io/chart", json=qc_payload)
+        global _QUICKCHART_SEMA
+        if _QUICKCHART_SEMA:
+            async with _QUICKCHART_SEMA:
+                global _QUICKCHART_SEMA
+        if _QUICKCHART_SEMA:
+            async with _QUICKCHART_SEMA:
+                resp_qc = await http_client.post("https://quickchart.io/chart", json=qc_payload)
+        else:
+            resp_qc = await http_client.post("https://quickchart.io/chart", json=qc_payload)
+        else:
+            global _QUICKCHART_SEMA
+        if _QUICKCHART_SEMA:
+            async with _QUICKCHART_SEMA:
+                resp_qc = await http_client.post("https://quickchart.io/chart", json=qc_payload)
+        else:
+            resp_qc = await http_client.post("https://quickchart.io/chart", json=qc_payload)
         if resp_qc.status_code == 200:
             return resp_qc.content, rendimiento
         return None, rendimiento
@@ -465,11 +457,7 @@ import html as _html_stdlib
 _TELEGRAM_TAGS = re.compile(r'(</?(?:b|i|u|s|code|pre|a|tg-spoiler)[^>]*>)', re.IGNORECASE)
 
 def _limpiar_html_telegram(texto: str) -> str:
-    """Sanitiza texto para Telegram HTML: normaliza etiquetas y escapa caracteres
-    especiales (<, >, &) que no formen parte de etiquetas válidas."""
     if not texto: return ""
-
-    # 1. Normalizar etiquetas no-Telegram a equivalentes válidos
     texto = re.sub(r'</?ul>', '', texto)
     texto = re.sub(r'<li>', '• ', texto)
     texto = re.sub(r'</li>', '\n', texto)
@@ -478,30 +466,19 @@ def _limpiar_html_telegram(texto: str) -> str:
     texto = re.sub(r'<em>', '<i>', texto)
     texto = re.sub(r'</em>', '</i>', texto)
     texto = re.sub(r'<br\s*/?>', '\n', texto)
-    texto = texto.strip()
-
-    # 2. Escapar caracteres especiales FUERA de etiquetas Telegram válidas
-    # Dividimos el texto en partes: etiquetas válidas y texto libre
+    
     partes = _TELEGRAM_TAGS.split(texto)
     resultado = []
     for parte in partes:
         if _TELEGRAM_TAGS.fullmatch(parte):
-            resultado.append(parte)          # etiqueta válida: la preservamos
+            resultado.append(parte)
         else:
-            parte = parte.replace('&', '&amp;')  # DEBE ir primero
+            parte = parte.replace('&', '&amp;')
             parte = parte.replace('<', '&lt;')
             parte = parte.replace('>', '&gt;')
             resultado.append(parte)
     texto = ''.join(resultado)
-
-    # 3. Micro-corrector: forzar cierre de etiquetas <b>/<i> desemparejadas
-    for tag in ['b', 'i']:
-        aperturas = texto.count(f'<{tag}>')
-        cierres   = texto.count(f'</{tag}>')
-        if aperturas > cierres:
-            texto += f'</{tag}>' * (aperturas - cierres)
-
-    return texto
+    return texto.strip()
 
 
 # --- 3. EL PIPELINE MAESTRO (ORQUESTADOR) ---
@@ -569,11 +546,11 @@ def _construir_filtros(perfil: str, filtros_dinamicos: list) -> dict:
             filtros["min_div_abs"] = valor
             filtros["div_abs_op"] = OPS.get(operador_str, operator.ge)
 
-        elif metrica in METRICAS_FMP:
+        elif metrica in METRICAS_YF:
             if metrica in METRICAS_PORCENTUALES and valor > 1:
                 valor /= 100.0
             filtros["filtros_extra"].append({
-                "key": METRICAS_FMP[metrica],
+                "key": METRICAS_YF[metrica],
                 "op": OPS.get(operador_str, operator.ge),
                 "val": valor,
             })
@@ -589,7 +566,6 @@ def _construir_filtros(perfil: str, filtros_dinamicos: list) -> dict:
 
 # --- CACHÉ YFINANCE Y POOLING (FMP ASYNC) ---
 # Inicializado en lifespan para garantizar el event loop correcto de Uvicorn
-_FMP_SEMA: asyncio.Semaphore = None
 
 async def _obtener_info_fmp(ticker: str, clase: str = "ACCION") -> dict:
     cached = await db.obtener_fmp_cache(ticker)
@@ -643,9 +619,8 @@ async def _obtener_info_fmp(ticker: str, clase: str = "ACCION") -> dict:
     return data
 
 
-async def _chequear_fundamentales_accion(ticker: str, filtros: dict) -> dict | None:
+def _chequear_fundamentales_accion(ticker: str, info: dict, filtros: dict) -> dict | None:
     try:
-        info = await _obtener_info_fmp(ticker, "ACCION")
         if not info: return None
         per = info.get('peRatioTTM') or 999
         div_yield_dec = info.get('dividendYieldTTM', 0)
@@ -670,9 +645,8 @@ async def _chequear_fundamentales_accion(ticker: str, filtros: dict) -> dict | N
         logger.debug(f"[FMP] Error {ticker} (Acciones): {e}")
         return None
 
-async def _chequear_fundamentales_reit(ticker: str, filtros_extra: list) -> dict | None:
+def _chequear_fundamentales_reit(ticker: str, info: dict, filtros_extra: list) -> dict | None:
     try:
-        info = await _obtener_info_fmp(ticker, "REIT")
         if not info: return None
         div_yield_dec = info.get('dividendYieldTTM', 0)
         div_yield = div_yield_dec if div_yield_dec is not None else 0
@@ -693,9 +667,8 @@ async def _chequear_fundamentales_reit(ticker: str, filtros_extra: list) -> dict
         logger.debug(f"[FMP] Error {ticker} (REIT): {e}")
         return None
 
-async def _chequear_fundamentales_etf(ticker: str, filtros_extra: list) -> dict | None:
+def _chequear_fundamentales_etf(ticker: str, info: dict, filtros_extra: list) -> dict | None:
     try:
-        info = await _obtener_info_fmp(ticker, "ETF")
         if not info: return None
         aum = info.get('mktCap', 0) or 0
         div_yield_dec = info.get('dividendYieldTTM', 0)
@@ -716,9 +689,8 @@ async def _chequear_fundamentales_etf(ticker: str, filtros_extra: list) -> dict 
         logger.debug(f"[FMP] Error {ticker} (ETF): {e}")
         return None
 
-async def _chequear_fundamentales_cripto(ticker: str, filtros_extra: list) -> dict | None:
+def _chequear_fundamentales_cripto(ticker: str, info: dict, filtros_extra: list) -> dict | None:
     try:
-        info = await _obtener_info_fmp(ticker, "CRIPTO")
         if not info: return None
         market_cap = info.get('mktCap', 0) or 0
         for f in filtros_extra:
@@ -733,9 +705,8 @@ async def _chequear_fundamentales_cripto(ticker: str, filtros_extra: list) -> di
         logger.debug(f"[FMP] Error {ticker} (Cripto): {e}")
         return None
 
-async def _chequear_fundamentales_bono(ticker: str, filtros_extra: list) -> dict | None:
+def _chequear_fundamentales_bono(ticker: str, info: dict, filtros_extra: list) -> dict | None:
     try:
-        info = await _obtener_info_fmp(ticker, "BONO")
         if not info: return None
         div_yield_dec = info.get('dividendYieldTTM', 0)
         div_yield = div_yield_dec if div_yield_dec is not None else 0
@@ -754,7 +725,38 @@ async def _chequear_fundamentales_bono(ticker: str, filtros_extra: list) -> dict
         return None
 
 # Inicializado explícitamente en lifespan para garantizar el event loop correcto de Uvicorn
-_PIPELINE_SEMA: asyncio.Semaphore = None
+_PIPELINE_SEMA = None
+_CRON_SEMA = None
+_CRON_LOCK = None
+_QUICKCHART_SEMA = None
+
+
+
+async def _obtener_info_bulk(tickers: list[str], clase: str) -> dict:
+    cached = await db.obtener_yf_cache_bulk(tickers)
+    faltantes = [t for t in tickers if t.upper() not in cached]
+    
+    if faltantes:
+        import yfinance as yf
+        async def fetch_yf(t):
+            try:
+                info = await asyncio.wait_for(asyncio.to_thread(lambda: yf.Ticker(t).info), timeout=15)
+                return t.upper(), info
+            except Exception as e:
+                logger.debug(f"[YF] Error fetching {t}: {e}")
+                return t.upper(), {}
+                
+        resultados = await asyncio.gather(*(fetch_yf(t) for t in faltantes))
+        nuevos_datos = {}
+        for t, info in resultados:
+            if info:
+                nuevos_datos[t] = info
+                cached[t] = info
+                
+        if nuevos_datos:
+            await db.guardar_yf_cache_bulk(nuevos_datos, clase)
+            
+    return cached
 
 async def pipeline_hibrido(solicitud: str, msg_espera=None, fuente_datos: str = "yahoo"):
     global _PIPELINE_SEMA
@@ -877,9 +879,9 @@ async def _pipeline_hibrido_interno(
                 "div_op": filtros["div_op"], "div_abs_op": filtros["div_abs_op"],
                 "filtros_extra": list(filtros["filtros_extra"]),
             }
-            tareas = [_chequear_fundamentales_accion(t, filtros_snap) for t in tickers]
+            datos_bulk = await _obtener_info_bulk(tickers, "ACCION")
+            resultados = [_chequear_fundamentales_accion(t, datos_bulk.get(t, {}), filtros_snap) for t in tickers]
             try:
-                resultados = await asyncio.wait_for(asyncio.gather(*tareas), timeout=45.0)
                 pre_ganadores = [r for r in resultados if r is not None]
             except asyncio.TimeoutError:
                 logger.warning(f"[PIPELINE] Timeout FMP en iter ACCION intento {intento}")
@@ -888,33 +890,33 @@ async def _pipeline_hibrido_interno(
                 break
 
     elif clase_activo == "REIT":
-        tareas = [_chequear_fundamentales_reit(t, filtros_dinamicos_raw) for t in tickers]
+        datos_bulk = await _obtener_info_bulk(tickers, "REIT")
+        resultados = [_chequear_fundamentales_reit(t, datos_bulk.get(t, {}), filtros_dinamicos_raw) for t in tickers]
         try:
-            resultados = await asyncio.wait_for(asyncio.gather(*tareas), timeout=45.0)
             pre_ganadores = [r for r in resultados if r is not None]
         except asyncio.TimeoutError:
             pre_ganadores = []
 
     elif clase_activo == "ETF":
-        tareas = [_chequear_fundamentales_etf(t, filtros_dinamicos_raw) for t in tickers]
+        datos_bulk = await _obtener_info_bulk(tickers, "ETF")
+        resultados = [_chequear_fundamentales_etf(t, datos_bulk.get(t, {}), filtros_dinamicos_raw) for t in tickers]
         try:
-            resultados = await asyncio.wait_for(asyncio.gather(*tareas), timeout=45.0)
             pre_ganadores = [r for r in resultados if r is not None]
         except asyncio.TimeoutError:
             pre_ganadores = []
 
     elif clase_activo == "CRIPTO":
-        tareas = [_chequear_fundamentales_cripto(t, filtros_dinamicos_raw) for t in tickers]
+        datos_bulk = await _obtener_info_bulk(tickers, "CRIPTO")
+        resultados = [_chequear_fundamentales_cripto(t, datos_bulk.get(t, {}), filtros_dinamicos_raw) for t in tickers]
         try:
-            resultados = await asyncio.wait_for(asyncio.gather(*tareas), timeout=45.0)
             pre_ganadores = [r for r in resultados if r is not None]
         except asyncio.TimeoutError:
             pre_ganadores = []
 
     elif clase_activo == "BONO":
-        tareas = [_chequear_fundamentales_bono(t, filtros_dinamicos_raw) for t in tickers]
+        datos_bulk = await _obtener_info_bulk(tickers, "BONO")
+        resultados = [_chequear_fundamentales_bono(t, datos_bulk.get(t, {}), filtros_dinamicos_raw) for t in tickers]
         try:
-            resultados = await asyncio.wait_for(asyncio.gather(*tareas), timeout=45.0)
             pre_ganadores = [r for r in resultados if r is not None]
         except asyncio.TimeoutError:
             pre_ganadores = []
@@ -1052,9 +1054,9 @@ async def _pipeline_por_tabla(
             "temporalidad": "3mo", "ignorar_per_estricto": per_max >= 9999,
             "filtros_extra": [{"key": "beta", "op": operator.le, "val": beta_max}] if beta_max < 99 else [],
         }
-        tareas = [_chequear_fundamentales_accion(t, filtros_a) for t in tickers]
+        datos_bulk = await _obtener_info_bulk(tickers, "ACCION")
+        resultados = [_chequear_fundamentales_accion(t, datos_bulk.get(t, {}), filtros_a) for t in tickers]
         try:
-            resultados = await asyncio.wait_for(asyncio.gather(*tareas), timeout=45.0)
             ganadores = [r for r in resultados if r is not None]
         except asyncio.TimeoutError:
             ganadores = []
@@ -1064,9 +1066,9 @@ async def _pipeline_por_tabla(
         p_ffo_max = float(filtros_tabla.get("p_ffo_max", 999))
         fe = [{"metrica": "dividend_yield", "operador": ">=", "valor": div_min},
               {"metrica": "p_ffo",           "operador": "<=", "valor": p_ffo_max}]
-        tareas = [_chequear_fundamentales_reit(t, fe) for t in tickers]
+        datos_bulk = await _obtener_info_bulk(tickers, "REIT")
+        resultados = [_chequear_fundamentales_reit(t, datos_bulk.get(t, {}), fe) for t in tickers]
         try:
-            resultados = await asyncio.wait_for(asyncio.gather(*tareas), timeout=45.0)
             ganadores = [r for r in resultados if r is not None]
         except asyncio.TimeoutError:
             ganadores = []
@@ -1076,9 +1078,9 @@ async def _pipeline_por_tabla(
         aum_min = float(filtros_tabla.get("aum_min_bn", 0)) * 1e9
         fe = [{"metrica": "ter", "operador": "<=", "valor": ter_max},
               {"metrica": "aum", "operador": ">=", "valor": aum_min}]
-        tareas = [_chequear_fundamentales_etf(t, fe) for t in tickers]
+        datos_bulk = await _obtener_info_bulk(tickers, "ETF")
+        resultados = [_chequear_fundamentales_etf(t, datos_bulk.get(t, {}), fe) for t in tickers]
         try:
-            resultados = await asyncio.wait_for(asyncio.gather(*tareas), timeout=45.0)
             ganadores = [r for r in resultados if r is not None]
         except asyncio.TimeoutError:
             ganadores = []
@@ -1086,9 +1088,9 @@ async def _pipeline_por_tabla(
     elif clase_activo == "CRIPTO":
         mcap_min = float(filtros_tabla.get("market_cap_min_bn", 0)) * 1e9
         fe = [{"metrica": "market_cap", "operador": ">=", "valor": mcap_min}]
-        tareas = [_chequear_fundamentales_cripto(t, fe) for t in tickers]
+        datos_bulk = await _obtener_info_bulk(tickers, "CRIPTO")
+        resultados = [_chequear_fundamentales_cripto(t, datos_bulk.get(t, {}), fe) for t in tickers]
         try:
-            resultados = await asyncio.wait_for(asyncio.gather(*tareas), timeout=45.0)
             ganadores = [r for r in resultados if r is not None]
         except asyncio.TimeoutError:
             ganadores = []
@@ -1096,9 +1098,9 @@ async def _pipeline_por_tabla(
     elif clase_activo == "BONO":
         ytm_min = float(filtros_tabla.get("ytm_min", 0))
         fe = [{"metrica": "dividend_yield", "operador": ">=", "valor": ytm_min}]
-        tareas = [_chequear_fundamentales_bono(t, fe) for t in tickers]
+        datos_bulk = await _obtener_info_bulk(tickers, "BONO")
+        resultados = [_chequear_fundamentales_bono(t, datos_bulk.get(t, {}), fe) for t in tickers]
         try:
-            resultados = await asyncio.wait_for(asyncio.gather(*tareas), timeout=45.0)
             ganadores = [r for r in resultados if r is not None]
         except asyncio.TimeoutError:
             ganadores = []
@@ -1267,7 +1269,7 @@ async def _ejecutar_tabla_wizard(query, context, chat_id: int):
     try:
         if grafico_bytes:
             await query.message.reply_photo(
-                photo=InputFile(io.BytesIO(grafico_bytes), filename=f"chart_{ticker}.webp"),
+                photo=InputFile(io.BytesIO(grafico_bytes), filename=f"chart_{ticker}.webp"), # replaced
                 caption=texto, reply_markup=teclado, parse_mode="HTML"
             )
             try: await query.message.delete()
@@ -1308,7 +1310,7 @@ async def _ejecutar_tabla_desde_message(update, context, chat_id: int):
     try:
         if grafico_bytes:
             await update.message.reply_photo(
-                photo=InputFile(io.BytesIO(grafico_bytes), filename=f"chart_{ticker}.webp"),
+                photo=InputFile(io.BytesIO(grafico_bytes), filename=f"chart_{ticker}.webp"), # replaced
                 caption=texto, reply_markup=teclado, parse_mode="HTML"
             )
             try: await msg.delete()
@@ -1363,9 +1365,13 @@ async def comando_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton(f"⚠️ Ver mis Strikes ({strikes})", callback_data="ver_strikes")],
         [InlineKeyboardButton("🔗 Configurar mi Broker (URL)", callback_data="pedir_url")],
         [InlineKeyboardButton("🌐 Fuente de Validación", callback_data="pedir_fuente")],
-        [InlineKeyboardButton("⌨️ Búsqueda Manual (Bypass IA)", callback_data="manual_input"),
-         InlineKeyboardButton("📊 Análisis por Tabla", callback_data="tabla_input")],
-        [InlineKeyboardButton("🔔 Configurar Alerta (6h)", callback_data="alerta_6")],
+        [InlineKeyboardButton("⌨️ Bypass (Manual)", callback_data="manual_input"),
+         InlineKeyboardButton("📊 Análisis Tabla", callback_data="tabla_input")],
+        [InlineKeyboardButton("💰 Dividendos VIP", callback_data="btn1click_divs"),
+         InlineKeyboardButton("🚀 Growth Tech", callback_data="btn1click_growth")],
+        [InlineKeyboardButton("🛡️ Blue Chips Seguras", callback_data="btn1click_blue"),
+         InlineKeyboardButton("📉 Buscachollos", callback_data="btn1click_value")],
+        [InlineKeyboardButton("🔔 Configurar Alerta (6h)", callback_data="alerta_6")]],
         [InlineKeyboardButton("🔔 Configurar Alerta (12h)", callback_data="alerta_12")],
         [InlineKeyboardButton("🛑 Detener Alertas", callback_data="alerta_stop")]
     ])
@@ -1577,9 +1583,13 @@ async def manejador_botones(update: Update, context: ContextTypes.DEFAULT_TYPE):
             [InlineKeyboardButton(f"⚠️ Ver mis Strikes ({strikes})", callback_data="ver_strikes")],
             [InlineKeyboardButton("🔗 Configurar mi Broker (URL)", callback_data="pedir_url")],
             [InlineKeyboardButton("🌐 Fuente de Validación", callback_data="pedir_fuente")],
-            [InlineKeyboardButton("⌨️ Bypass IA (Tickers)", callback_data="manual_input"),
-             InlineKeyboardButton("📊 Análisis por Tabla", callback_data="tabla_input")],
-            [InlineKeyboardButton("🔔 Configurar Alerta (6h)", callback_data="alerta_6")],
+        [InlineKeyboardButton("⌨️ Bypass (Manual)", callback_data="manual_input"),
+         InlineKeyboardButton("📊 Análisis Tabla", callback_data="tabla_input")],
+        [InlineKeyboardButton("💰 Dividendos VIP", callback_data="btn1click_divs"),
+         InlineKeyboardButton("🚀 Growth Tech", callback_data="btn1click_growth")],
+        [InlineKeyboardButton("🛡️ Blue Chips Seguras", callback_data="btn1click_blue"),
+         InlineKeyboardButton("📉 Buscachollos", callback_data="btn1click_value")],
+        [InlineKeyboardButton("🔔 Configurar Alerta (6h)", callback_data="alerta_6")]],
             [InlineKeyboardButton("🔔 Configurar Alerta (12h)", callback_data="alerta_12")],
             [InlineKeyboardButton("🛑 Detener Alertas", callback_data="alerta_stop")]
         ])
@@ -2069,26 +2079,14 @@ telegram_app.add_handler(CommandHandler("comprar", comando_comprar))
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Gestiona el ciclo de vida del bot de Telegram junto a FastAPI/Uvicorn."""
-    global http_client, _PIPELINE_SEMA, _FMP_SEMA, _CRON_SEMA, _CRON_LOCK
-    
-    logger.info("[LIFESPAN] Iniciando Connection Pool Global (httpx)...")
-    http_client = httpx.AsyncClient(
-        timeout=15,
-        limits=httpx.Limits(max_connections=100, max_keepalive_connections=20)
-    )
-
-    # Inicializar semáforos en el event loop de Uvicorn (evita 'wrong loop' errors)
-    _PIPELINE_SEMA = asyncio.Semaphore(2)
-    _FMP_SEMA      = asyncio.Semaphore(5)
-    _CRON_SEMA     = asyncio.Semaphore(5)
-    _CRON_LOCK     = asyncio.Lock()
-    logger.info("[LIFESPAN] Semáforos y Locks inicializados en el event loop de Uvicorn.")
-
-    # ── STARTUP ──
-    logger.info("[LIFESPAN] Conectando con Supabase...")
-    await db.inicializar_pool()              # Crea el pool asyncpg
-    await db.inicializar_db()                # Añade columnas extra si faltan
+    global _PIPELINE_SEMA, _CRON_SEMA, _CRON_LOCK, _QUICKCHART_SEMA
+    _QUICKCHART_SEMA = asyncio.Semaphore(2), _QUICKCHART_SEMA
+    _QUICKCHART_SEMA = asyncio.Semaphore(2)
+    _PIPELINE_SEMA = asyncio.Semaphore(15)
+    _CRON_SEMA = asyncio.Semaphore(5)
+    _CRON_LOCK = asyncio.Lock()
+    await db.inicializar_pool()
+    await db.inicializar_db()
     await db.precargar_semillas_basicas()    # Asegura operatividad inmediata v4.3
 
     logger.info("[LIFESPAN] Inicializando bot de Telegram...")
@@ -2318,6 +2316,8 @@ async def _ejecutar_alerta_usuario(tid: int, solicitud: str, fuente: str):
 _usuarios_en_cron = set()
 _CRON_SEMA = None
 _CRON_LOCK = None
+_QUICKCHART_SEMA = None
+
 
 async def procesador_lotes_cron(lista_usuarios: list):
     """Procesa alertas con concurrencia controlada para equilibrar carga y velocidad."""
@@ -2396,7 +2396,7 @@ async def cron_ejecutar(request: Request, background_tasks: BackgroundTasks):
                         text="💳 <b>Alerta Cron Pausada</b>\n\nSin créditos. Recarga y reactiva desde /menu.",
                         parse_mode="HTML", reply_markup=teclado_pago
                     )
-                except Exception: pass
+                except Exception as e:\n            logger.debug(f'Ignorado: {e}')
                 continue
 
             async with _CRON_LOCK:

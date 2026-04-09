@@ -31,21 +31,19 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 
 # Cargar las claves API
 load_dotenv()
-TELEGRAM_TOKEN   = os.getenv("TELEGRAM_TOKEN")
+TELEGRAM_TOKEN   = os.getenv("TELEGRAM_TOKEN", "123456789:DUMMY_TOKEN_PARA_EVITAR_CRASH_EN_FRIO")
 GEMINI_API_KEY   = os.getenv("GEMINI_API_KEY")
 RENDER_EXTERNAL_URL = os.getenv("RENDER_EXTERNAL_URL", "")
 STRIPE_API_KEY   = os.getenv("STRIPE_API_KEY", "")   # sk_live_... o sk_test_...
 stripe.api_key = STRIPE_API_KEY
 
 if not TELEGRAM_TOKEN or not GEMINI_API_KEY:
-    logger.error("Falta TELEGRAM_TOKEN o GEMINI_API_KEY en .env")
-    exit(1)
+    logger.critical("Falta TELEGRAM_TOKEN o GEMINI_API_KEY en .env")
 
 try:
     client = genai.Client(api_key=GEMINI_API_KEY)
 except Exception as e:
-    logger.error(f"Error inicializando SDK Gemini v2: {e}")
-    exit(1)
+    logger.critical(f"Error inicializando SDK Gemini v2: {e}")
 
 # --- CONSTANTES GLOBALES ---
 
@@ -56,6 +54,10 @@ STRIPE_PAYMENT_URL    = "https://buy.stripe.com/28EcN70yD05tcjHgZm3VC00"
 # Secret para proteger el endpoint /cron/ejecutar de llamadas no autorizadas
 CRON_SECRET = os.getenv("CRON_SECRET", "")
 http_client: httpx.AsyncClient = None
+_PIPELINE_SEMA = None
+_QUICKCHART_SEMA = None
+_CRON_SEMA = None
+_CRON_LOCK = None
 
 OPS = {
     ">": operator.gt, "<": operator.lt, ">=": operator.ge,
@@ -362,31 +364,22 @@ Ejemplo de Flash Note para BONO:
 
 # --- 2. HERRAMIENTAS MATEMÁTICAS LOCALES ---
 async def fabricante_de_graficos(ticker: str, periodo: str = "3mo") -> tuple[bytes | None, float]:
-    """Genera un gráfico usando FMP y QuickChart.io de forma asíncrona y ligera."""
-    if not FMP_API_KEY: 
-        return None, 0.0
-    
-    # 1. Obtener datos históricos de FMP (60 días laborables = ~3 meses)
-    url_hist = f"https://financialmodelingprep.com/api/v3/historical-price-full/{ticker}?timeseries=60&apikey={FMP_API_KEY}"
-    
+    """Genera un gráfico usando Yahoo Finance y QuickChart.io de forma asíncrona."""
     try:
-        global http_client
-        resp = await http_client.get(url_hist)
-        if resp.status_code != 200: return None, 0.0
+        import yfinance as yf
+        hist = await asyncio.wait_for(
+            asyncio.to_thread(lambda: yf.Ticker(ticker).history(period=periodo)), timeout=10
+        )
         
-        data = resp.json()
-        if "historical" not in data or not data["historical"]: return None, 0.0
-        
-        hist = data["historical"][::-1] # Invertir para orden cronológico
-        labels = [d["date"] for d in hist]
-        prices = [d["close"] for d in hist]
-        
-        if len(prices) < 2: return None, 0.0
+        if hist.empty or len(hist) < 2:
+            return None, 0.0
+            
+        labels = hist.index.strftime('%Y-%m-%d').tolist()
+        prices = [round(p, 2) for p in hist['Close'].tolist()]
         
         rendimiento = ((prices[-1] - prices[0]) / prices[0]) * 100
         color = "rgb(44, 160, 44)" if rendimiento >= 0 else "rgb(214, 39, 40)"
         
-        # 2. Construir payload para QuickChart
         qc_payload = {
             "chart": {
                 "type": "line",
@@ -411,23 +404,13 @@ async def fabricante_de_graficos(ticker: str, periodo: str = "3mo") -> tuple[byt
             "format": "webp"
         }
         
-        # 3. Solicitar imagen a QuickChart
-        global _QUICKCHART_SEMA
-        if _QUICKCHART_SEMA:
-            async with _QUICKCHART_SEMA:
-                global _QUICKCHART_SEMA
-        if _QUICKCHART_SEMA:
+        global _QUICKCHART_SEMA, http_client
+        if _QUICKCHART_SEMA is not None:
             async with _QUICKCHART_SEMA:
                 resp_qc = await http_client.post("https://quickchart.io/chart", json=qc_payload)
         else:
             resp_qc = await http_client.post("https://quickchart.io/chart", json=qc_payload)
-        else:
-            global _QUICKCHART_SEMA
-        if _QUICKCHART_SEMA:
-            async with _QUICKCHART_SEMA:
-                resp_qc = await http_client.post("https://quickchart.io/chart", json=qc_payload)
-        else:
-            resp_qc = await http_client.post("https://quickchart.io/chart", json=qc_payload)
+            
         if resp_qc.status_code == 200:
             return resp_qc.content, rendimiento
         return None, rendimiento
@@ -566,73 +549,20 @@ def _construir_filtros(perfil: str, filtros_dinamicos: list) -> dict:
 
 # --- CACHÉ YFINANCE Y POOLING (FMP ASYNC) ---
 # Inicializado en lifespan para garantizar el event loop correcto de Uvicorn
-
-async def _obtener_info_fmp(ticker: str, clase: str = "ACCION") -> dict:
-    cached = await db.obtener_fmp_cache(ticker)
-    if cached is not None:
-        return cached
-
-    if not FMP_API_KEY:
-        logger.error(f"Falta FMP_API_KEY para {ticker}")
-        return {}
-
-    url_profile = f"https://financialmodelingprep.com/api/v3/profile/{ticker}?apikey={FMP_API_KEY}"
-    url_metrics = f"https://financialmodelingprep.com/api/v3/key-metrics-ttm/{ticker}?apikey={FMP_API_KEY}"
-    
-    data = {}
-    
-    global http_client, _FMP_SEMA
-    # Aquí aplicamos el cerrojo. Solo 5 tickers a la vez pueden entrar a este bloque.
-    async with _FMP_SEMA:
-        for intento in range(3):
-            try:
-                resp_prof, resp_metr = await asyncio.gather(
-                    http_client.get(url_profile),
-                    http_client.get(url_metrics),
-                    return_exceptions=True
-                )
-                
-                if isinstance(resp_prof, httpx.Response) and resp_prof.status_code == 200:
-                    rp = resp_prof.json()
-                    if rp and len(rp) > 0:
-                        data.update(rp[0])
-                elif isinstance(resp_prof, httpx.Response) and resp_prof.status_code == 429:
-                    await asyncio.sleep(1 + intento)
-                    continue
-                
-                if isinstance(resp_metr, httpx.Response) and resp_metr.status_code == 200:
-                    rm = resp_metr.json()
-                    if rm and len(rm) > 0:
-                        data.update(rm[0])
-                elif isinstance(resp_metr, httpx.Response) and resp_metr.status_code == 429:
-                    await asyncio.sleep(1 + intento)
-                    continue
-                    
-                break
-            except Exception as e:
-                logger.warning(f"[FMP] Error conectando para {ticker}: {e}")
-                await asyncio.sleep(1 + intento)
-
-    if data:
-        await db.guardar_fmp_cache(ticker, data, clase)
-
-    return data
-
-
 def _chequear_fundamentales_accion(ticker: str, info: dict, filtros: dict) -> dict | None:
     try:
         if not info: return None
-        per = info.get('peRatioTTM') or 999
-        div_yield_dec = info.get('dividendYieldTTM', 0)
+        per = info.get('trailingPE') or info.get('forwardPE') or 999
+        div_yield_dec = info.get('dividendYield', 0)
         div_yield = div_yield_dec if div_yield_dec is not None else 0
-        div_rate = info.get('lastDiv', 0) or 0
+        div_rate = info.get('dividendRate', 0) or 0
         
         if not filtros["per_op"](per, filtros["max_per"]): return None
         if not filtros["div_op"](div_yield, filtros["min_div_pct"]): return None
         if not filtros["div_abs_op"](div_rate, filtros["min_div_abs"]): return None
         for fex in filtros["filtros_extra"]:
-            fmp_val = info.get(fex["key"])
-            if fmp_val is None or not fex["op"](float(fmp_val), fex["val"]): return None
+            yf_val = info.get(fex["key"])
+            if yf_val is None or not fex["op"](float(yf_val), fex["val"]): return None
             
         div_pct = round(div_yield * 100, 2)
         return {
@@ -641,16 +571,14 @@ def _chequear_fundamentales_accion(ticker: str, info: dict, filtros: dict) -> di
             "div_yield_pct": div_pct,
             "div_rate_abs": round(div_rate, 2),
         }
-    except Exception as e:
-        logger.debug(f"[FMP] Error {ticker} (Acciones): {e}")
-        return None
+    except Exception as e: logger.debug(f"[YF] Error {ticker} (Acciones): {e}")
 
 def _chequear_fundamentales_reit(ticker: str, info: dict, filtros_extra: list) -> dict | None:
     try:
         if not info: return None
-        div_yield_dec = info.get('dividendYieldTTM', 0)
+        div_yield_dec = info.get('dividendYield', 0)
         div_yield = div_yield_dec if div_yield_dec is not None else 0
-        p_ffo_proxy = info.get('pbRatioTTM', 999) or 999
+        p_ffo_proxy = info.get('priceToBook', 999) or 999
         
         for f in filtros_extra:
             if f["metrica"] == "dividend_yield" and not OPS.get(f["operador"], operator.ge)(div_yield * 100, f["valor"]): return None
@@ -663,20 +591,17 @@ def _chequear_fundamentales_reit(ticker: str, info: dict, filtros_extra: list) -
             "p_ffo_proxy": round(p_ffo_proxy, 2) if p_ffo_proxy != 999 else "N/A",
             "sector": info.get("sector", "Real Estate"),
         }
-    except Exception as e:
-        logger.debug(f"[FMP] Error {ticker} (REIT): {e}")
-        return None
+    except Exception as e: logger.debug(f"[YF] Error {ticker} (REIT): {e}")
 
 def _chequear_fundamentales_etf(ticker: str, info: dict, filtros_extra: list) -> dict | None:
     try:
         if not info: return None
-        aum = info.get('mktCap', 0) or 0
-        div_yield_dec = info.get('dividendYieldTTM', 0)
+        aum = info.get('totalAssets', 0) or info.get('marketCap', 0) or 0
+        div_yield_dec = info.get('yield', 0) or info.get('dividendYield', 0)
         div_yield = div_yield_dec if div_yield_dec is not None else 0
         
         for f in filtros_extra:
             if f["metrica"] == "aum" and not OPS.get(f["operador"], operator.ge)(aum, f["valor"]): return None
-            # Nota: TER ya no está tan claro en el profile gratuito de FMP.
         
         if aum <= 0: return None
         return {
@@ -685,32 +610,28 @@ def _chequear_fundamentales_etf(ticker: str, info: dict, filtros_extra: list) ->
             "aum_bn": round(aum / 1e9, 2),
             "div_yield_pct": round(div_yield * 100, 2),
         }
-    except Exception as e:
-        logger.debug(f"[FMP] Error {ticker} (ETF): {e}")
-        return None
+    except Exception as e: logger.debug(f"[YF] Error {ticker} (ETF): {e}")
 
 def _chequear_fundamentales_cripto(ticker: str, info: dict, filtros_extra: list) -> dict | None:
     try:
         if not info: return None
-        market_cap = info.get('mktCap', 0) or 0
+        market_cap = info.get('marketCap', 0) or 0
         for f in filtros_extra:
             if f["metrica"] == "market_cap" and not OPS.get(f["operador"], operator.ge)(market_cap, f["valor"]): return None
         if market_cap <= 0: return None
         return {
             "ticker": ticker,
             "market_cap_bn": round(market_cap / 1e9, 2),
-            "nombre": info.get("companyName", ticker),
+            "nombre": info.get("shortName", ticker),
         }
-    except Exception as e:
-        logger.debug(f"[FMP] Error {ticker} (Cripto): {e}")
-        return None
+    except Exception as e: logger.debug(f"[YF] Error {ticker} (Cripto): {e}")
 
 def _chequear_fundamentales_bono(ticker: str, info: dict, filtros_extra: list) -> dict | None:
     try:
         if not info: return None
-        div_yield_dec = info.get('dividendYieldTTM', 0)
+        div_yield_dec = info.get('yield', 0) or info.get('dividendYield', 0)
         div_yield = div_yield_dec if div_yield_dec is not None else 0
-        aum = info.get('mktCap', 0) or 0
+        aum = info.get('totalAssets', 0) or info.get('marketCap', 0) or 0
         for f in filtros_extra:
             if f["metrica"] == "dividend_yield" and not OPS.get(f["operador"], operator.ge)(div_yield * 100, f["valor"]): return None
         if div_yield <= 0 or aum <= 0: return None
@@ -718,18 +639,9 @@ def _chequear_fundamentales_bono(ticker: str, info: dict, filtros_extra: list) -
             "ticker": ticker,
             "ytm_proxy_pct": round(div_yield * 100, 2),
             "aum_bn": round(aum / 1e9, 2),
-            "nombre": info.get("companyName", ticker),
+            "nombre": info.get("shortName", ticker),
         }
-    except Exception as e:
-        logger.debug(f"[FMP] Error {ticker} (Bono): {e}")
-        return None
-
-# Inicializado explícitamente en lifespan para garantizar el event loop correcto de Uvicorn
-_PIPELINE_SEMA = None
-_CRON_SEMA = None
-_CRON_LOCK = None
-_QUICKCHART_SEMA = None
-
+    except Exception as e: logger.debug(f"[YF] Error {ticker} (Bono): {e}")
 
 
 async def _obtener_info_bulk(tickers: list[str], clase: str) -> dict:
@@ -1371,7 +1283,7 @@ async def comando_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
          InlineKeyboardButton("🚀 Growth Tech", callback_data="btn1click_growth")],
         [InlineKeyboardButton("🛡️ Blue Chips Seguras", callback_data="btn1click_blue"),
          InlineKeyboardButton("📉 Buscachollos", callback_data="btn1click_value")],
-        [InlineKeyboardButton("🔔 Configurar Alerta (6h)", callback_data="alerta_6")]],
+        [InlineKeyboardButton("🔔 Configurar Alerta (6h)", callback_data="alerta_6")],
         [InlineKeyboardButton("🔔 Configurar Alerta (12h)", callback_data="alerta_12")],
         [InlineKeyboardButton("🛑 Detener Alertas", callback_data="alerta_stop")]
     ])
@@ -1388,6 +1300,57 @@ async def manejador_botones(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     chat_id = update.effective_chat.id
+
+    # --- 1-Click Macros (Bypass Inteligente) ---
+    if query.data.startswith("btn1click_"):
+        modo = query.data.replace("btn1click_", "")
+        await query.edit_message_text("⏳ Ejecutando escáner determinístico ultra-rápido...")
+        
+        filtros = {}
+        clase = "ACCION"
+        if modo == "divs":
+            filtros = {"per_max": 9999, "dividendo_min": 5.0, "beta_max": 99, "sector": "__all__"}
+        elif modo == "growth":
+            filtros = {"per_max": 9999, "dividendo_min": 0, "beta_max": 99, "sector": "tecnologia"}
+        elif modo == "blue":
+            filtros = {"per_max": 20, "dividendo_min": 0, "beta_max": 1.0, "sector": "__all__"}
+        elif modo == "value":
+            filtros = {"per_max": 15, "dividendo_min": 0, "beta_max": 99, "sector": "__all__"}
+            
+        texto, grafico_bytes, ticker = await _pipeline_por_tabla(clase, filtros)
+
+        if not ticker:
+            await query.edit_message_text(texto or "❌ No se encontraron activos con estos filtros extremos hoy.")
+            return
+
+        fuente = await db.obtener_fuente_datos(chat_id)
+        fuente_info = FUENTES_DATOS.get(fuente, FUENTES_DATOS["yahoo"])
+        url_chart = fuente_info["url"].format(ticker=ticker)
+        broker_url = await db.obtener_broker_url(chat_id)
+        botones = []
+        if broker_url:
+            u = broker_url.replace("{ticker}", ticker) if "{ticker}" in broker_url else broker_url
+            botones.append([InlineKeyboardButton("Comprar en Broker 🛒", url=u)])
+        botones.append([InlineKeyboardButton(f"Ver en {fuente_info['nombre']} 📈", url=url_chart)])
+        teclado = InlineKeyboardMarkup(botones)
+
+        import io
+        from telegram import InputFile
+        try:
+            if grafico_bytes:
+                with io.BytesIO(grafico_bytes) as buf:
+                    await query.message.reply_photo(
+                        photo=InputFile(buf, filename=f"chart_{ticker}.webp"),
+                        caption=texto, reply_markup=teclado, parse_mode="HTML"
+                    )
+                try: await query.message.delete()
+                except Exception: pass
+            else:
+                await query.edit_message_text(texto, reply_markup=teclado, parse_mode="HTML")
+        except Exception as e:
+            logger.error(f"[MACRO] Error: {e}")
+            await query.edit_message_text(texto[:4096], parse_mode=None)
+        return
 
     # --- Ver Strikes ---
     if query.data == "ver_strikes":
@@ -1589,7 +1552,7 @@ async def manejador_botones(update: Update, context: ContextTypes.DEFAULT_TYPE):
          InlineKeyboardButton("🚀 Growth Tech", callback_data="btn1click_growth")],
         [InlineKeyboardButton("🛡️ Blue Chips Seguras", callback_data="btn1click_blue"),
          InlineKeyboardButton("📉 Buscachollos", callback_data="btn1click_value")],
-        [InlineKeyboardButton("🔔 Configurar Alerta (6h)", callback_data="alerta_6")]],
+        [InlineKeyboardButton("🔔 Configurar Alerta (6h)", callback_data="alerta_6")],
             [InlineKeyboardButton("🔔 Configurar Alerta (12h)", callback_data="alerta_12")],
             [InlineKeyboardButton("🛑 Detener Alertas", callback_data="alerta_stop")]
         ])
@@ -1905,7 +1868,9 @@ async def conversacion_inversor(update: Update, context: ContextTypes.DEFAULT_TY
             teclado_m = InlineKeyboardMarkup(botones_m)
             try:
                 if ruta_captura:
-                    await update.message.reply_photo(photo=InputFile(ruta_captura, filename=f"chart_{ticker}.webp"), caption=texto_final, reply_markup=teclado_m, parse_mode="HTML")
+                    import io
+                    with io.BytesIO(ruta_captura) as buf:
+                        await update.message.reply_photo(photo=InputFile(buf, filename=f"chart_{ticker}.webp"), caption=texto_final, reply_markup=teclado_m, parse_mode="HTML")
                 else:
                     await update.message.reply_text(texto_final, reply_markup=teclado_m, parse_mode="HTML")
                 await msg_espera.delete()
@@ -2041,6 +2006,7 @@ async def conversacion_inversor(update: Update, context: ContextTypes.DEFAULT_TY
 telegram_app = (
     Application.builder()
     .token(TELEGRAM_TOKEN)
+    .updater(None)
     .read_timeout(60)
     .write_timeout(60)
     .build()
@@ -2079,12 +2045,14 @@ telegram_app.add_handler(CommandHandler("comprar", comando_comprar))
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _PIPELINE_SEMA, _CRON_SEMA, _CRON_LOCK, _QUICKCHART_SEMA
-    _QUICKCHART_SEMA = asyncio.Semaphore(2), _QUICKCHART_SEMA
+    global _PIPELINE_SEMA, _CRON_SEMA, _CRON_LOCK, _QUICKCHART_SEMA, http_client
     _QUICKCHART_SEMA = asyncio.Semaphore(2)
     _PIPELINE_SEMA = asyncio.Semaphore(15)
     _CRON_SEMA = asyncio.Semaphore(5)
     _CRON_LOCK = asyncio.Lock()
+    import httpx
+    http_client = httpx.AsyncClient(timeout=15.0)
+    
     await db.inicializar_pool()
     await db.inicializar_db()
     await db.precargar_semillas_basicas()    # Asegura operatividad inmediata v4.3
@@ -2101,7 +2069,13 @@ async def lifespan(app: FastAPI):
     # --- INYECCIÓN DEL WEBHOOK SEGURO ---
     webhook_url = f"{RENDER_EXTERNAL_URL}/webhook/telegram"
     logger.info(f"[LIFESPAN] Configurando webhook en: {webhook_url}")
-    await telegram_app.bot.set_webhook(url=webhook_url, secret_token=CRON_SECRET)
+    try:
+        if CRON_SECRET:
+            await telegram_app.bot.set_webhook(url=webhook_url, secret_token=CRON_SECRET)
+        else:
+            await telegram_app.bot.set_webhook(url=webhook_url)
+    except Exception as e:
+        logger.error(f"[LIFESPAN] Webhook falló, servidor ignora excepción: {e}")
 
     await telegram_app.start()
     logger.info("[LIFESPAN] Bot de Telegram en modo Webhook protegido. Plataforma ONLINE.")
@@ -2314,14 +2288,14 @@ async def _ejecutar_alerta_usuario(tid: int, solicitud: str, fuente: str):
 
 
 _usuarios_en_cron = set()
-_CRON_SEMA = None
-_CRON_LOCK = None
-_QUICKCHART_SEMA = None
 
 
 async def procesador_lotes_cron(lista_usuarios: list):
     """Procesa alertas con concurrencia controlada para equilibrar carga y velocidad."""
     async def _worker_usuario(item):
+        if _CRON_SEMA is None:
+            logger.error("[CRON] Semáforo no inicializado")
+            return
         async with _CRON_SEMA:
             tid = item['tid']
             try:
@@ -2396,7 +2370,7 @@ async def cron_ejecutar(request: Request, background_tasks: BackgroundTasks):
                         text="💳 <b>Alerta Cron Pausada</b>\n\nSin créditos. Recarga y reactiva desde /menu.",
                         parse_mode="HTML", reply_markup=teclado_pago
                     )
-                except Exception as e:\n            logger.debug(f'Ignorado: {e}')
+                except Exception as e: logger.debug(f'Ignorado: {e}')
                 continue
 
             async with _CRON_LOCK:

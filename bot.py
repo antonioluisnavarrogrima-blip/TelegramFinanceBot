@@ -443,15 +443,16 @@ async def fabricante_de_graficos(ticker: str, periodo: str = "3mo") -> tuple[byt
         logger.error(f"[CHART] Error generando gráfico para {ticker}: {e}")
         return None, 0.0
 
+_REGEX_URL = re.compile(
+    r'^(?:http|ftp)s?://'
+    r'(?:(?:[A-Z0-9](?:[A-Z0-9-]{0,61}[A-Z0-9])?\.)+(?:[A-Z]{2,6}\.?|[A-Z0-9-]{2,}\.?)|'
+    r'localhost|'
+    r'\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})'
+    r'(?::\d+)?'
+    r'(?:/?|[/?]\S+)$', re.IGNORECASE)
+
 def es_url_valida(texto: str) -> bool:
-    regex = re.compile(
-        r'^(?:http|ftp)s?://'
-        r'(?:(?:[A-Z0-9](?:[A-Z0-9-]{0,61}[A-Z0-9])?\.)+(?:[A-Z]{2,6}\.?|[A-Z0-9-]{2,}\.?)|'
-        r'localhost|'
-        r'\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})'
-        r'(?::\d+)?'
-        r'(?:/?|[/?]\S+)$', re.IGNORECASE)
-    return re.match(regex, texto) is not None
+    return bool(_REGEX_URL.match(texto))
 
 
 def extraer_url(texto: str) -> str | None:
@@ -568,11 +569,11 @@ def _construir_filtros(perfil: str, filtros_dinamicos: list) -> dict:
             filtros["min_div_abs"] = valor
             filtros["div_abs_op"] = OPS.get(operador_str, operator.ge)
 
-        elif metrica in METRICAS_YF:
+        elif metrica in METRICAS_FMP:
             if metrica in METRICAS_PORCENTUALES and valor > 1:
                 valor /= 100.0
             filtros["filtros_extra"].append({
-                "key": METRICAS_YF[metrica],
+                "key": METRICAS_FMP[metrica],
                 "op": OPS.get(operador_str, operator.ge),
                 "val": valor,
             })
@@ -665,7 +666,9 @@ async def _chequear_fundamentales_accion(ticker: str, filtros: dict) -> dict | N
             "div_yield_pct": div_pct,
             "div_rate_abs": round(div_rate, 2),
         }
-    except Exception: return None
+    except Exception as e:
+        logger.debug(f"[FMP] Error {ticker} (Acciones): {e}")
+        return None
 
 async def _chequear_fundamentales_reit(ticker: str, filtros_extra: list) -> dict | None:
     try:
@@ -686,7 +689,9 @@ async def _chequear_fundamentales_reit(ticker: str, filtros_extra: list) -> dict
             "p_ffo_proxy": round(p_ffo_proxy, 2) if p_ffo_proxy != 999 else "N/A",
             "sector": info.get("sector", "Real Estate"),
         }
-    except Exception: return None
+    except Exception as e:
+        logger.debug(f"[FMP] Error {ticker} (REIT): {e}")
+        return None
 
 async def _chequear_fundamentales_etf(ticker: str, filtros_extra: list) -> dict | None:
     try:
@@ -707,7 +712,9 @@ async def _chequear_fundamentales_etf(ticker: str, filtros_extra: list) -> dict 
             "aum_bn": round(aum / 1e9, 2),
             "div_yield_pct": round(div_yield * 100, 2),
         }
-    except Exception: return None
+    except Exception as e:
+        logger.debug(f"[FMP] Error {ticker} (ETF): {e}")
+        return None
 
 async def _chequear_fundamentales_cripto(ticker: str, filtros_extra: list) -> dict | None:
     try:
@@ -722,7 +729,9 @@ async def _chequear_fundamentales_cripto(ticker: str, filtros_extra: list) -> di
             "market_cap_bn": round(market_cap / 1e9, 2),
             "nombre": info.get("companyName", ticker),
         }
-    except Exception: return None
+    except Exception as e:
+        logger.debug(f"[FMP] Error {ticker} (Cripto): {e}")
+        return None
 
 async def _chequear_fundamentales_bono(ticker: str, filtros_extra: list) -> dict | None:
     try:
@@ -740,7 +749,9 @@ async def _chequear_fundamentales_bono(ticker: str, filtros_extra: list) -> dict
             "aum_bn": round(aum / 1e9, 2),
             "nombre": info.get("companyName", ticker),
         }
-    except Exception: return None
+    except Exception as e:
+        logger.debug(f"[FMP] Error {ticker} (Bono): {e}")
+        return None
 
 # Inicializado explícitamente en lifespan para garantizar el event loop correcto de Uvicorn
 _PIPELINE_SEMA: asyncio.Semaphore = None
@@ -942,11 +953,17 @@ async def _pipeline_hibrido_interno(
         rendimiento_objetivo = filtros.get("rendimiento_objetivo", 0.0)
         rendimiento_op = filtros.get("rendimiento_op", operator.ge)
 
-    for gan in pre_ganadores:
-        t = gan["ticker"]
-        buf_graf, rend = await fabricante_de_graficos(t, temporalidad)
+    # Parallel chart request
+    tareas_graf = [fabricante_de_graficos(gan["ticker"], temporalidad) for gan in pre_ganadores]
+    resultados_graf = await asyncio.gather(*tareas_graf, return_exceptions=True)
+
+    for i, res_graf in enumerate(resultados_graf):
+        if isinstance(res_graf, Exception):
+            continue
+            
+        buf_graf, rend = res_graf
         if rend is not None and rendimiento_op(rend, rendimiento_objetivo):
-            mejor_opcion = gan
+            mejor_opcion = pre_ganadores[i]
             mejor_opcion["rendimiento_real"] = round(rend, 2)
             ruta_captura_final = buf_graf
             break
@@ -1098,11 +1115,16 @@ async def _pipeline_por_tabla(
     mejor = None
     grafico_bytes = None
     temporalidad  = "1mo" if clase_activo == "CRIPTO" else "3mo"
-    for gan in ganadores:
-        buf_graf, rend = await fabricante_de_graficos(gan["ticker"], temporalidad)
+    tareas_graf = [fabricante_de_graficos(gan["ticker"], temporalidad) for gan in ganadores]
+    resultados_graf = await asyncio.gather(*tareas_graf, return_exceptions=True)
+
+    for i, res_graf in enumerate(resultados_graf):
+        if isinstance(res_graf, Exception):
+            continue
+        buf_graf, rend = res_graf
         if rend is not None:
-            gan["rendimiento_real"] = round(rend, 2)
-            mejor = gan
+            ganadores[i]["rendimiento_real"] = round(rend, 2)
+            mejor = ganadores[i]
             grafico_bytes = buf_graf
             break
     if not mejor:
@@ -1599,7 +1621,7 @@ async def manejador_botones(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # EL FIX: Inyectar orden secreta para evitar bucle de tickers idénticos
         busqueda_forzada = busqueda + " (IMPORTANTE: Esto es un reintento. Dame 10 tickers COMPLETAMENTE DISTINTOS a los habituales. Sé muy flexible con los números)."
         
-        texto_final, ruta_captura, url_compra, ticker = await pipeline_hibrido(
+        texto_final, grafico_bytes, url_compra, ticker = await pipeline_hibrido(
             busqueda_forzada, msg_espera=msg_espera, fuente_datos=fuente
         )
 
@@ -1636,18 +1658,20 @@ async def manejador_botones(update: Update, context: ContextTypes.DEFAULT_TYPE):
         teclado = InlineKeyboardMarkup(botones)
 
         try:
-            if ruta_captura:
+            if grafico_bytes:
                 try:
-                    if len(texto_final) > 1000:
-                        await context.bot.send_photo(chat_id=chat_id, photo=InputFile(ruta_captura, filename=f"chart_{ticker}.webp"), read_timeout=60, write_timeout=60, connect_timeout=60)
-                        await context.bot.send_message(chat_id=chat_id, text=texto_final, reply_markup=teclado, parse_mode="HTML")
-                    else:
-                        await context.bot.send_photo(
-                            chat_id=chat_id, photo=InputFile(ruta_captura, filename=f"chart_{ticker}.webp"), caption=texto_final,
-                            reply_markup=teclado, read_timeout=60, write_timeout=60, connect_timeout=60,
-                            parse_mode="HTML"
-                        )
-                except Exception:
+                    with io.BytesIO(grafico_bytes) as buf:
+                        if len(texto_final) > 1000:
+                            await context.bot.send_photo(chat_id=chat_id, photo=InputFile(buf, filename=f"chart_{ticker}.webp"), read_timeout=60, write_timeout=60, connect_timeout=60)
+                            await context.bot.send_message(chat_id=chat_id, text=texto_final, reply_markup=teclado, parse_mode="HTML")
+                        else:
+                            await context.bot.send_photo(
+                                chat_id=chat_id, photo=InputFile(buf, filename=f"chart_{ticker}.webp"), caption=texto_final,
+                                reply_markup=teclado, read_timeout=60, write_timeout=60, connect_timeout=60,
+                                parse_mode="HTML"
+                            )
+                except Exception as e:
+                    logger.warning(f"[UI] Fallo foto reintento, usando texto: {e}")
                     await context.bot.send_message(chat_id=chat_id, text=texto_final, reply_markup=teclado, parse_mode="HTML")
             else:
                 await context.bot.send_message(chat_id=chat_id, text=texto_final, reply_markup=teclado, parse_mode="HTML")
@@ -1905,7 +1929,7 @@ async def conversacion_inversor(update: Update, context: ContextTypes.DEFAULT_TY
     msg_espera = await update.message.reply_text("⏳ Conectando con los Agentes Quants...")
 
     fuente = await db.obtener_fuente_datos(tid)
-    texto_final, ruta_captura, url_compra, ticker = await pipeline_hibrido(
+    texto_final, grafico_bytes, url_compra, ticker = await pipeline_hibrido(
         solicitud, msg_espera, fuente_datos=fuente
     )
 
@@ -1943,19 +1967,21 @@ async def conversacion_inversor(update: Update, context: ContextTypes.DEFAULT_TY
     teclado = InlineKeyboardMarkup(botones)
 
     try:
-        if ruta_captura:
+        if grafico_bytes:
             try:
-                if len(texto_final) > 1000:
-                    await update.message.reply_photo(photo=InputFile(ruta_captura, filename=f"chart_{ticker}.webp"), read_timeout=60, write_timeout=60, connect_timeout=60)
-                    await update.message.reply_text(texto_final, reply_markup=teclado, parse_mode="HTML")
-                else:
-                    await update.message.reply_photo(
-                        photo=InputFile(ruta_captura, filename=f"chart_{ticker}.webp"), caption=texto_final,
-                        reply_markup=teclado, read_timeout=60, write_timeout=60, connect_timeout=60, parse_mode="HTML"
-                    )
+                with io.BytesIO(grafico_bytes) as buf:
+                    if len(texto_final) > 1000:
+                        await update.message.reply_photo(photo=InputFile(buf, filename=f"chart_{ticker}.webp"), read_timeout=60, write_timeout=60, connect_timeout=60)
+                        await update.message.reply_text(texto_final, reply_markup=teclado, parse_mode="HTML")
+                    else:
+                        await update.message.reply_photo(
+                            photo=InputFile(buf, filename=f"chart_{ticker}.webp"), caption=texto_final,
+                            reply_markup=teclado, read_timeout=60, write_timeout=60, connect_timeout=60, parse_mode="HTML"
+                        )
             except BadRequest:
                 raise # Delegar al bloque de fallback exterior
-            except Exception:
+            except Exception as e:
+                logger.warning(f"[UI] Fallo envío foto original: {e}")
                 await update.message.reply_text(texto_final, reply_markup=teclado, parse_mode="HTML")
         else:
             await update.message.reply_text(texto_final, reply_markup=teclado, parse_mode="HTML")
@@ -1968,17 +1994,19 @@ async def conversacion_inversor(update: Update, context: ContextTypes.DEFAULT_TY
     except BadRequest as e:
         logger.warning(f"[UI] Fallback a texto crudo por posible HTML inválido: {e}")
         texto_limpio = re.sub(r'<[^>]+>', '', texto_final)
-        if ruta_captura:
+        if grafico_bytes:
             try:
-                if len(texto_limpio) > 1000:
-                    await update.message.reply_photo(photo=InputFile(ruta_captura, filename=f"chart_{ticker}.webp"), read_timeout=60, write_timeout=60, connect_timeout=60)
-                    await update.message.reply_text(texto_limpio, reply_markup=teclado, parse_mode=None)
-                else:
-                    await update.message.reply_photo(
-                        photo=InputFile(ruta_captura, filename=f"chart_{ticker}.webp"), caption=texto_limpio,
-                        reply_markup=teclado, read_timeout=60, write_timeout=60, connect_timeout=60, parse_mode=None
-                    )
-            except Exception:
+                with io.BytesIO(grafico_bytes) as buf:
+                    if len(texto_limpio) > 1000:
+                        await update.message.reply_photo(photo=InputFile(buf, filename=f"chart_{ticker}.webp"), read_timeout=60, write_timeout=60, connect_timeout=60)
+                        await update.message.reply_text(texto_limpio, reply_markup=teclado, parse_mode=None)
+                    else:
+                        await update.message.reply_photo(
+                            photo=InputFile(buf, filename=f"chart_{ticker}.webp"), caption=texto_limpio,
+                            reply_markup=teclado, read_timeout=60, write_timeout=60, connect_timeout=60, parse_mode=None
+                        )
+            except Exception as e:
+                logger.warning(f"[UI] Fallo envío foto fallback: {e}")
                 await update.message.reply_text(texto_limpio, reply_markup=teclado, parse_mode=None)
         else:
             await update.message.reply_text(texto_limpio, reply_markup=teclado, parse_mode=None)
@@ -1993,8 +2021,8 @@ async def conversacion_inversor(update: Update, context: ContextTypes.DEFAULT_TY
             await db.actualizar_creditos(tid, 1)
             logger.info(f"[FACTURACION] Reembolso de 1 crédito inyectado al usuario {tid} por fallo de entrega.")
             await msg_espera.edit_text("⚠️ El análisis se completó pero hubo un fallo al enviarte el gráfico. Se te ha devuelto el crédito.")
-        except Exception:
-            pass
+        except Exception as e:
+            logger.error(f"[FACTURACION] FALLO CRÍTICO en reembolso usuario {tid}: {e}")
 
 
 # ── APP DE TELEGRAM (nivel de módulo) ────────────────────────────────────────
@@ -2042,7 +2070,7 @@ telegram_app.add_handler(CommandHandler("comprar", comando_comprar))
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Gestiona el ciclo de vida del bot de Telegram junto a FastAPI/Uvicorn."""
-    global http_client, _PIPELINE_SEMA, _FMP_SEMA
+    global http_client, _PIPELINE_SEMA, _FMP_SEMA, _CRON_SEMA, _CRON_LOCK
     
     logger.info("[LIFESPAN] Iniciando Connection Pool Global (httpx)...")
     http_client = httpx.AsyncClient(
@@ -2053,7 +2081,9 @@ async def lifespan(app: FastAPI):
     # Inicializar semáforos en el event loop de Uvicorn (evita 'wrong loop' errors)
     _PIPELINE_SEMA = asyncio.Semaphore(2)
     _FMP_SEMA      = asyncio.Semaphore(5)
-    logger.info("[LIFESPAN] Semáforos Pipeline y FMP inicializados en el event loop de Uvicorn.")
+    _CRON_SEMA     = asyncio.Semaphore(5)
+    _CRON_LOCK     = asyncio.Lock()
+    logger.info("[LIFESPAN] Semáforos y Locks inicializados en el event loop de Uvicorn.")
 
     # ── STARTUP ──
     logger.info("[LIFESPAN] Conectando con Supabase...")
@@ -2208,7 +2238,7 @@ async def webhook_pago(request: Request):
 async def _ejecutar_alerta_usuario(tid: int, solicitud: str, fuente: str):
     """Ejecuta el pipeline para un usuario y le envía el resultado. Fire-and-forget."""
     try:
-        texto_final, ruta_captura, url_compra, ticker = await pipeline_hibrido(
+        texto_final, grafico_bytes, url_compra, ticker = await pipeline_hibrido(
             solicitud, msg_espera=None, fuente_datos=fuente
         )
         if not url_compra:
@@ -2242,35 +2272,39 @@ async def _ejecutar_alerta_usuario(tid: int, solicitud: str, fuente: str):
         teclado = InlineKeyboardMarkup(botones)
 
         try:
-            if ruta_captura:
+            if grafico_bytes:
                 try:
-                    # Margen súper conservador para el límite 1024 de Telegram API
-                    if len(texto_final) > 900:
-                        await telegram_app.bot.send_photo(chat_id=tid, photo=InputFile(ruta_captura, filename=f"chart_{ticker}.webp"))
-                        await telegram_app.bot.send_message(chat_id=tid, text=texto_final, reply_markup=teclado, parse_mode="HTML")
-                    else:
-                        await telegram_app.bot.send_photo(
-                            chat_id=tid, photo=InputFile(ruta_captura, filename=f"chart_{ticker}.webp"), caption=texto_final, reply_markup=teclado, parse_mode="HTML"
-                        )
+                    with io.BytesIO(grafico_bytes) as buf:
+                        # Margen súper conservador para el límite 1024 de Telegram API
+                        if len(texto_final) > 900:
+                            await telegram_app.bot.send_photo(chat_id=tid, photo=InputFile(buf, filename=f"chart_{ticker}.webp"))
+                            await telegram_app.bot.send_message(chat_id=tid, text=texto_final, reply_markup=teclado, parse_mode="HTML")
+                        else:
+                            await telegram_app.bot.send_photo(
+                                chat_id=tid, photo=InputFile(buf, filename=f"chart_{ticker}.webp"), caption=texto_final, reply_markup=teclado, parse_mode="HTML"
+                            )
                 except BadRequest:
                     raise # Delegar fallback HTML exterior
-                except Exception:
+                except Exception as e:
+                    logger.warning(f"[CRON] Error envío de foto: {e}")
                     await telegram_app.bot.send_message(chat_id=tid, text=texto_final, reply_markup=teclado, parse_mode="HTML")
             else:
                 await telegram_app.bot.send_message(chat_id=tid, text=texto_final, reply_markup=teclado, parse_mode="HTML")
         except BadRequest as e:
             logger.warning(f"[CRON UI] Fallback a texto crudo por posible HTML inválido: {e}")
             texto_limpio = re.sub(r'<[^>]+>', '', texto_final)
-            if ruta_captura:
+            if grafico_bytes:
                 try:
-                    if len(texto_limpio) > 900:
-                        await telegram_app.bot.send_photo(chat_id=tid, photo=InputFile(ruta_captura, filename=f"chart_{ticker}.webp"))
-                        await telegram_app.bot.send_message(chat_id=tid, text=texto_limpio, reply_markup=teclado, parse_mode=None)
-                    else:
-                        await telegram_app.bot.send_photo(
-                            chat_id=tid, photo=InputFile(ruta_captura, filename=f"chart_{ticker}.webp"), caption=texto_limpio, reply_markup=teclado, parse_mode=None
-                        )
-                except Exception:
+                    with io.BytesIO(grafico_bytes) as buf:
+                        if len(texto_limpio) > 900:
+                            await telegram_app.bot.send_photo(chat_id=tid, photo=InputFile(buf, filename=f"chart_{ticker}.webp"))
+                            await telegram_app.bot.send_message(chat_id=tid, text=texto_limpio, reply_markup=teclado, parse_mode=None)
+                        else:
+                            await telegram_app.bot.send_photo(
+                                chat_id=tid, photo=InputFile(buf, filename=f"chart_{ticker}.webp"), caption=texto_limpio, reply_markup=teclado, parse_mode=None
+                            )
+                except Exception as e:
+                    logger.warning(f"[CRON] Error envío de foto fallback: {e}")
                     await telegram_app.bot.send_message(chat_id=tid, text=texto_limpio, reply_markup=teclado, parse_mode=None)
             else:
                 await telegram_app.bot.send_message(chat_id=tid, text=texto_limpio, reply_markup=teclado, parse_mode=None)
@@ -2282,13 +2316,13 @@ async def _ejecutar_alerta_usuario(tid: int, solicitud: str, fuente: str):
 
 
 _usuarios_en_cron = set()
+_CRON_SEMA = None
+_CRON_LOCK = None
 
 async def procesador_lotes_cron(lista_usuarios: list):
     """Procesa alertas con concurrencia controlada para equilibrar carga y velocidad."""
-    semaforo_cron = asyncio.Semaphore(5) # Procesa 5 usuarios a la vez como máximo
-
     async def _worker_usuario(item):
-        async with semaforo_cron:
+        async with _CRON_SEMA:
             tid = item['tid']
             try:
                 # Jitter aleatorio (0 a 3s) para no golpear la DB o APIs exactamente a la vez
@@ -2365,11 +2399,11 @@ async def cron_ejecutar(request: Request, background_tasks: BackgroundTasks):
                 except Exception: pass
                 continue
 
-            if tid in _usuarios_en_cron:
-                omitidos += 1
-                continue
-
-            _usuarios_en_cron.add(tid)
+            async with _CRON_LOCK:
+                if tid in _usuarios_en_cron:
+                    omitidos += 1
+                    continue
+                _usuarios_en_cron.add(tid)
             lote_activo.append({"tid": tid, "solicitud": solicitud, "fuente": fuente})
             ids_por_bloquear.append(tid)
             ejecutados += 1

@@ -20,6 +20,15 @@ from fastapi import FastAPI, HTTPException, Request, BackgroundTasks, Response
 import uvicorn
 import stripe
 
+import requests
+from requests.adapters import HTTPAdapter
+
+# Crear una sesión global optimizada para alta concurrencia
+_YF_SESSION = requests.Session()
+_yf_adapter = HTTPAdapter(pool_connections=50, pool_maxsize=50)
+_YF_SESSION.mount('https://', _yf_adapter)
+_YF_SESSION.mount('http://', _yf_adapter)
+
 import database as db
 
 
@@ -171,7 +180,7 @@ TRADUCCIONES: {"PER bajo":{"metrica":"per","operador":"<","valor":45},"dividendo
 REGLAS: sector siempre lleno ("tecnologia","energia","general"...). Perfil: "Seguro"|"Riesgo"|"Balanceado". filtros_dinamicos como objeto por métrica(nunca con tickers)."""
     try:
         res = await client.aio.models.generate_content(
-            model='gemini-2.5-flash',
+            model='gemini-2.0-flash',
             contents=f"{prompt_sistema}\n\n[INPUT USUARIO]: {prompt_del_inversor}",
             config=types.GenerateContentConfig(
                 response_mime_type="application/json",
@@ -347,7 +356,7 @@ Ejemplo de Flash Note para BONO:
     """
     try:
         res = await client.aio.models.generate_content(
-            model='gemini-2.5-flash',
+            model='gemini-2.0-flash',
             contents=(
                 f"{prompt_sistema}\n\n"
                 f"Perfil Cliente: {perfil} | Sector/Categoría: {sector}\n"
@@ -366,9 +375,8 @@ Ejemplo de Flash Note para BONO:
 async def fabricante_de_graficos(ticker: str, periodo: str = "3mo") -> tuple[bytes | None, float]:
     """Genera un gráfico usando Yahoo Finance y QuickChart.io de forma asíncrona."""
     try:
-        import yfinance as yf
         hist = await asyncio.wait_for(
-            asyncio.to_thread(lambda: yf.Ticker(ticker).history(period=periodo)), timeout=10
+            asyncio.to_thread(lambda: yf.Ticker(ticker, session=_YF_SESSION).history(period=periodo)), timeout=10
         )
         
         if hist.empty or len(hist) < 2:
@@ -649,10 +657,9 @@ async def _obtener_info_bulk(tickers: list[str], clase: str) -> dict:
     faltantes = [t for t in tickers if t.upper() not in cached]
     
     if faltantes:
-        import yfinance as yf
         async def fetch_yf(t):
             try:
-                info = await asyncio.wait_for(asyncio.to_thread(lambda: yf.Ticker(t).info), timeout=15)
+                info = await asyncio.wait_for(asyncio.to_thread(lambda: yf.Ticker(t, session=_YF_SESSION).info), timeout=15)
                 return t.upper(), info
             except Exception as e:
                 logger.debug(f"[YF] Error fetching {t}: {e}")
@@ -1868,7 +1875,6 @@ async def conversacion_inversor(update: Update, context: ContextTypes.DEFAULT_TY
             teclado_m = InlineKeyboardMarkup(botones_m)
             try:
                 if ruta_captura:
-                    import io
                     with io.BytesIO(ruta_captura) as buf:
                         await update.message.reply_photo(photo=InputFile(buf, filename=f"chart_{ticker}.webp"), caption=texto_final, reply_markup=teclado_m, parse_mode="HTML")
                 else:
@@ -2050,7 +2056,6 @@ async def lifespan(app: FastAPI):
     _PIPELINE_SEMA = asyncio.Semaphore(15)
     _CRON_SEMA = asyncio.Semaphore(5)
     _CRON_LOCK = asyncio.Lock()
-    import httpx
     http_client = httpx.AsyncClient(timeout=15.0)
     
     await db.inicializar_pool()
@@ -2124,7 +2129,7 @@ async def health_gemini():
     try:
         # Reemplazo de asyncio.to_thread por asincronía nativa real (.aio)
         res = await client.aio.models.generate_content(
-            model='gemini-2.5-flash',
+            model='gemini-2.0-flash',
             contents="Responde solo con la palabra: OK"
         )
         result = {"status": "ok", "response": res.text.strip()[:50]}

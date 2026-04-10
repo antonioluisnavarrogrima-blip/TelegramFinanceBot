@@ -180,7 +180,7 @@ TRADUCCIONES: {"PER bajo":{"metrica":"per","operador":"<","valor":45},"dividendo
 REGLAS: sector siempre lleno ("tecnologia","energia","general"...). Perfil: "Seguro"|"Riesgo"|"Balanceado". filtros_dinamicos como objeto por métrica(nunca con tickers)."""
     try:
         res = await client.aio.models.generate_content(
-            model='gemini-2.0-flash',
+            model='gemini-2.5-flash',
             contents=f"{prompt_sistema}\n\n[INPUT USUARIO]: {prompt_del_inversor}",
             config=types.GenerateContentConfig(
                 response_mime_type="application/json",
@@ -356,7 +356,7 @@ Ejemplo de Flash Note para BONO:
     """
     try:
         res = await client.aio.models.generate_content(
-            model='gemini-2.0-flash',
+            model='gemini-2.5-flash',
             contents=(
                 f"{prompt_sistema}\n\n"
                 f"Perfil Cliente: {perfil} | Sector/Categoría: {sector}\n"
@@ -2129,7 +2129,7 @@ async def health_gemini():
     try:
         # Reemplazo de asyncio.to_thread por asincronía nativa real (.aio)
         res = await client.aio.models.generate_content(
-            model='gemini-2.0-flash',
+            model='gemini-2.5-flash',
             contents="Responde solo con la palabra: OK"
         )
         result = {"status": "ok", "response": res.text.strip()[:50]}

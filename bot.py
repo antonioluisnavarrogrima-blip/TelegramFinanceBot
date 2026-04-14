@@ -1,6 +1,8 @@
+import io
 import os
 import re
 import json
+import copy
 import time
 import random
 import logging
@@ -9,16 +11,28 @@ import asyncio
 import operator
 import sys
 import unicodedata
+import requests
 from contextlib import asynccontextmanager
 
 import httpx
 import stripe
+import uvicorn
 import yfinance as yf
 from google import genai
+from google.genai import types
 from dotenv import load_dotenv
-from fastapi import FastAPI, Request, Response
-from telegram import Update
-from telegram.ext import Application
+from fastapi import FastAPI, HTTPException, Request, Response, BackgroundTasks
+from telegram import (
+    Update, InputFile, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand
+)
+from telegram.constants import ParseMode
+from telegram.error import BadRequest
+from telegram.ext import (
+    Application, CommandHandler, CallbackQueryHandler,
+    MessageHandler, ContextTypes, filters
+)
+from telegram.ext import BotCommandScopeDefault
+import html as _html_stdlib
 
 import database as db
 
@@ -62,9 +76,12 @@ except Exception as e:
 http_client: httpx.AsyncClient = None
 
 # --- CONSTANTES Y REGEX ---
-STRIPE_WEBHOOK_SECRET = os.getenv("STRIPE_WEBHOOK_SECRET", "")
-CREDITOS_POR_COMPRA = _obtener_int_env("CREDITOS_POR_COMPRA", 10)
-STRIPE_PAYMENT_URL = "https://buy.stripe.com/28EcN70yD05tcjHgZm3VC00"
+STRIPE_WEBHOOK_SECRET    = os.getenv("STRIPE_WEBHOOK_SECRET", "")
+TELEGRAM_WEBHOOK_SECRET  = os.getenv("TELEGRAM_WEBHOOK_SECRET", "")
+CRON_SECRET              = os.getenv("CRON_SECRET", "")
+RENDER_EXTERNAL_URL      = os.getenv("RENDER_EXTERNAL_URL", "").rstrip("/")
+CREDITOS_POR_COMPRA      = _obtener_int_env("CREDITOS_POR_COMPRA", 10)
+STRIPE_PAYMENT_URL       = "https://buy.stripe.com/28EcN70yD05tcjHgZm3VC00"
 
 OPS = {
     ">": operator.gt, "<": operator.lt, ">=": operator.ge,
@@ -85,9 +102,12 @@ _REGEX_FINANCIERO = re.compile(
     re.IGNORECASE
 )
 
-# Semáforos para control de concurrencia en Render (Tier Gratis/Starter)
-_PIPELINE_SEMA = asyncio.Semaphore(10)
-_QUICKCHART_SEMA = asyncio.Semaphore(5)
+# Semáforos — se inicializan en lifespan() dentro del event loop de Uvicorn.
+# NUNCA instanciar asyncio.Semaphore/Lock a nivel de módulo (RuntimeError en Python 3.10+).
+_PIPELINE_SEMA:    asyncio.Semaphore | None = None
+_QUICKCHART_SEMA:  asyncio.Semaphore | None = None
+_CRON_SEMA:        asyncio.Semaphore | None = None
+_CRON_LOCK:        asyncio.Lock      | None = None
 
 def _normalizar_texto(texto: str) -> str:
     """Elimina diacríticos (tildes) para que el regex sea robusto ante inputs sin tilde."""
@@ -189,8 +209,12 @@ TABLA_CAMPOS = {
 # Rate-limit simple para /health/gemini (evitar gasto de tokens por monitores externos)
 _HEALTH_GEMINI_CACHE: dict = {"ts": 0.0, "data": None}
 
-# Sesion HTTP nula para yfinance (evita instanciar sesiones sincronas globales)
-_YF_SESSION = None
+# Caché de informes Goldman Sachs (TTL 2h por ticker) — ahorro directo de tokens Gemini
+_GOLDMAN_CACHE: dict = {}
+
+# Sesión HTTP para yfinance con cabeceras de browser real (anti-bloqueo en Render/AWS).
+# Se inicializa dentro del lifespan — necesita el event loop activo.
+_YF_SESSION: requests.Session | None = None
 
 # Regex anti-SSRF para validar URLs externas (bloquea IPs privadas y loopback)
 _REGEX_URL = re.compile(
@@ -235,7 +259,7 @@ async def extractor_intenciones(prompt_del_inversor: str) -> dict | None:
     
     if intent_hash in _INTENT_CACHE:
         cache_entry = _INTENT_CACHE[intent_hash]
-        if ahora - cache_entry['ts'] < 86400: # 24 horas de TTL
+        if ahora - cache_entry['ts'] < 259200: # 3 días de TTL
             logger.info("[CACHE] Intención semántica recuperada de caché.")
             return cache_entry['data']
         else:
@@ -366,7 +390,24 @@ _PROHIBICIONES_POR_CLASE = {
 }
 
 async def generador_informe_goldman(ticker: str, sector: str, datos: dict, perfil: str, clase_activo: str = "ACCION") -> str | None:
-    """Genera un informe estilo Goldman Sachs adaptado a la clase de activo (Asíncrono nativo)."""
+    """Genera un Flash Note estilo Goldman Sachs. Usa caché de 2h por ticker para no quemar tokens."""
+
+    # 0. Caché: si el mismo ticker fue analizado en las últimas 2 horas, devolver directo
+    cache_key = f"{ticker}_{clase_activo}_{perfil}"
+    ahora_gs = time.time()
+    if cache_key in _GOLDMAN_CACHE:
+        entrada = _GOLDMAN_CACHE[cache_key]
+        if ahora_gs - entrada["ts"] < 21600:  # TTL 6 horas (los fundamentales no cambian en ese lapso)
+            logger.info(f"[GOLDMAN CACHE] Hit para {ticker} — 0 tokens consumidos.")
+            return entrada["texto"]
+        else:
+            _GOLDMAN_CACHE.pop(cache_key, None)
+
+    # Purga proactiva del caché Goldman si supera 500 entradas
+    if len(_GOLDMAN_CACHE) >= 500:
+        claves_viejas = list(_GOLDMAN_CACHE.keys())[:100]
+        for k in claves_viejas:
+            _GOLDMAN_CACHE.pop(k, None)
 
     # 1. Sanitización de datos (Mantenemos los 0, ignoramos nulos)
     datos_limpios = {
@@ -374,42 +415,39 @@ async def generador_informe_goldman(ticker: str, sector: str, datos: dict, perfi
         if v is not None and str(v).strip().upper() != "N/A"
     }
 
-    # 2. Obtención de contexto específico
+    # 2. Contexto específico según clase
     ejemplo = _EJEMPLOS_POR_CLASE.get(clase_activo, _EJEMPLOS_POR_CLASE["ACCION"])
     restricciones = _PROHIBICIONES_POR_CLASE.get(clase_activo, "")
 
-    # 3. Prompt unificado sin contradicciones lógicas
-    prompt_sistema = f"""Rol: Director C-Level Quant.
-Escribe un Flash Note institucional, crudo, ultracorto.
-LIMITADO a máximo 3 bullets directos al punto para reducir tokens.
-Clase de Activo: {clase_activo}
-Restricciones de Dominio: {restricciones}
-
-ESTRUCTURA ESTRICTA (Usa <b> y <i> de HTML, PROHIBIDO Markdown o asteriscos):
-🎯 <b>Tesis:</b> [1 frase lapidaria]
-📊 <b>Datos:</b> [Max 3 viñetas con métricas reales provistas]
-⚖️ <b>Veredicto:</b> [Conclusión 1 frase]
-
-{ejemplo}"""
+    # 3. Prompt compacto (mínimo tokens, máximo precisión)
+    prompt_sistema = (
+        f"Quant Director. Flash Note {clase_activo}. 3 bullets MAX. "
+        f"HTML solo <b><i>. SIN markdown/asteriscos. "
+        f"{restricciones} "
+        f"Estructura: f3af<b>Tesis:</b> [1 frase] | f4ca<b>Datos:</b> [métricas] | ⚖️<b>Veredicto:</b> [1 frase]\n"
+        f"{ejemplo}"
+    )
 
     try:
         res = await client.aio.models.generate_content(
-            model='gemini-2.5-flash',
+            model='gemini-2.0-flash-lite',  # P3: coste ~10x menor que 2.5-flash para resúmenes
             contents=(
-                f"{prompt_sistema}\n\n"
-                f"Perfil Cliente: {perfil} | Sector/Categoría: {sector}\n"
-                # separators=(',', ':') elimina espacios en blanco inútiles en el JSON, ahorrando tokens de input
-                f"[DATOS VERIFICADOS DE {ticker}]: {json.dumps(datos_limpios, separators=(',', ':'))}"
+                f"{prompt_sistema}\n"
+                f"Perfil:{perfil}|Sector:{sector}|"  # separadores compactos
+                f"[{ticker}]:{json.dumps(datos_limpios, separators=(',', ':'))}"
             )
         )
-        
+
         # 4. Blindaje contra bloqueos de seguridad de Gemini
         if not res.candidates or not getattr(res.candidates[0].content, "parts", None):
             logger.warning(f"[GOLDMAN] Respuesta de {ticker} bloqueada por filtros de seguridad.")
             return "<i>Análisis no disponible temporalmente por filtros de contenido.</i>"
 
-        # 5. Limpieza residual de seguridad (por si la IA ignora la orden HTML)
+        # 5. Limpieza residual
         texto = res.text.replace('**', '<b>').replace('*', '').strip()
+
+        # 6. Guardar en caché
+        _GOLDMAN_CACHE[cache_key] = {"ts": ahora_gs, "texto": texto}
         return texto
         
     except Exception as e:
@@ -418,75 +456,83 @@ ESTRUCTURA ESTRICTA (Usa <b> y <i> de HTML, PROHIBIDO Markdown o asteriscos):
 
 # --- 2. HERRAMIENTAS MATEMÁTICAS LOCALES ---
 async def fabricante_de_graficos(ticker: str, periodo: str = "3mo") -> tuple[bytes | None, float]:
-    """Genera un gráfico usando Yahoo Finance y QuickChart.io de forma asíncrona."""
-    try:
-        # 1. Eliminada la sesión síncrona (_YF_SESSION) que borramos en la inicialización
-        hist = await asyncio.wait_for(
-            asyncio.to_thread(lambda: yf.Ticker(ticker).history(period=periodo)), timeout=10.0
-        )
-        
-        # 2. Saneamiento estricto: Eliminar filas con NaNs que rompen el JSON y las matemáticas
-        hist = hist.dropna(subset=['Close'])
-        
-        if hist.empty or len(hist) < 2:
-            return None, 0.0
-            
-        labels = hist.index.strftime('%Y-%m-%d').tolist()
-        prices = [round(float(p), 2) for p in hist['Close'].tolist()]
-        
-        # 3. Prevención de ZeroDivisionError
-        p_inicial = prices[0]
-        p_final = prices[-1]
-        rendimiento = 0.0 if p_inicial == 0 else ((p_final - p_inicial) / p_inicial) * 100
-        
-        color = "rgb(44, 160, 44)" if rendimiento >= 0 else "rgb(214, 39, 40)"
-        
-        qc_payload = {
-            "chart": {
-                "type": "line",
-                "data": {
-                    "labels": labels,
-                    "datasets": [{
-                        "label": f"Precio {ticker}",
-                        "data": prices,
-                        "borderColor": color,
-                        "backgroundColor": "rgba(0,0,0,0)",
-                        "borderWidth": 2,
-                        "pointRadius": 0
-                    }]
-                },
-                "options": {
-                    "legend": {"display": False},
-                    "title": {"display": True, "text": f"Evolución {ticker} ({periodo})"}
-                }
+    """Genera gráfico via Yahoo Finance + QuickChart. Retry interno 2x con backoff para evitar ban."""
+    hist = None
+    for intento in range(3):  # hasta 3 intentos con backoff (0s, 1s, 3s)
+        try:
+            hist = await asyncio.wait_for(
+                asyncio.to_thread(lambda: yf.Ticker(ticker, session=_YF_SESSION).history(period=periodo)),
+                timeout=10.0
+            )
+            hist = hist.dropna(subset=['Close'])
+            if not hist.empty and len(hist) >= 2:
+                break  # datos válidos obtenidos
+            logger.warning(f"[YF] Datos vacíos para {ticker} (intento {intento+1}/3)")
+        except asyncio.TimeoutError:
+            logger.warning(f"[YF] Timeout descargando {ticker} (intento {intento+1}/3)")
+            hist = None
+        except Exception as e:
+            logger.warning(f"[YF] Error descargando {ticker} (intento {intento+1}/3): {e}")
+            hist = None
+        if intento < 2:
+            await asyncio.sleep([0, 1, 3][intento + 1])
+
+    if hist is None or hist.empty or len(hist) < 2:
+        return None, 0.0
+
+    labels = hist.index.strftime('%Y-%m-%d').tolist()
+    prices = [round(float(p), 2) for p in hist['Close'].tolist()]
+
+    p_inicial = prices[0]
+    p_final   = prices[-1]
+    rendimiento = 0.0 if p_inicial == 0 else ((p_final - p_inicial) / p_inicial) * 100
+    color = "rgb(44,160,44)" if rendimiento >= 0 else "rgb(214,39,40)"
+
+    qc_payload = {
+        "chart": {
+            "type": "line",
+            "data": {
+                "labels": labels,
+                "datasets": [{
+                    "label": ticker,
+                    "data": prices,
+                    "borderColor": color,
+                    "backgroundColor": "rgba(0,0,0,0)",
+                    "borderWidth": 2,
+                    "pointRadius": 0
+                }]
             },
-            "width": 600,
-            "height": 300,
-            "format": "webp"
-        }
-        
-        global _QUICKCHART_SEMA, http_client
-        # 4. Timeout estricto de 8 segundos para evitar bloqueos del Event Loop si QuickChart cae
-        kwargs = {"json": qc_payload, "timeout": 8.0}
-        
-        if _QUICKCHART_SEMA is not None:
-            async with _QUICKCHART_SEMA:
-                resp_qc = await http_client.post("https://quickchart.io/chart", **kwargs)
-        else:
+            "options": {
+                "legend": {"display": False},
+                "title": {"display": True, "text": f"{ticker} ({periodo})"}
+            }
+        },
+        "width": 600, "height": 300, "format": "webp"
+    }
+
+    global _QUICKCHART_SEMA, http_client
+    kwargs = {"json": qc_payload, "timeout": 8.0}
+
+    try:
+        # P5: Guard — si el semáforo no está listo, abortar limpiamente
+        if _QUICKCHART_SEMA is None:
+            logger.warning("[CHART] _QUICKCHART_SEMA no inicializado todavía (cold-start), omitiendo gráfico.")
+            return None, rendimiento
+        async with _QUICKCHART_SEMA:
             resp_qc = await http_client.post("https://quickchart.io/chart", **kwargs)
-            
+
         if resp_qc.status_code == 200:
             return resp_qc.content, rendimiento
-            
-        logger.error(f"[CHART] QuickChart devolvió HTTP {resp_qc.status_code} para {ticker}")
+
+        logger.error(f"[CHART] QuickChart HTTP {resp_qc.status_code} para {ticker}")
         return None, rendimiento
-        
+
     except asyncio.TimeoutError:
-        logger.warning(f"[CHART] Timeout obteniendo datos (YF/QuickChart) para {ticker}")
-        return None, 0.0
+        logger.warning(f"[CHART] Timeout QuickChart para {ticker}")
+        return None, rendimiento
     except Exception as e:
-        logger.error(f"[CHART] Error generando gráfico para {ticker}: {e}")
-        return None, 0.0
+        logger.error(f"[CHART] Error QuickChart para {ticker}: {e}")
+        return None, rendimiento
 
 def es_url_valida(texto: str) -> bool:
     if not texto or not isinstance(texto, str): return False
@@ -500,7 +546,6 @@ def extraer_url(texto: str) -> str | None:
         if es_url_valida(url_limpia):
             return url_limpia
     return None
-import html as _html_stdlib
 
 # Tags HTML soportados por Telegram (modo HTML estricto)
 _TELEGRAM_TAGS = re.compile(r'(</?(?:b|i|u|s|code|pre|a|tg-spoiler)[^>]*>)', re.IGNORECASE)
@@ -724,59 +769,76 @@ def _chequear_fundamentales_bono(ticker: str, info: dict, filtros_extra: list) -
 async def _obtener_info_bulk(tickers: list[str], clase: str) -> dict:
     cached = await db.obtener_yf_cache_bulk(tickers)
     faltantes = [t for t in tickers if t.upper() not in cached]
-    
+
     if faltantes:
-        async def fetch_yf(t):
+        async def fetch_yf(t: str):
+            """Descarga info de yfinance con sesión browser y fallback a fast_info."""
             try:
-                info = await asyncio.wait_for(asyncio.to_thread(lambda: yf.Ticker(t, session=_YF_SESSION).info), timeout=15)
+                info = await asyncio.wait_for(
+                    asyncio.to_thread(lambda: yf.Ticker(t, session=_YF_SESSION).info),
+                    timeout=15
+                )
+                # Detectar bloqueo silencioso: Yahoo devuelve {} o solo trailingPegRatio
+                claves_validas = {k for k, v in info.items() if v is not None and k != 'trailingPegRatio'}
+                if len(claves_validas) < 3:
+                    logger.warning(f"[YF] Bloqueo silencioso detectado para {t}, reintentando con fast_info...")
+                    await asyncio.sleep(2)
+                    # Fallback: fast_info tiene menos datos pero no suele ser bloqueado
+                    fi = await asyncio.wait_for(
+                        asyncio.to_thread(lambda: dict(yf.Ticker(t, session=_YF_SESSION).fast_info)),
+                        timeout=10
+                    )
+                    if fi:
+                        info = fi
                 return t.upper(), info
             except Exception as e:
                 logger.debug(f"[YF] Error fetching {t}: {e}")
                 return t.upper(), {}
-                
+
         resultados = []
-        for i in range(0, len(faltantes), 5):
-            lote = faltantes[i:i+5]
+        for i in range(0, len(faltantes), 3):   # lotes de 3 (era 5) — más respetuoso con YF
+            lote = faltantes[i:i+3]
             res_lote = await asyncio.gather(*(fetch_yf(t) for t in lote))
             resultados.extend(res_lote)
-            if i + 5 < len(faltantes):
-                await asyncio.sleep(0.5)
+            if i + 3 < len(faltantes):
+                await asyncio.sleep(1.0)        # 1s entre lotes (era 0.5s)
 
         nuevos_datos = {}
+        # FIX #4: Solo inyectar en caché si el dict contiene mírimas necesarias.
+        # Un dict {trailingPegRatio: None} pasa `if info:` pero es bloqueo silencioso de Yahoo.
+        _METRICAS_MINIMAS = {"regularMarketPrice", "currentPrice", "previousClose",
+                             "trailingPE", "dividendYield", "marketCap",
+                             "lastPrice", "regularMarketOpen"}  # fast_info keys incluidas
         for t, info in resultados:
-            if info:
-                nuevos_datos[t] = info
-                cached[t] = info
-                
+            if not info:
+                continue
+            claves_presentes = set(info.keys()) & _METRICAS_MINIMAS
+            if not claves_presentes:
+                logger.debug(f"[YF CACHE] Rechazando {t}: sin métricas mínimas (posible bloqueo silencioso).")
+                continue
+            nuevos_datos[t] = info
+            cached[t] = info
+
         if nuevos_datos:
             await db.guardar_yf_cache_bulk(nuevos_datos, clase)
-            
+
     return cached
 
 async def pipeline_hibrido(solicitud: str, msg_espera=None, fuente_datos: str = "yahoo"):
-    global _PIPELINE_SEMA
-    async with _PIPELINE_SEMA:
-        return await _pipeline_hibrido_interno(solicitud, msg_espera, fuente_datos)
-
-async def _pipeline_hibrido_interno(
-    solicitud: str,
-    msg_espera=None,
-    fuente_datos: str = "yahoo"
-) -> tuple[str | None, str | None, str | None, str | None]:
-    """Orquesta Extractor → Filtro Fundamentales → Gráfico → Generador Goldman Sachs.
-    Soporta: ACCION, REIT, ETF, CRIPTO, BONO.
-    Retorna SIEMPRE 4 valores: (texto_final, ruta_grafico, url_compra, ticker_final)
+    """Wrapper: ejecuta la fase NLP (barata/Gemini) fuera del semáforo y la fase
+    intensiva de I/O (Yahoo/QuickChart) dentro. Así el semáforo no bloquea durante
+    los reintentos NLP de 10-20 segundos.
     """
-    # 1. Extracción de intenciones con IA (con reintentos async no bloqueantes)
-    # Se ejecuta en el executor global para no bloquear el event loop de asyncio
+    if _PIPELINE_SEMA is None:
+        raise HTTPException(status_code=503, detail="Bot iniciando, reintenta en 5s")
+
+    # --- FASE 1: NLP (fuera del semáforo — no consume slot de concurrencia YF) ---
     if msg_espera:
         try: await msg_espera.edit_text("🔍 Analizando tipo de activo e infiriendo perfil del inversor...")
         except BadRequest: pass
 
     extraccion = None
-    esperas_retry = [10, 20]
-    for i_retry, espera_retry in enumerate(esperas_retry + [None]):
-        # Llamada asíncrona nativa a Gemini
+    for i_retry, espera_retry in enumerate([10, 20, None]):
         extraccion = await extractor_intenciones(solicitud)
         if extraccion and extraccion.get("_rate_limit"):
             if espera_retry is not None:
@@ -784,17 +846,29 @@ async def _pipeline_hibrido_interno(
                 if msg_espera:
                     try: await msg_espera.edit_text(f"⏳ Motor IA ocupado, reintentando en {espera_retry}s...")
                     except BadRequest: pass
-                await asyncio.sleep(espera_retry)
+                await asyncio.sleep(espera_retry)  # duerme FUERA del semáforo
                 continue
             else:
                 return "⚠️ El motor IA está temporalmente saturado. Por favor, espera 1 minuto e inténtalo de nuevo.", None, None, None
-        break  # éxito o error no relacionado con rate limit
+        break
 
+    # --- FASE 2: I/O intensiva (dentro del semáforo) ---
+    async with _PIPELINE_SEMA:
+        return await _pipeline_hibrido_interno(extraccion, solicitud, msg_espera, fuente_datos)
+
+async def _pipeline_hibrido_interno(
+    extraccion: dict | None,
+    solicitud: str,
+    msg_espera=None,
+    fuente_datos: str = "yahoo"
+) -> tuple[str | None, str | None, str | None, str | None]:
+    """Orquesta Filtro Fundamentales → Gráfico → Goldman Sachs.
+    La fase NLP ya se ejecutó en pipeline_hibrido() fuera del semáforo.
+    Retorna SIEMPRE 4 valores: (texto_final, ruta_grafico, url_compra, ticker_final)
+    """
     if extraccion and extraccion.get("error_api"):
-        # Marcador __TROLL__ para que conversacion_inversor pueda sumar strike
         return f"__TROLL__ ⚠️ {extraccion['error_api']}", None, None, None
 
-    # BUG FIX: el campo correcto del schema Pydantic es 'tickers_manuales', no 'tickers'
     _t_manuales = extraccion.get("tickers_manuales") if extraccion else None
     _t_legacy   = extraccion.get("tickers") if extraccion else None
     _hay_clase  = extraccion.get("clase_activo") if extraccion else None
@@ -814,18 +888,15 @@ async def _pipeline_hibrido_interno(
     sector_ia = extraccion.get("sector")
     filtros_dinamicos_raw = extraccion.get("filtros_dinamicos", [])
 
-    # 2. Obtención de Candidatos Determínística (La Tercera Vía)
     tickers = extraccion.get("tickers_manuales") or extraccion.get("tickers") or []
     if not tickers:
         if msg_espera:
             try: await msg_espera.edit_text(f"📡 Consultando terminal de activos para sector: <b>{sector_ia}</b>...", parse_mode="HTML")
             except BadRequest: pass
-        
         tickers = await db.obtener_semillas_busqueda(clase_activo, sector_ia)
-        # Fallback si el sector es demasiado específico
         if not tickers:
             tickers = await db.obtener_semillas_busqueda(clase_activo)
-    
+
     if not tickers:
         return "❌ No se han encontrado activos candidatos en el registro para esa categoría.", None, None, None
 
@@ -843,30 +914,35 @@ async def _pipeline_hibrido_interno(
             )
         except BadRequest: pass
 
-    # 2. Seleccionar checker según clase de activo (loop ya definido arriba)
-    # Se usa _YF_EXECUTOR (3 workers) para limitar la concurrencia con Yahoo Finance
     pre_ganadores = []
-    # Inicializar filtros con valores por defecto; se sobreescribirán si clase_activo == "ACCION"
     filtros: dict = {"temporalidad": "3mo", "rendimiento_objetivo": 0.0, "rendimiento_op": operator.ge}
 
-    # Dispatch por clase de activo
+    # --- Dispatch por clase ---
     if clase_activo == "ACCION":
-        filtros = _construir_filtros(perfil, filtros_dinamicos_raw)
-        # Paso proporcional: 15% del umbral pedido por intento (mínimo 0.5%pp)
-        _paso_div_pct = max(0.005, filtros["min_div_pct"] * 0.15)
+        # FIX #3: Inmutabilidad. Guardamos el estado base y hacemos deepcopy en cada intento
+        # para evitar que los multiplicadores de relajación se acumulen incorrectamente.
+        filtros_base = _construir_filtros(perfil, filtros_dinamicos_raw)
         max_intentos = 4
+
         for intento in range(max_intentos):
+            # Copia fresca en cada iteración: ningún intento hereda estado sucio del anterior
+            filtros = copy.deepcopy(filtros_base)
+
             if intento > 0:
                 if intento == max_intentos - 1:
-                    filtros["max_per"] = 99999
+                    # Último intento: filtros mínimos de emergencia
+                    filtros["max_per"]     = 99999
                     filtros["min_div_pct"] = 0.0
                     filtros["min_div_abs"] = 0.0
                 else:
+                    # Relajación progresiva proporcional al número de intento
+                    factor_per = 1.5 ** intento  # 1.5x, 2.25x …
+                    factor_div = 0.60 ** intento  # 60%, 36% …
                     if filtros["max_per"] < 99999:
-                        filtros["max_per"] *= 1.5 
-                    filtros["min_div_pct"] = max(0, filtros["min_div_pct"] * 0.60)
-                    filtros["min_div_abs"] = max(0, filtros["min_div_abs"] * 0.60)
-                
+                        filtros["max_per"] = min(filtros_base["max_per"] * factor_per, 99998)
+                    filtros["min_div_pct"] = max(0, filtros_base["min_div_pct"] * factor_div)
+                    filtros["min_div_abs"] = max(0, filtros_base["min_div_abs"] * factor_div)
+
                 if msg_espera:
                     try:
                         estado = "críticos" if intento == max_intentos - 1 else "relajados"
@@ -875,53 +951,41 @@ async def _pipeline_hibrido_interno(
                         )
                     except BadRequest: pass
                 await asyncio.sleep(0.5)
+
             filtros_snap = {
-                "max_per": filtros["max_per"], "min_div_pct": filtros["min_div_pct"],
-                "min_div_abs": filtros["min_div_abs"], "per_op": filtros["per_op"],
-                "div_op": filtros["div_op"], "div_abs_op": filtros["div_abs_op"],
+                "max_per":     filtros["max_per"],
+                "min_div_pct": filtros["min_div_pct"],
+                "min_div_abs": filtros["min_div_abs"],
+                "per_op":      filtros["per_op"],
+                "div_op":      filtros["div_op"],
+                "div_abs_op":  filtros["div_abs_op"],
                 "filtros_extra": list(filtros["filtros_extra"]),
             }
             datos_bulk = await _obtener_info_bulk(tickers, "ACCION")
             resultados = [_chequear_fundamentales_accion(t, datos_bulk.get(t, {}), filtros_snap) for t in tickers]
-            try:
-                pre_ganadores = [r for r in resultados if r is not None]
-            except asyncio.TimeoutError:
-                logger.warning(f"[PIPELINE] Timeout FMP en iter ACCION intento {intento}")
-                pre_ganadores = []
+            pre_ganadores = [r for r in resultados if r is not None]
             if pre_ganadores:
                 break
 
     elif clase_activo == "REIT":
         datos_bulk = await _obtener_info_bulk(tickers, "REIT")
         resultados = [_chequear_fundamentales_reit(t, datos_bulk.get(t, {}), filtros_dinamicos_raw) for t in tickers]
-        try:
-            pre_ganadores = [r for r in resultados if r is not None]
-        except asyncio.TimeoutError:
-            pre_ganadores = []
+        pre_ganadores = [r for r in resultados if r is not None]
 
     elif clase_activo == "ETF":
         datos_bulk = await _obtener_info_bulk(tickers, "ETF")
         resultados = [_chequear_fundamentales_etf(t, datos_bulk.get(t, {}), filtros_dinamicos_raw) for t in tickers]
-        try:
-            pre_ganadores = [r for r in resultados if r is not None]
-        except asyncio.TimeoutError:
-            pre_ganadores = []
+        pre_ganadores = [r for r in resultados if r is not None]
 
     elif clase_activo == "CRIPTO":
         datos_bulk = await _obtener_info_bulk(tickers, "CRIPTO")
         resultados = [_chequear_fundamentales_cripto(t, datos_bulk.get(t, {}), filtros_dinamicos_raw) for t in tickers]
-        try:
-            pre_ganadores = [r for r in resultados if r is not None]
-        except asyncio.TimeoutError:
-            pre_ganadores = []
+        pre_ganadores = [r for r in resultados if r is not None]
 
     elif clase_activo == "BONO":
         datos_bulk = await _obtener_info_bulk(tickers, "BONO")
         resultados = [_chequear_fundamentales_bono(t, datos_bulk.get(t, {}), filtros_dinamicos_raw) for t in tickers]
-        try:
-            pre_ganadores = [r for r in resultados if r is not None]
-        except asyncio.TimeoutError:
-            pre_ganadores = []
+        pre_ganadores = [r for r in resultados if r is not None]
 
     else:
         return f"❌ Clase de activo no reconocida: {clase_activo}.", None, None, None
@@ -932,47 +996,56 @@ async def _pipeline_hibrido_interno(
             None, None, f"FALLBACK_REQ_{clase_activo}"
         )
 
-    # 3. Filtro de rendimiento gráfico
+    # --- 3. Filtro de rendimiento gráfico (FIX #2: prefetch concurrente + ordenación) ---
     temporalidad = "3mo"
     if clase_activo == "ACCION":
         temporalidad = filtros.get("temporalidad", "3mo")
     elif clase_activo == "CRIPTO":
         temporalidad = "1mo"
 
-    if msg_espera:
-        try:
-            await msg_espera.edit_text(
-                f"🔥 ¡Criba superada por {len(pre_ganadores)} activos!\n"
-                f"Comprobando rendimiento histórico ({temporalidad})..."
-            )
-        except BadRequest: pass
-
-    mejor_opcion = None
-    ruta_captura_final = None
     rendimiento_objetivo = 0.0
     rendimiento_op = operator.ge
     if clase_activo == "ACCION":
         rendimiento_objetivo = filtros.get("rendimiento_objetivo", 0.0)
         rendimiento_op = filtros.get("rendimiento_op", operator.ge)
 
-    # Evaluación perezosa (Lazy Load): Solo pedimos el gráfico que necesitamos
-    for gan in pre_ganadores:
-        buf_graf, rend = await fabricante_de_graficos(gan["ticker"], temporalidad)
-        
-        if rend is None:
-            continue
-            
-        is_fallback = gan.get("_best_effort", False)
-        
-        # Si cumple los requisitos gráficos, lo coronamos y ROMPEMOS el bucle.
-        # Ahorramos decenas de llamadas inútiles a QuickChart y Yahoo.
-        if is_fallback or (rend is not None and rendimiento_op(rend, rendimiento_objetivo)):
-            mejor_opcion = gan
-            mejor_opcion["rendimiento_real"] = round(rend, 2)
-            ruta_captura_final = buf_graf
-            break
+    if msg_espera:
+        try:
+            await msg_espera.edit_text(
+                f"🔥 ¡Criba superada por {len(pre_ganadores)} activos!\n"
+                f"Prefetch concurrente de rendimiento ({temporalidad})..."
+            )
+        except BadRequest: pass
 
-    if not mejor_opcion:
+    # Pre-fetch concurrente: obtenemos el rendimiento de todos los candidatos a la vez
+    # usando solo yfinance (sin generar imágenes). Coste: N llamadas YF en paralelo.
+    async def _fetch_rend_solo(gan: dict) -> tuple[dict, float]:
+        """Obtiene el rendimiento histórico sin generar la imagen del gráfico."""
+        try:
+            hist = await asyncio.wait_for(
+                asyncio.to_thread(
+                    lambda: yf.Ticker(gan["ticker"], session=_YF_SESSION).history(period=temporalidad)
+                ),
+                timeout=10.0
+            )
+            hist = hist.dropna(subset=["Close"])
+            if hist.empty or len(hist) < 2:
+                return gan, 0.0
+            p0, p1 = float(hist["Close"].iloc[0]), float(hist["Close"].iloc[-1])
+            return gan, 0.0 if p0 == 0 else ((p1 - p0) / p0) * 100
+        except Exception:
+            return gan, 0.0
+
+    tuples_rend = await asyncio.gather(*(_fetch_rend_solo(g) for g in pre_ganadores))
+
+    # Filtrar candidatos que cumplen el umbral y ordenar de mayor a menor rendimiento
+    candidatos_validos = [
+        (gan, rend) for gan, rend in tuples_rend
+        if gan.get("_best_effort", False) or rendimiento_op(rend, rendimiento_objetivo)
+    ]
+    candidatos_validos.sort(key=lambda x: x[1], reverse=True)
+
+    if not candidatos_validos:
         return (
             f"❌ Filtro Gráfico Fallido.\n"
             f"He analizado las {len(pre_ganadores)} finalistas, pero ninguna cumple "
@@ -980,6 +1053,12 @@ async def _pipeline_hibrido_interno(
             f"Intenta relajar tu exigencia numérica.",
             None, None, None
         )
+
+    # Solicitamos el gráfico únicamente al ganador real (mejor rendimiento)
+    mejor_opcion, mejor_rend = candidatos_validos[0]
+    mejor_opcion = dict(mejor_opcion)  # copia defensiva antes de mutar
+    mejor_opcion["rendimiento_real"] = round(mejor_rend, 2)
+    ruta_captura_final, _ = await fabricante_de_graficos(mejor_opcion["ticker"], temporalidad)
 
     if msg_espera:
         try:
@@ -989,11 +1068,11 @@ async def _pipeline_hibrido_interno(
             )
         except BadRequest: pass
 
-    # 4. Generador Goldman Sachs adaptado (llamada asíncrona nativa)
-    ticker_final = mejor_opcion['ticker']
+    # --- 4. Generador Goldman Sachs ---
+    ticker_final = mejor_opcion["ticker"]
     try:
         informe_gs = await generador_informe_goldman(
-            ticker_final, sector_ia, mejor_opcion, perfil, clase_activo  # BUG FIX: era 'sector', correcto es 'sector_ia'
+            ticker_final, sector_ia, mejor_opcion, perfil, clase_activo
         )
     except Exception as e:
         logger.error(f"[GS] Error generando informe: {e}")
@@ -1002,20 +1081,18 @@ async def _pipeline_hibrido_interno(
     if not informe_gs:
         informe_gs = f"Datos Crudos: {ticker_final} | Clase: {clase_activo} | {json.dumps(mejor_opcion)}"
     else:
-        informe_gs = informe_gs.replace('*', '')
+        informe_gs = informe_gs.replace("*", "")
 
     fuente = fuente_datos if fuente_datos in FUENTES_DATOS else "yahoo"
     url_compra = FUENTES_DATOS[fuente]["url"].format(ticker=ticker_final)
 
-    rend_str = mejor_opcion.get('rendimiento_real', 0)
+    rend_str = mejor_opcion.get("rendimiento_real", 0)
     texto_final = (
         f"⚡ ALERTA {emoji_clase} {clase_activo}: {ticker_final}\n"
         f"📈 Momentum ({temporalidad}): {'+' if rend_str >= 0 else ''}{rend_str}%\n\n"
         f"{informe_gs}"
     )
-
     texto_final = _limpiar_html_telegram(texto_final)
-
     return texto_final, ruta_captura_final, url_compra, ticker_final
 
 
@@ -1319,8 +1396,8 @@ async def _ejecutar_tabla_desde_message(update, context, chat_id: int):
     botones = []
     if broker_url:
         u = broker_url.replace("{ticker}", ticker) if "{ticker}" in broker_url else broker_url
-        botones.append([InlineKeyboardButton("Comprar en Broker \ud83d\uded2", url=u)])
-    botones.append([InlineKeyboardButton(f"Ver en {fuente_info['nombre']} \ud83d\udcc8", url=url_chart)])
+        botones.append([InlineKeyboardButton("Comprar en Broker 🛒", url=u)])
+    botones.append([InlineKeyboardButton(f"Ver en {fuente_info['nombre']} 📈", url=url_chart)])
     teclado = InlineKeyboardMarkup(botones)
 
     try:
@@ -2260,11 +2337,24 @@ telegram_app.add_handler(CommandHandler("comprar", comando_comprar))
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _PIPELINE_SEMA, _CRON_SEMA, _CRON_LOCK, _QUICKCHART_SEMA, http_client
+    global _PIPELINE_SEMA, _CRON_SEMA, _CRON_LOCK, _QUICKCHART_SEMA, http_client, _YF_SESSION
+
+    # P1: Sesión requests con User-Agent de browser real para evitar bloqueo de Yahoo en Render
+    sess = requests.Session()
+    sess.headers.update({
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                      "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        "Accept":          "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.5",
+        "Accept-Encoding": "gzip, deflate, br",
+    })
+    _YF_SESSION = sess
+
+    # P4: Render free tier (512 MB / 0.5 vCPU) — semáforos conservadores
     _QUICKCHART_SEMA = asyncio.Semaphore(2)
-    _PIPELINE_SEMA = asyncio.Semaphore(15)
-    _CRON_SEMA = asyncio.Semaphore(5)
-    _CRON_LOCK = asyncio.Lock()
+    _PIPELINE_SEMA   = asyncio.Semaphore(5)   # era 15 — demasiado para el tier gratuito
+    _CRON_SEMA       = asyncio.Semaphore(3)
+    _CRON_LOCK       = asyncio.Lock()
     http_client = httpx.AsyncClient(timeout=15.0)
     
     await db.inicializar_pool()
@@ -2280,14 +2370,16 @@ async def lifespan(app: FastAPI):
     ]
     await telegram_app.bot.set_my_commands(comandos, scope=BotCommandScopeDefault())
 
-    # --- INYECCIÓN DEL WEBHOOK SEGURO ---
+    # --- INYECCIÓN DEL WEBHOOK SEGURO (P6: max_connections + allowed_updates) ---
     webhook_url = f"{RENDER_EXTERNAL_URL}/webhook/telegram"
     logger.info(f"[LIFESPAN] Configurando webhook en: {webhook_url}")
     try:
-        if TELEGRAM_WEBHOOK_SECRET:
-            await telegram_app.bot.set_webhook(url=webhook_url, secret_token=TELEGRAM_WEBHOOK_SECRET)
-        else:
-            await telegram_app.bot.set_webhook(url=webhook_url)
+        await telegram_app.bot.set_webhook(
+            url=webhook_url,
+            secret_token=TELEGRAM_WEBHOOK_SECRET or None,
+            max_connections=5,                           # Render free solo puede manejar 5 workers
+            allowed_updates=["message", "callback_query"]  # Ignorar updates innecesarios (inline, etc)
+        )
     except Exception as e:
         logger.error(f"[LIFESPAN] Webhook falló, servidor ignora excepción: {e}")
 
@@ -2310,22 +2402,34 @@ async def lifespan(app: FastAPI):
 web_app = FastAPI(title="BotFinanzas Webhook", lifespan=lifespan)
 
 @web_app.post("/webhook/telegram")
-async def telegram_webhook(request: Request):
-    """Endpoint principal de Telegram Webhook validado criptográficamente."""
+async def telegram_webhook(request: Request, background_tasks: BackgroundTasks):
+    """P6: Devuelve 200 inmediatamente y procesa el update en background para evitar timeouts de Telegram."""
     secret = request.headers.get("X-Telegram-Bot-Api-Secret-Token")
-    if secret != TELEGRAM_WEBHOOK_SECRET:
+    if TELEGRAM_WEBHOOK_SECRET and secret != TELEGRAM_WEBHOOK_SECRET:
         logger.warning("[WEBHOOK] Intento de acceso no autorizado o malicioso.")
         raise HTTPException(status_code=403, detail="Forbidden")
 
     data = await request.json()
-    try:
-        update = Update.de_json(data, telegram_app.bot)
-        # Uso correcto de la cola asíncrona de python-telegram-bot en lugar de threads/bypasses
-        await telegram_app.update_queue.put(update)
-    except Exception as e:
-        logger.error(f"[WEBHOOK] Error procesando update: {e}")
-        
+
+    async def _procesar_update():
+        try:
+            update = Update.de_json(data, telegram_app.bot)
+            await telegram_app.update_queue.put(update)
+        except Exception as e:
+            logger.error(f"[WEBHOOK] Error procesando update: {e}")
+
+    background_tasks.add_task(_procesar_update)
     return Response(status_code=200)
+
+@web_app.get("/ping")
+async def ping():
+    """P6: Endpoint ultra-ligero para mantener Render despierto (cron-job.org cada 14 min)."""
+    return {"ok": True}
+
+@web_app.get("/health")
+async def health():
+    """P5: Indica si el bot está completamente inicializado (semáforos activos)."""
+    return {"ready": _PIPELINE_SEMA is not None}
 
 @web_app.get("/health/gemini")
 async def health_gemini():

@@ -769,6 +769,7 @@ def _chequear_fundamentales_bono(ticker: str, info: dict, filtros_extra: list) -
 async def _obtener_info_bulk(tickers: list[str], clase: str) -> dict:
     cached = await db.obtener_yf_cache_bulk(tickers)
     faltantes = [t for t in tickers if t.upper() not in cached]
+    logger.info(f"[YF BULK] {clase} | Total:{len(tickers)} En-cache:{len(cached)} A-descargar:{len(faltantes)}")
 
     if faltantes:
         async def fetch_yf(t: str):
@@ -778,50 +779,56 @@ async def _obtener_info_bulk(tickers: list[str], clase: str) -> dict:
                     asyncio.to_thread(lambda: yf.Ticker(t, session=_YF_SESSION).info),
                     timeout=15
                 )
-                # Detectar bloqueo silencioso: Yahoo devuelve {} o solo trailingPegRatio
                 claves_validas = {k for k, v in info.items() if v is not None and k != 'trailingPegRatio'}
+                logger.info(f"[YF FETCH] {t} -> {len(claves_validas)} claves válidas | muestra: {list(claves_validas)[:5]}")
                 if len(claves_validas) < 3:
                     logger.warning(f"[YF] Bloqueo silencioso detectado para {t}, reintentando con fast_info...")
                     await asyncio.sleep(2)
-                    # Fallback: fast_info tiene menos datos pero no suele ser bloqueado
                     fi = await asyncio.wait_for(
                         asyncio.to_thread(lambda: dict(yf.Ticker(t, session=_YF_SESSION).fast_info)),
                         timeout=10
                     )
+                    logger.info(f"[YF FAST_INFO] {t} -> {len(fi)} claves | muestra: {list(fi.keys())[:5]}")
                     if fi:
                         info = fi
                 return t.upper(), info
+            except asyncio.TimeoutError:
+                logger.warning(f"[YF FETCH] TIMEOUT descargando {t} (15s superados)")
+                return t.upper(), {}
             except Exception as e:
-                logger.debug(f"[YF] Error fetching {t}: {e}")
+                logger.warning(f"[YF FETCH] ERROR {t}: {type(e).__name__}: {e}")
                 return t.upper(), {}
 
         resultados = []
-        for i in range(0, len(faltantes), 3):   # lotes de 3 (era 5) — más respetuoso con YF
+        for i in range(0, len(faltantes), 3):
             lote = faltantes[i:i+3]
+            logger.info(f"[YF BULK] Lote {i//3+1}: descargando {lote}")
             res_lote = await asyncio.gather(*(fetch_yf(t) for t in lote))
             resultados.extend(res_lote)
             if i + 3 < len(faltantes):
-                await asyncio.sleep(1.0)        # 1s entre lotes (era 0.5s)
+                await asyncio.sleep(1.0)
 
         nuevos_datos = {}
-        # FIX #4: Solo inyectar en caché si el dict contiene mírimas necesarias.
-        # Un dict {trailingPegRatio: None} pasa `if info:` pero es bloqueo silencioso de Yahoo.
         _METRICAS_MINIMAS = {"regularMarketPrice", "currentPrice", "previousClose",
                              "trailingPE", "dividendYield", "marketCap",
-                             "lastPrice", "regularMarketOpen"}  # fast_info keys incluidas
+                             "lastPrice", "regularMarketOpen"}
         for t, info in resultados:
             if not info:
+                logger.warning(f"[YF CACHE] {t}: dict vacío, ignorado.")
                 continue
             claves_presentes = set(info.keys()) & _METRICAS_MINIMAS
             if not claves_presentes:
-                logger.debug(f"[YF CACHE] Rechazando {t}: sin métricas mínimas (posible bloqueo silencioso).")
+                logger.warning(f"[YF CACHE] {t}: sin métricas mínimas -> RECHAZADO. Claves recibidas: {list(info.keys())[:10]}")
                 continue
+            logger.info(f"[YF CACHE] {t}: aceptado con métricas: {claves_presentes}")
             nuevos_datos[t] = info
             cached[t] = info
 
+        logger.info(f"[YF BULK] Resultado final: {len(nuevos_datos)}/{len(faltantes)} tickers con datos válidos")
         if nuevos_datos:
             await db.guardar_yf_cache_bulk(nuevos_datos, clase)
 
+    logger.info(f"[YF BULK] Cache total disponible: {len(cached)} tickers")
     return cached
 
 async def pipeline_hibrido(solicitud: str, msg_espera=None, fuente_datos: str = "yahoo"):
@@ -888,16 +895,23 @@ async def _pipeline_hibrido_interno(
     sector_ia = extraccion.get("sector")
     filtros_dinamicos_raw = extraccion.get("filtros_dinamicos", [])
 
+    logger.info(f"[PIPELINE] Solicitud='{solicitud[:80]}' | Clase={clase_activo} | Perfil={perfil} | Sector={sector_ia} | FiltrosDin={filtros_dinamicos_raw}")
+
     tickers = extraccion.get("tickers_manuales") or extraccion.get("tickers") or []
     if not tickers:
         if msg_espera:
             try: await msg_espera.edit_text(f"📡 Consultando terminal de activos para sector: <b>{sector_ia}</b>...", parse_mode="HTML")
             except BadRequest: pass
         tickers = await db.obtener_semillas_busqueda(clase_activo, sector_ia)
+        logger.info(f"[PIPELINE] Semillas obtenidas para ({clase_activo}, {sector_ia}): {tickers}")
         if not tickers:
             tickers = await db.obtener_semillas_busqueda(clase_activo)
+            logger.info(f"[PIPELINE] Semillas fallback para {clase_activo}: {tickers}")
+    else:
+        logger.info(f"[PIPELINE] Tickers manuales/extractados: {tickers}")
 
     if not tickers:
+        logger.error(f"[PIPELINE] Sin tickers candidatos para clase={clase_activo} sector={sector_ia}")
         return "❌ No se han encontrado activos candidatos en el registro para esa categoría.", None, None, None
 
     EMOJIS_CLASE = {
@@ -919,25 +933,21 @@ async def _pipeline_hibrido_interno(
 
     # --- Dispatch por clase ---
     if clase_activo == "ACCION":
-        # FIX #3: Inmutabilidad. Guardamos el estado base y hacemos deepcopy en cada intento
-        # para evitar que los multiplicadores de relajación se acumulen incorrectamente.
         filtros_base = _construir_filtros(perfil, filtros_dinamicos_raw)
+        logger.info(f"[FILTROS BASE] max_per={filtros_base.get('max_per')} min_div_pct={filtros_base.get('min_div_pct')} min_div_abs={filtros_base.get('min_div_abs')} extras={filtros_base.get('filtros_extra')}")
         max_intentos = 4
 
         for intento in range(max_intentos):
-            # Copia fresca en cada iteración: ningún intento hereda estado sucio del anterior
             filtros = copy.deepcopy(filtros_base)
 
             if intento > 0:
                 if intento == max_intentos - 1:
-                    # Último intento: filtros mínimos de emergencia
                     filtros["max_per"]     = 99999
                     filtros["min_div_pct"] = 0.0
                     filtros["min_div_abs"] = 0.0
                 else:
-                    # Relajación progresiva proporcional al número de intento
-                    factor_per = 1.5 ** intento  # 1.5x, 2.25x …
-                    factor_div = 0.60 ** intento  # 60%, 36% …
+                    factor_per = 1.5 ** intento
+                    factor_div = 0.60 ** intento
                     if filtros["max_per"] < 99999:
                         filtros["max_per"] = min(filtros_base["max_per"] * factor_per, 99998)
                     filtros["min_div_pct"] = max(0, filtros_base["min_div_pct"] * factor_div)
@@ -952,6 +962,8 @@ async def _pipeline_hibrido_interno(
                     except BadRequest: pass
                 await asyncio.sleep(0.5)
 
+            logger.info(f"[FILTROS INTENTO {intento+1}/{max_intentos}] max_per={filtros['max_per']:.1f} min_div_pct={filtros['min_div_pct']:.4f} min_div_abs={filtros['min_div_abs']:.4f}")
+
             filtros_snap = {
                 "max_per":     filtros["max_per"],
                 "min_div_pct": filtros["min_div_pct"],
@@ -962,8 +974,17 @@ async def _pipeline_hibrido_interno(
                 "filtros_extra": list(filtros["filtros_extra"]),
             }
             datos_bulk = await _obtener_info_bulk(tickers, "ACCION")
+
+            # Log por ticker: qué datos reales tiene y si pasa el checker
+            for t in tickers:
+                d = datos_bulk.get(t, {})
+                per_real = d.get("trailingPE") or d.get("forwardPE")
+                div_real = d.get("dividendYield") or d.get("dividendRate", 0)
+                logger.info(f"[CHECKER ACCION] {t} | PER={per_real} DIV_YIELD={div_real} | claves_total={len(d)}")
+
             resultados = [_chequear_fundamentales_accion(t, datos_bulk.get(t, {}), filtros_snap) for t in tickers]
             pre_ganadores = [r for r in resultados if r is not None]
+            logger.info(f"[ACCION INTENTO {intento+1}] pre_ganadores={len(pre_ganadores)}/{len(tickers)} -> {[g['ticker'] for g in pre_ganadores]}")
             if pre_ganadores:
                 break
 
@@ -971,26 +992,31 @@ async def _pipeline_hibrido_interno(
         datos_bulk = await _obtener_info_bulk(tickers, "REIT")
         resultados = [_chequear_fundamentales_reit(t, datos_bulk.get(t, {}), filtros_dinamicos_raw) for t in tickers]
         pre_ganadores = [r for r in resultados if r is not None]
+        logger.info(f"[REIT] pre_ganadores={len(pre_ganadores)}/{len(tickers)} -> {[g['ticker'] for g in pre_ganadores]}")
 
     elif clase_activo == "ETF":
         datos_bulk = await _obtener_info_bulk(tickers, "ETF")
         resultados = [_chequear_fundamentales_etf(t, datos_bulk.get(t, {}), filtros_dinamicos_raw) for t in tickers]
         pre_ganadores = [r for r in resultados if r is not None]
+        logger.info(f"[ETF] pre_ganadores={len(pre_ganadores)}/{len(tickers)} -> {[g['ticker'] for g in pre_ganadores]}")
 
     elif clase_activo == "CRIPTO":
         datos_bulk = await _obtener_info_bulk(tickers, "CRIPTO")
         resultados = [_chequear_fundamentales_cripto(t, datos_bulk.get(t, {}), filtros_dinamicos_raw) for t in tickers]
         pre_ganadores = [r for r in resultados if r is not None]
+        logger.info(f"[CRIPTO] pre_ganadores={len(pre_ganadores)}/{len(tickers)} -> {[g['ticker'] for g in pre_ganadores]}")
 
     elif clase_activo == "BONO":
         datos_bulk = await _obtener_info_bulk(tickers, "BONO")
         resultados = [_chequear_fundamentales_bono(t, datos_bulk.get(t, {}), filtros_dinamicos_raw) for t in tickers]
         pre_ganadores = [r for r in resultados if r is not None]
+        logger.info(f"[BONO] pre_ganadores={len(pre_ganadores)}/{len(tickers)} -> {[g['ticker'] for g in pre_ganadores]}")
 
     else:
         return f"❌ Clase de activo no reconocida: {clase_activo}.", None, None, None
 
     if not pre_ganadores:
+        logger.warning(f"[PIPELINE] CERO pre_ganadores para {clase_activo}. YF puede estar bloqueando o los filtros son demasiado estrictos incluso en el intento final.")
         return (
             "⚠️ El mercado actual no ofrece activos que cumplan exactamente esos filtros tan estrictos.",
             None, None, f"FALLBACK_REQ_{clase_activo}"
@@ -1030,22 +1056,31 @@ async def _pipeline_hibrido_interno(
             )
             hist = hist.dropna(subset=["Close"])
             if hist.empty or len(hist) < 2:
+                logger.warning(f"[REND PREFETCH] {gan['ticker']}: hist vacío en {temporalidad}")
                 return gan, 0.0
             p0, p1 = float(hist["Close"].iloc[0]), float(hist["Close"].iloc[-1])
-            return gan, 0.0 if p0 == 0 else ((p1 - p0) / p0) * 100
-        except Exception:
+            rend = 0.0 if p0 == 0 else ((p1 - p0) / p0) * 100
+            logger.info(f"[REND PREFETCH] {gan['ticker']}: {rend:+.2f}% ({temporalidad}) | umbral={rendimiento_objetivo}% op={rendimiento_op.__name__ if hasattr(rendimiento_op,'__name__') else rendimiento_op}")
+            return gan, rend
+        except asyncio.TimeoutError:
+            logger.warning(f"[REND PREFETCH] {gan['ticker']}: TIMEOUT en history()")
+            return gan, 0.0
+        except Exception as e:
+            logger.warning(f"[REND PREFETCH] {gan['ticker']}: ERROR {type(e).__name__}: {e}")
             return gan, 0.0
 
     tuples_rend = await asyncio.gather(*(_fetch_rend_solo(g) for g in pre_ganadores))
 
-    # Filtrar candidatos que cumplen el umbral y ordenar de mayor a menor rendimiento
     candidatos_validos = [
         (gan, rend) for gan, rend in tuples_rend
         if gan.get("_best_effort", False) or rendimiento_op(rend, rendimiento_objetivo)
     ]
     candidatos_validos.sort(key=lambda x: x[1], reverse=True)
 
+    logger.info(f"[PIPELINE] candidatos_validos tras filtro rend={rendimiento_objetivo}%: {[(g['ticker'], round(r,2)) for g,r in candidatos_validos]}")
+
     if not candidatos_validos:
+        logger.warning(f"[PIPELINE] CERO candidatos_validos. Pre-ganadores tenían rends: {[(t for t,r in [(g['ticker'],r) for g,r in tuples_rend])]}")
         return (
             f"❌ Filtro Gráfico Fallido.\n"
             f"He analizado las {len(pre_ganadores)} finalistas, pero ninguna cumple "

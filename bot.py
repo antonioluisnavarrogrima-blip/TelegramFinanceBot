@@ -31,7 +31,7 @@ from telegram.ext import (
     Application, CommandHandler, CallbackQueryHandler,
     MessageHandler, ContextTypes, filters
 )
-from telegram.ext import BotCommandScopeDefault
+from telegram import BotCommandScopeDefault
 import html as _html_stdlib
 
 import database as db

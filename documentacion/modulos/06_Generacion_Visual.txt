@@ -1,0 +1,240 @@
+--- MÓDULO: 06_Generacion_Visual ---
+
+// ARCHIVO DE ORIGEN: bot.py
+// LÍNEAS ORIGINALES: 396-628
+
+# --- CONSTANTES DEL GENERADOR GOLDMAN (Mover fuera de la función) ---
+_EJEMPLOS_POR_CLASE = {
+    "ACCION": """Ejemplo de Flash Note para ACCION:
+ 🎯 <b>Tesis de Inversión:</b> Microsoft mantiene su foso económico...
+ 📊 <b>Fundamentales:</b>
+   - Dividend Yield: 0.72%
+   - ROE: 38.5%
+   - Margen Neto: 36.2%
+ ⚖️ <b>Veredicto:</b> Posición defensiva. Adecuada para perfil Seguro.""",
+
+    "ETF": """Ejemplo de Flash Note para ETF:
+ 🎯 <b>Tesis de Inversión:</b> IWDA ofrece exposición diversificada a mercados desarrollados...
+ 📊 <b>Fundamentales:</b>
+   - TER (Coste Anual): 0.20%
+   - AUM: 68.4 Bn USD
+ ⚖️ <b>Veredicto:</b> Vehículo eficiente para indexación.""",
+
+    "REIT": """Ejemplo de Flash Note para REIT:
+ 🎯 <b>Tesis de Inversión:</b> Realty Income es el referente de rentas...
+ 📊 <b>Fundamentales:</b>
+   - Dividend Yield: 5.8%
+   - P/Book (proxy P/FFO): 1.3x
+ ⚖️ <b>Veredicto:</b> Generador de rentas predecible.""",
+
+    "CRIPTO": """Ejemplo de Flash Note para CRIPTO:
+ 🎯 <b>Tesis de Inversión:</b> Ethereum lidera el ecosistema DeFi...
+ 📊 <b>Fundamentales:</b>
+   - Market Cap: 298.4 Bn USD
+   - Momentum 1m: +12.5%
+ ⚖️ <b>Veredicto:</b> Activo especulativo. Perfil Riesgo.""",
+
+    "BONO": """Ejemplo de Flash Note para BONO:
+ 🎯 <b>Tesis de Inversión:</b> TLT actúa como cobertura deflacionaria...
+ 📊 <b>Fundamentales:</b>
+   - YTM / Cupón Proxy: 4.35%
+   - AUM: 41.2 Bn USD
+ ⚖️ <b>Veredicto:</b> Instrumento de cobertura y renta fija."""
+}
+
+_PROHIBICIONES_POR_CLASE = {
+    "ACCION": "",
+    "ETF": "PROHIBIDO mencionar PER, PEG, EPS o BPA. PROHIBIDO mencionar Dividendos como empresa. Usa 'Dividend Yield'. Centra en TER y AUM.",
+    "REIT": "PROHIBIDO usar PER. Usa P/FFO o P/Book. Centra en Dividend Yield.",
+    "CRIPTO": "PROHIBIDO mencionar PER, Dividendos, FFO o TER. Centra en Market Cap.",
+    "BONO": "PROHIBIDO mencionar PER, PEG. PROHIBIDO llamar 'dividendo' al cupón. Usa 'YTM', 'Cupón' o 'rendimiento'."
+}
+
+async def generador_informe_goldman(ticker: str, sector: str, datos: dict, perfil: str, clase_activo: str = "ACCION") -> str | None:
+    """Genera un Flash Note estilo Goldman Sachs. Usa caché de 2h por ticker para no quemar tokens."""
+
+    # 0. Caché: si el mismo ticker fue analizado en las últimas 2 horas, devolver directo
+    cache_key = f"{ticker}_{clase_activo}_{perfil}"
+    ahora_gs = time.time()
+    if cache_key in _GOLDMAN_CACHE:
+        entrada = _GOLDMAN_CACHE[cache_key]
+        if ahora_gs - entrada["ts"] < 21600:  # TTL 6 horas (los fundamentales no cambian en ese lapso)
+            logger.info(f"[GOLDMAN CACHE] Hit para {ticker} — 0 tokens consumidos.")
+            return entrada["texto"]
+        else:
+            _GOLDMAN_CACHE.pop(cache_key, None)
+
+    # Purga proactiva del caché Goldman si supera 500 entradas
+    if len(_GOLDMAN_CACHE) >= 500:
+        claves_viejas = list(_GOLDMAN_CACHE.keys())[:100]
+        for k in claves_viejas:
+            _GOLDMAN_CACHE.pop(k, None)
+
+    # 1. Sanitización de datos (Mantenemos los 0, ignoramos nulos)
+    datos_limpios = {
+        k: v for k, v in datos.items()
+        if v is not None and str(v).strip().upper() != "N/A"
+    }
+
+    # 2. Contexto específico según clase
+    ejemplo = _EJEMPLOS_POR_CLASE.get(clase_activo, _EJEMPLOS_POR_CLASE["ACCION"])
+    restricciones = _PROHIBICIONES_POR_CLASE.get(clase_activo, "")
+
+    # 3. Prompt compacto (mínimo tokens, máximo precisión)
+    prompt_sistema = (
+        f"Quant Director. Flash Note {clase_activo}. 3 bullets MAX. "
+        f"HTML solo <b><i>. SIN markdown/asteriscos. "
+        f"{restricciones} "
+        f"Estructura: f3af<b>Tesis:</b> [1 frase] | f4ca<b>Datos:</b> [métricas] | ⚖️<b>Veredicto:</b> [1 frase]\n"
+        f"{ejemplo}"
+    )
+
+    try:
+        res = await client.aio.models.generate_content(
+            model='gemini-2.0-flash-lite',  # P3: coste ~10x menor que 2.5-flash para resúmenes
+            contents=(
+                f"{prompt_sistema}\n"
+                f"Perfil:{perfil}|Sector:{sector}|"  # separadores compactos
+                f"[{ticker}]:{json.dumps(datos_limpios, separators=(',', ':'))}"
+            )
+        )
+
+        # 4. Blindaje contra bloqueos de seguridad de Gemini
+        if not res.candidates or not getattr(res.candidates[0].content, "parts", None):
+            logger.warning(f"[GOLDMAN] Respuesta de {ticker} bloqueada por filtros de seguridad.")
+            return "<i>Análisis no disponible temporalmente por filtros de contenido.</i>"
+
+        # 5. Limpieza residual
+        texto = res.text.replace('**', '<b>').replace('*', '').strip()
+
+        # 6. Guardar en caché
+        _GOLDMAN_CACHE[cache_key] = {"ts": ahora_gs, "texto": texto}
+        return texto
+        
+    except Exception as e:
+        logger.error(f"[ERROR GOLDMAN] Ticker: {ticker} | Fallo: {str(e)[:200]}")
+        return None
+
+# --- 2. HERRAMIENTAS MATEMÁTICAS LOCALES ---
+async def fabricante_de_graficos(ticker: str, periodo: str = "3mo") -> tuple[bytes | None, float]:
+    """Genera gráfico via Yahoo Finance + QuickChart. Retry interno 2x con backoff para evitar ban."""
+    hist = None
+    for intento in range(3):  # hasta 3 intentos con backoff (0s, 1s, 3s)
+        try:
+            hist = await asyncio.wait_for(
+                asyncio.to_thread(lambda: yf.Ticker(ticker, session=_YF_SESSION).history(period=periodo)),
+                timeout=10.0
+            )
+            hist = hist.dropna(subset=['Close'])
+            if not hist.empty and len(hist) >= 2:
+                break  # datos válidos obtenidos
+            logger.warning(f"[YF] Datos vacíos para {ticker} (intento {intento+1}/3)")
+        except asyncio.TimeoutError:
+            logger.warning(f"[YF] Timeout descargando {ticker} (intento {intento+1}/3)")
+            hist = None
+        except Exception as e:
+            logger.warning(f"[YF] Error descargando {ticker} (intento {intento+1}/3): {e}")
+            hist = None
+        if intento < 2:
+            await asyncio.sleep([0, 1, 3][intento + 1])
+
+    if hist is None or hist.empty or len(hist) < 2:
+        return None, 0.0
+
+    labels = hist.index.strftime('%Y-%m-%d').tolist()
+    prices = [round(float(p), 2) for p in hist['Close'].tolist()]
+
+    p_inicial = prices[0]
+    p_final   = prices[-1]
+    rendimiento = 0.0 if p_inicial == 0 else ((p_final - p_inicial) / p_inicial) * 100
+    color = "rgb(44,160,44)" if rendimiento >= 0 else "rgb(214,39,40)"
+
+    qc_payload = {
+        "chart": {
+            "type": "line",
+            "data": {
+                "labels": labels,
+                "datasets": [{
+                    "label": ticker,
+                    "data": prices,
+                    "borderColor": color,
+                    "backgroundColor": "rgba(0,0,0,0)",
+                    "borderWidth": 2,
+                    "pointRadius": 0
+                }]
+            },
+            "options": {
+                "legend": {"display": False},
+                "title": {"display": True, "text": f"{ticker} ({periodo})"}
+            }
+        },
+        "width": 600, "height": 300, "format": "webp"
+    }
+
+    global _QUICKCHART_SEMA, http_client
+    kwargs = {"json": qc_payload, "timeout": 8.0}
+
+    try:
+        # P5: Guard — si el semáforo no está listo, abortar limpiamente
+        if _QUICKCHART_SEMA is None:
+            logger.warning("[CHART] _QUICKCHART_SEMA no inicializado todavía (cold-start), omitiendo gráfico.")
+            return None, rendimiento
+        async with _QUICKCHART_SEMA:
+            resp_qc = await http_client.post("https://quickchart.io/chart", **kwargs)
+
+        if resp_qc.status_code == 200:
+            return resp_qc.content, rendimiento
+
+        logger.error(f"[CHART] QuickChart HTTP {resp_qc.status_code} para {ticker}")
+        return None, rendimiento
+
+    except asyncio.TimeoutError:
+        logger.warning(f"[CHART] Timeout QuickChart para {ticker}")
+        return None, rendimiento
+    except Exception as e:
+        logger.error(f"[CHART] Error QuickChart para {ticker}: {e}")
+        return None, rendimiento
+
+def es_url_valida(texto: str) -> bool:
+    if not texto or not isinstance(texto, str): return False
+    return bool(_REGEX_URL.match(texto.strip()))
+
+def extraer_url(texto: str) -> str | None:
+    if not texto: return None
+    enlaces = re.findall(r'(https?://[^\s()<>]+)', texto)
+    for url_candidata in enlaces:
+        url_limpia = url_candidata.rstrip('.,;:)')
+        if es_url_valida(url_limpia):
+            return url_limpia
+    return None
+
+# Tags HTML soportados por Telegram (modo HTML estricto)
+_TELEGRAM_TAGS = re.compile(r'(</?(?:b|i|u|s|code|pre|a|tg-spoiler)[^>]*>)', re.IGNORECASE)
+
+def _limpiar_html_telegram(texto: str) -> str:
+    if not texto: return ""
+    texto = re.sub(r'</?ul>', '', texto)
+    texto = re.sub(r'<li>', '• ', texto)
+    texto = re.sub(r'</li>', '\n', texto)
+    texto = re.sub(r'<strong>', '<b>', texto)
+    texto = re.sub(r'</strong>', '</b>', texto)
+    texto = re.sub(r'<em>', '<i>', texto)
+    texto = re.sub(r'</em>', '</i>', texto)
+    texto = re.sub(r'<br\s*/?>', '\n', texto)
+    
+    partes = _TELEGRAM_TAGS.split(texto)
+    resultado = []
+    for parte in partes:
+        if _TELEGRAM_TAGS.fullmatch(parte):
+            resultado.append(parte)
+        else:
+            parte = parte.replace('&', '&amp;')
+            parte = parte.replace('<', '&lt;')
+            parte = parte.replace('>', '&gt;')
+            resultado.append(parte)
+    texto = ''.join(resultado)
+    return texto.strip()
+
+
+
+

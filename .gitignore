@@ -1,5 +1,7 @@
 # Variables de entorno — NUNCA subir al repo
 .env
+token.json
+credentials.json
 
 # Entorno virtual Python
 venv/

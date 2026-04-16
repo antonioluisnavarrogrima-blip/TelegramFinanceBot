@@ -1,0 +1,122 @@
+--- MÓDULO: 02_IA_NLP_Extractor ---
+
+// ARCHIVO DE ORIGEN: bot.py
+// LÍNEAS ORIGINALES: 281-395
+
+def _guardar_en_cache(hash_key: str, data: dict):
+    """Guarda en caché y purga proactivamente (FIFO) si excede 1000 elementos para evitar OOM."""
+    if len(_INTENT_CACHE) >= 1000:
+        # Los dicts en Python >= 3.7 mantienen el orden de inserción.
+        # Extraemos las primeras 200 claves (las más antiguas) directamente y de forma segura.
+        claves_antiguas = list(_INTENT_CACHE.keys())[:200]
+        
+        for k in claves_antiguas:
+            _INTENT_CACHE.pop(k, None)
+            
+    _INTENT_CACHE[hash_key] = {"ts": time.time(), "data": data}
+# Mover la constante fuera de la función evita reasignaciones en memoria por cada mensaje.
+_PROMPT_SISTEMA_EXTRACTOR = """Rol Oficial: Analista Cuantitativo Senior de "Mejor Esfuerzo". Extrae parámetros usando lenguaje natural. No generes tickers de memoria.
+Evaluación de Probabilidad: Evalúa si los parámetros solicitados son realistas (ej. div > 20% o PER < 5 no lo son). Si hay discrepancia, ajusta los filtros a la realidad del sector (Best Effort), NO entregues validaciones imposibles.
+Prevención Filtro Aniquilador: Si el universo es de nicho (ETF, Cripto), relaja métricas 20% para habilitar tolerancia matemática.
+CLASES válidas: ACCION|REIT|ETF|CRIPTO|BONO
+MÉTRICAS: {"ACCION":["per","rendimiento","dividendo_porcentaje","dividendo_absoluto","roe","margen_beneficio","beta","deuda_capital","crecimiento_ingresos"],"REIT":["p_ffo","dividend_yield","ocupacion","ltv"],"ETF":["ter","aum","dividend_yield","rendimiento"],"CRIPTO":["rendimiento","market_cap"],"BONO":["dividend_yield","rendimiento","duracion"]}
+TRADUCCIONES: {"PER bajo":{"metrica":"per","operador":"<","valor":45},"dividendo alto":{"metrica":"dividendo_porcentaje","operador":">","valor":4},"dividendo estable":{"metrica":"dividendo_porcentaje","operador":">","valor":2},"alta rentabilidad":{"metrica":"roe","operador":">","valor":45},"deuda baja":{"metrica":"deuda_capital","operador":"<","valor":50},"estable":{"metrica":"beta","operador":"<","valor":0.8},"crecimiento agresivo":{"metrica":"crecimiento_ingresos","operador":">","valor":20},"alcista":{"metrica":"rendimiento","operador":">","valor":0},"bajista":{"metrica":"rendimiento","operador":"<","valor":0},"ETF barato":{"metrica":"ter","operador":"<","valor":0.2},"ETF grande":{"metrica":"aum","operador":">","valor":1000000000},"REIT ocupacion alta":{"metrica":"ocupacion","operador":">","valor":90},"REIT dividendo alto":{"metrica":"dividend_yield","operador":">","valor":4},"cripto cap grande":{"metrica":"market_cap","operador":">","valor":1000000000}}
+REGLAS: sector siempre lleno ("tecnologia","energia","general"...). Perfil: "Seguro"|"Riesgo"|"Balanceado". filtros_dinamicos como objeto por métrica(nunca con tickers)."""
+
+async def extractor_intenciones(prompt_del_inversor: str) -> dict | None:
+    """Extrae parámetros para búsqueda determínistica v4.5 — prompt compacto (-60% tokens)."""
+    # 1. Filtro pre-API: Evitar llamadas inútiles (ej. spam de espacios o signos de interrogación)
+    texto_hash = re.sub(r'[^\w\s]', '', prompt_del_inversor).lower().strip()
+    if not texto_hash:
+        return None
+
+    intent_hash = hashlib.md5(texto_hash.encode('utf-8')).hexdigest()
+    ahora = time.time()
+    
+    if intent_hash in _INTENT_CACHE:
+        cache_entry = _INTENT_CACHE[intent_hash]
+        if ahora - cache_entry['ts'] < 259200: # 3 días de TTL
+            logger.info("[CACHE] Intención semántica recuperada de caché.")
+            return cache_entry['data']
+        else:
+            del _INTENT_CACHE[intent_hash]
+
+    try:
+        res = await client.aio.models.generate_content(
+            model='gemini-2.5-flash',
+            contents=f"{_PROMPT_SISTEMA_EXTRACTOR}\n\n[INPUT USUARIO]: {prompt_del_inversor}",
+            config=types.GenerateContentConfig(
+                response_mime_type="application/json",
+                response_schema={
+                    "type": "OBJECT",
+                    "properties": {
+                        "clase_activo": {"type": "STRING"},
+                        "perfil":       {"type": "STRING"},
+                        "sector":       {"type": "STRING"},
+                        "tickers_manuales": {
+                            "type": "ARRAY",
+                            "items": {"type": "STRING"}
+                        },
+                        "filtros_dinamicos": {
+                            "type": "ARRAY",
+                            "items": {
+                                "type": "OBJECT",
+                                "properties": {
+                                    "metrica":  {"type": "STRING"},
+                                    "operador": {"type": "STRING"},
+                                    "valor":    {"type": "NUMBER"}
+                                }
+                            }
+                        },
+                        "error_api": {
+                            "type": "STRING",
+                            "description": "Dejar vacío si no hay error"
+                        }
+                    }
+                }
+            )
+        )
+
+        # 2. Control de Safety Filters: Si Gemini bloquea el prompt, evitamos el ValueError en res.text
+        if not res.candidates or not getattr(res.candidates[0].content, "parts", None):
+            logger.warning("[EXTRACTOR] Respuesta bloqueada por filtros de seguridad de Gemini.")
+            return None
+
+        # Con schema nativo (Pydantic objects lo usan, diccionarios planos podrían no poblarlo en todos los SDKs)
+        if isinstance(getattr(res, "parsed", None), dict):
+            _guardar_en_cache(intent_hash, res.parsed)
+            return res.parsed
+            
+        # Fallback ultra-robusto
+        texto_limpio_res = res.text.strip()
+        inicio = texto_limpio_res.find('{')
+        fin = texto_limpio_res.rfind('}')
+        if inicio != -1 and fin != -1 and fin > inicio:
+            texto_limpio_res = texto_limpio_res[inicio:fin+1]
+        
+        parsed = json.loads(texto_limpio_res)
+        _guardar_en_cache(intent_hash, parsed)
+        return parsed
+        
+    except json.JSONDecodeError as je:
+        texto_bruto = getattr(res, "text", "")[:400] if 'res' in locals() else "No response object"
+        logger.error(f"[EXTRACTOR] JSON decode error: {je} | Texto bruto: '{texto_bruto}'")
+        return None
+    except Exception as e:
+        error_str = str(e).lower()
+        logger.error(f"[GEMINI ERROR] Tipo: {type(e).__name__} | Mensaje: {str(e)[:300]}")
+        es_rate_limit = "429" in str(e) or "quota" in error_str or "resource_exhausted" in error_str
+        es_conexion   = "timeout" in error_str or "timed out" in error_str or "connection" in error_str or "network" in error_str
+        if es_rate_limit:
+            logger.warning("[GEMINI] Rate limit. Se reintentará desde el pipeline.")
+            return {"_rate_limit": True}
+        if es_conexion:
+            logger.warning("[GEMINI] Error de conexión/timeout. Se reintentará.")
+            return {"_rate_limit": True}
+        logger.error(f"[GEMINI EXTRACTOR] Error no recuperable: {type(e).__name__} | {str(e)[:200]}")
+        return None
+
+
+
+
+

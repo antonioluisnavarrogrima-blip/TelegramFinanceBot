@@ -1,0 +1,310 @@
+--- MÓDULO: 09_Seguridad_y_Moderacion ---
+
+// ARCHIVO DE ORIGEN: bot.py
+// LÍNEAS ORIGINALES: 2179-2481
+
+def obtener_penalizacion_por_ban_level(ban_level: int) -> float:
+    """Retorna el cooldown en segundos según el banLevel almacenado en BD."""
+    if ban_level >= 4:
+        return float('inf')   # Permanente
+    elif ban_level == 3:
+        return 24 * 3600.0    # 24 horas
+    elif ban_level == 2:
+        return 3600.0         # 1 hora
+    elif ban_level == 1:
+        return 120.0          # 2 minutos
+    return 30.0               # Normal: 30 segundos entre consultas
+
+def formatear_tiempo(segundos: float) -> str:
+    if segundos == float('inf'):
+        return "PERMANENTE"
+    segundos = int(segundos)
+    dias = segundos // 86400
+    horas = (segundos % 86400) // 3600
+    minutos = (segundos % 3600) // 60
+    segs = segundos % 60
+    
+    parts = []
+    if dias > 0: parts.append(f"{dias}d")
+    if horas > 0: parts.append(f"{horas}h")
+    if minutos > 0: parts.append(f"{minutos}m")
+    if segs > 0 or not parts: parts.append(f"{segs}s")
+    return " ".join(parts)
+
+
+async def conversacion_inversor(update: Update, context: ContextTypes.DEFAULT_TYPE, es_reintento=False):
+    """Handler principal con filtros de seguridad v4.3."""
+    user_id = update.effective_user.id
+    texto_usuario = update.message.text or ""
+    
+    # 1. Truncado de seguridad (Anti Context-Length Attack)
+    solicitud = texto_usuario[:500]
+    tid = user_id
+
+    # 2. GUARDIÁN LOCAL: Filtro regex ligero para ahorrar tokens de Gemini.
+    # El regex ya incluye: empresa, tendencia, alcista, bajista, comprar, vender, etc.
+    # Solo llegan a Gemini las consultas que superan este primer filtro.
+    estado_mem = context.user_data.get('estado')
+    estados_especiales = ("ESPERANDO_URL", "ESPERANDO_TICKERS_MANUALES")
+
+    if not es_reintento and not (estado_mem in estados_especiales):
+        if not _es_consulta_financiera(solicitud):
+            await db.sumar_strike(tid)
+            await update.message.reply_text(
+                "👋 ¡Hola! Soy tu asistente financiero Quant.\n\n"
+                "Para ayudarte, hazme una consulta sobre <b>inversiones, bolsa, empresas o tendencias de mercado</b>.",
+                parse_mode="HTML"
+            )
+            return
+
+    # --- 🛡️ SISTEMA ANTI-SPAM (COOLDOWN basado en banLevel de BD + persistencia) ---
+    ahora = time.time()
+    # Fix: leer ultimo_uso desde BD para que el cooldown sobreviva reinicios de Render
+    ultimo_uso = await db.obtener_ultimo_uso(tid)
+    ban_level = await db.obtener_ban_level(tid)
+    cooldown_segundos = obtener_penalizacion_por_ban_level(ban_level)
+
+    if not es_reintento:
+        if ahora - ultimo_uso < cooldown_segundos:
+            # Bans severos (≥ día o permanente): ofrecer pago para desbloquear
+            es_timeout_severo = (cooldown_segundos == float('inf') or cooldown_segundos >= 86400)
+            if es_timeout_severo:
+                if cooldown_segundos == float('inf'):
+                    msg_ban = (
+                        "🛑 Has sido baneado PERMANENTEMENTE por trolling reiterado.\n\n"
+                        "Puedes desbloquear tu acceso de forma inmediata recargando créditos:"
+                    )
+                else:
+                    tiempo_restante = cooldown_segundos - (ahora - ultimo_uso)
+                    str_tiempo = formatear_tiempo(tiempo_restante)
+                    msg_ban = (
+                        f"🛑 Sanción activa. Tiempo restante: {str_tiempo}.\n\n"
+                        "Puedes saltarte la espera de forma inmediata recargando créditos:"
+                    )
+                teclado_desbloqueo = InlineKeyboardMarkup([
+                    [InlineKeyboardButton(
+                        "💳 Desbloquear ahora",
+                        url=f"{STRIPE_PAYMENT_URL}?client_reference_id={tid}"
+                    )]
+                ])
+                await update.message.reply_text(msg_ban, reply_markup=teclado_desbloqueo)
+            else:
+                tiempo_restante = cooldown_segundos - (ahora - ultimo_uso)
+                str_tiempo = formatear_tiempo(tiempo_restante)
+                await update.message.reply_text(
+                    f"🛑 Motor Quant enfriándose. Espera {str_tiempo} para otra consulta."
+                )
+            return
+
+        # BUG FIX 3: actualizar_ultimo_uso SOLO al verificar créditos positivos (abajo)
+    # --- FIN DEL SISTEMA ANTI-SPAM ---
+
+    # Manejar estado de configuración de Broker (BD + fallback en memoria)
+    estado_mem = context.user_data.get('estado')
+    usuario_actual = await db.obtener_usuario(tid)
+    estado_db = usuario_actual.get('estado') if usuario_actual else None
+    if estado_mem == "ESPERANDO_URL" or estado_db == "ESPERANDO_URL":
+        url_detectada = extraer_url(solicitud)
+        if url_detectada and es_url_valida(url_detectada):
+            await db.upsert_usuario(tid, broker_url=url_detectada, estado=None)
+            context.user_data['estado'] = None
+            await update.message.reply_text(
+                f"✅ <b>Broker conectado.</b>\n"
+                f"Todas tus señales redirigirán a:\n{url_detectada}",
+                parse_mode="HTML"
+            )
+        else:
+            await db.upsert_usuario(tid, estado=None)
+            context.user_data['estado'] = None
+            await update.message.reply_text("❌ URL Inválida. Protocolo Cancelado.")
+        return
+
+    # BUG FIX 4: Manejar estado ESPERANDO_TICKERS_MANUALES (Bypass IA)
+    if estado_mem == "ESPERANDO_TICKERS_MANUALES" or estado_db == "ESPERANDO_TICKERS_MANUALES":
+        raw_tickers = re.split(r'[\s,;]+', solicitud.upper().strip())
+        tickers_validos = [t for t in raw_tickers if re.match(r'^[A-Z0-9.\-]{1,10}$', t) and len(t) >= 1]
+        if not tickers_validos:
+            await update.message.reply_text(
+                "❌ No encontré tickers válidos. Escíbelos separados por espacios o comas.\n"
+                "Ejemplo: <code>AAPL MSFT TSLA</code>",
+                parse_mode="HTML"
+            )
+            return
+        context.user_data['estado'] = None
+        await db.upsert_usuario(tid, estado=None)
+        clase_elegida  = context.user_data.get('manual_clase',  'ACCION')
+        perfil_elegido = context.user_data.get('manual_perfil', 'Balanceado')
+        msg_espera = await update.message.reply_text(
+            f"⏳ Validando {len(tickers_validos)} ticker(s) en Yahoo Finance sin IA..."
+        )
+        # Guardar como última búsqueda para alertas
+        await db.upsert_usuario(tid, ultima_busqueda=" ".join(tickers_validos))
+        fuente = await db.obtener_fuente_datos(tid)
+        creditos = await db.obtener_creditos(tid)
+        if creditos <= 0:
+            await msg_espera.edit_text(
+                "💳 <b>Saldo agotado.</b> Recarga créditos para continuar.",
+                parse_mode="HTML"
+            )
+            return
+        if not es_reintento:
+            await db.actualizar_ultimo_uso(tid, time.time())
+        texto_final, ruta_captura, url_compra, ticker = await pipeline_hibrido(
+            " ".join(tickers_validos), msg_espera, fuente_datos=fuente
+        )
+        if url_compra:
+            await db.resetear_strikes(tid)
+            await db.restar_credito(tid)
+            cred_r = await db.obtener_creditos(tid)
+            texto_final += f"\n\n<i>Te quedan {cred_r} créditos.</i>"
+            botones_m = []
+            burl = await db.obtener_broker_url(tid)
+            if burl:
+                botones_m.append([InlineKeyboardButton("Comprar en Broker 🛒", url=burl.replace("{ticker}", ticker) if "{ticker}" in burl else burl)])
+            nf = FUENTES_DATOS.get(fuente, FUENTES_DATOS["yahoo"])["nombre"]
+            botones_m.append([InlineKeyboardButton(f"Ver en {nf} 📈", url=FUENTES_DATOS.get(fuente, FUENTES_DATOS['yahoo'])['url'].format(ticker=ticker))])
+            teclado_m = InlineKeyboardMarkup(botones_m)
+            try:
+                if ruta_captura:
+                    with io.BytesIO(ruta_captura) as buf:
+                        await update.message.reply_photo(photo=InputFile(buf, filename=f"chart_{ticker}.webp"), caption=texto_final, reply_markup=teclado_m, parse_mode="HTML")
+                else:
+                    await update.message.reply_text(texto_final, reply_markup=teclado_m, parse_mode="HTML")
+                await msg_espera.delete()
+            except Exception:
+                await msg_espera.edit_text(texto_final, parse_mode="HTML")
+        else:
+            await msg_espera.edit_text(texto_final or "❌ No se encontraron activos con esos tickers.")
+        return
+
+    # Verificar créditos
+    creditos = await db.obtener_creditos(tid)
+    if creditos <= 0:
+        teclado_pago = InlineKeyboardMarkup([
+            [InlineKeyboardButton("💳 Recargar Créditos", url=f"{STRIPE_PAYMENT_URL}?client_reference_id={tid}")]
+        ])
+        await update.message.reply_text(
+            "💳 <b>Saldo agotado.</b>\n"
+            "Has consumido tus análisis Quant.\n"
+            "Pulsa el nivel de abajo para recargar tus créditos:",
+            parse_mode="HTML",
+            reply_markup=teclado_pago
+        )
+        return
+
+    # BUG FIX 3: guardar timestamp AHORA, tras confirmar que tiene créditos
+    if not es_reintento:
+        await db.actualizar_ultimo_uso(tid, ahora)
+
+    # Guardar búsqueda en DB
+    await db.upsert_usuario(tid, ultima_busqueda=solicitud)
+    msg_espera = await update.message.reply_text("⏳ Conectando con los Agentes Quants...")
+
+    fuente = await db.obtener_fuente_datos(tid)
+    texto_final, grafico_bytes, url_compra, ticker = await pipeline_hibrido(
+        solicitud, msg_espera, fuente_datos=fuente
+    )
+
+    # Error → mostrar mensaje con botón de reintento (NO cobrar)
+    if not url_compra:
+        if texto_final and texto_final.startswith("__TROLL__"):
+            # BUG FIX 1: Consulta troll detectada por IA → sumar strike en BD
+            await db.sumar_strike(tid)
+            texto_troll = texto_final.replace("__TROLL__ ", "", 1)
+            await msg_espera.edit_text(texto_troll)
+            return
+
+        if ticker and ticker.startswith("FALLBACK_REQ_"):
+            clase_req = ticker.replace("FALLBACK_REQ_", "")
+            teclado_error = InlineKeyboardMarkup([
+                [InlineKeyboardButton("🔍 ¿Desea ver la alternativa más cercana encontrada?", callback_data=f"best_effort_{clase_req}")],
+                [InlineKeyboardButton("🔄 Reintentar con otros tickers", callback_data="reintentar")]
+            ])
+            await msg_espera.edit_text(texto_final, reply_markup=teclado_error)
+            return
+
+        # (si fue un fallo puramente técnico o de mercado, ponemos botón retry)
+        teclado_error = InlineKeyboardMarkup([
+            [InlineKeyboardButton("🔄 Reintentar con otros tickers", callback_data="reintentar")]
+        ])
+        await msg_espera.edit_text(texto_final, reply_markup=teclado_error)
+        return
+
+    # Solicitud exitosa: resetear strikes en BD
+    await db.resetear_strikes(tid)
+
+    # Cobro Justo: solo cobrar en éxito
+    await db.restar_credito(tid)
+    creditos_restantes = await db.obtener_creditos(tid)
+    texto_final += f"\n\n<i>Te quedan {creditos_restantes} créditos.</i>"  # BUG FIX 5: HTML no Markdown
+
+    broker_url = await db.obtener_broker_url(tid)
+    botones = []
+    if broker_url:
+        url_broker_final = broker_url.replace("{ticker}", ticker) if "{ticker}" in broker_url else broker_url
+        botones.append([InlineKeyboardButton(text="Ejecutar Compra en Broker 🛒", url=url_broker_final)])
+    nombre_fuente = FUENTES_DATOS.get(fuente, FUENTES_DATOS["yahoo"])["nombre"]
+    botones.append([InlineKeyboardButton(text=f"Validar en {nombre_fuente} 📈", url=url_compra)])
+    teclado = InlineKeyboardMarkup(botones)
+
+    try:
+        if grafico_bytes:
+            try:
+                with io.BytesIO(grafico_bytes) as buf:
+                    if len(texto_final) > 1000:
+                        await update.message.reply_photo(photo=InputFile(buf, filename=f"chart_{ticker}.webp"), read_timeout=60, write_timeout=60, connect_timeout=60)
+                        await update.message.reply_text(texto_final, reply_markup=teclado, parse_mode="HTML")
+                    else:
+                        await update.message.reply_photo(
+                            photo=InputFile(buf, filename=f"chart_{ticker}.webp"), caption=texto_final,
+                            reply_markup=teclado, read_timeout=60, write_timeout=60, connect_timeout=60, parse_mode="HTML"
+                        )
+            except BadRequest:
+                raise # Delegar al bloque de fallback exterior
+            except Exception as e:
+                logger.warning(f"[UI] Fallo envío foto original: {e}")
+                await update.message.reply_text(texto_final, reply_markup=teclado, parse_mode="HTML")
+        else:
+            await update.message.reply_text(texto_final, reply_markup=teclado, parse_mode="HTML")
+            
+        try:
+            await msg_espera.delete()
+        except Exception as e:
+            logger.debug(f"[UI] Ignorado al borrar msg espera: {e}")
+
+    except BadRequest as e:
+        logger.warning(f"[UI] Fallback a texto crudo por posible HTML inválido: {e}")
+        texto_limpio = re.sub(r'<[^>]+>', '', texto_final)
+        if grafico_bytes:
+            try:
+                with io.BytesIO(grafico_bytes) as buf:
+                    if len(texto_limpio) > 1000:
+                        await update.message.reply_photo(photo=InputFile(buf, filename=f"chart_{ticker}.webp"), read_timeout=60, write_timeout=60, connect_timeout=60)
+                        await update.message.reply_text(texto_limpio, reply_markup=teclado, parse_mode=None)
+                    else:
+                        await update.message.reply_photo(
+                            photo=InputFile(buf, filename=f"chart_{ticker}.webp"), caption=texto_limpio,
+                            reply_markup=teclado, read_timeout=60, write_timeout=60, connect_timeout=60, parse_mode=None
+                        )
+            except Exception as e:
+                logger.warning(f"[UI] Fallo envío foto fallback: {e}")
+                await update.message.reply_text(texto_limpio, reply_markup=teclado, parse_mode=None)
+        else:
+            await update.message.reply_text(texto_limpio, reply_markup=teclado, parse_mode=None)
+        
+        try: await msg_espera.delete()
+        except Exception as e: logger.debug(f"[UI] Ignorado al borrar msg espera (fallback): {e}")
+
+    except Exception as e:
+        logger.error(f"Telegram API: {e}")
+        # Lógica de REEMBOLSO (Cobro Justo): si el análisis fue bien pero falló el envío final.
+        try:
+            await db.actualizar_creditos(tid, 1)
+            logger.info(f"[FACTURACION] Reembolso de 1 crédito inyectado al usuario {tid} por fallo de entrega.")
+            await msg_espera.edit_text("⚠️ El análisis se completó pero hubo un fallo al enviarte el gráfico. Se te ha devuelto el crédito.")
+        except Exception as e:
+            logger.error(f"[FACTURACION] FALLO CRÍTICO en reembolso usuario {tid}: {e}")
+
+
+
+

@@ -1,0 +1,78 @@
+# ARQUITECTURA DEL PROYECTO: BOT FINANZAS v4.5
+## ÍNDICE DE MÓDULOS DE CÓDIGO (documentacion/modulos)
+
+Para facilitar la consulta por parte de Inteligencia Artificial o MCP, el código fuente original ha sido segmentado en 12 módulos funcionales con archivos `.txt`. A continuación, se detalla qué responsabilidad abarca cada módulo:
+
+--------------------------------------------------------------------------------
+1. Entorno y Orquestación Principal
+--------------------------------------------------------------------------------
+- **01_Configuracion_y_Entorno.txt**
+  - Ubicación: `documentacion/modulos/01_Configuracion_y_Entorno.txt`
+  - Contenido: Setup principal, variables de entorno, carga/inicialización de clientes globales (`httpx`, `yfinance` sesión), imports, regex y el bloque `lifespan` de FastAPI que maneja la inicialización.
+
+- **03_Pipeline_Core.txt**
+  - Ubicación: `documentacion/modulos/03_Pipeline_Core.txt`
+  - Contenido: El orquestador principal (`pipeline_hibrido` y `_pipeline_hibrido_interno`). Controla la ejecución asíncrona y la inyección inteligente entre las respuestas de la IA NLP y la descarga intensiva de redes.
+  - Origen: `bot.py`
+
+--------------------------------------------------------------------------------
+2. Inteligencia Artificial y Lógica Matemática
+--------------------------------------------------------------------------------
+- **02_IA_NLP_Extractor.txt**
+  - Ubicación: `documentacion/modulos/02_IA_NLP_Extractor.txt`
+  - Contenido: La función `extractor_intenciones()` que usa `gemini-2.5-flash` para identificar tickers, intenciones y métricas desde el prompt en lenguaje natural del usuario. Reducción de tokens.
+  - Origen: `bot.py`
+
+- **04_Validacion_Metricas.txt**
+  - Ubicación: `documentacion/modulos/04_Validacion_Metricas.txt`
+  - Contenido: Los evaluadores locales (ej. `_chequear_fundamentales_accion()`) que filtran matemáticamente las clases de activos sin usar IA para evitar alucinaciones.
+
+- **06_Generacion_Visual.txt**
+  - Ubicación: `documentacion/modulos/06_Generacion_Visual.txt`
+  - Contenido: Función `fabricante_de_graficos()` para interconectar con QuickChart.io y `generador_informe_goldman()` utilizado con Gemini Flash Lite para resumir las características ganadoras.
+
+--------------------------------------------------------------------------------
+3. Datos y Caché
+--------------------------------------------------------------------------------
+- **05_Descarga_Datos.txt**
+  - Ubicación: `documentacion/modulos/05_Descarga_Datos.txt`
+  - Contenido: Lógica en bloque (Bulk) asíncrona hacia Yahoo Finance y Financial Modeling Prep. Incluye como capa defensiva inferior el diccionario `_DATOS_ESTATICOS`.
+  
+- **12_Persistencia_Estructura.txt**
+  - Ubicación: `documentacion/modulos/12_Persistencia_Estructura.txt`
+  - Contenido: Todo el archivo `database.py`. Incluye la topología PostgreSQL en Supabase, el `yf_cache` e indexadores de persistencia.
+  - Origen: `database.py`
+
+--------------------------------------------------------------------------------
+4. Interfaces y Flujos de Usuario (Telegram)
+--------------------------------------------------------------------------------
+- **07_Telegram_Interfaz.txt**
+  - Ubicación: `documentacion/modulos/07_Telegram_Interfaz.txt`
+  - Contenido: Handlers principales (`comando_start`, `comando_menu`, `manejador_botones`), respuestas 1-Click e interpretaciones de inline keyboards.
+
+- **08_Screener_Tablas.txt**
+  - Ubicación: `documentacion/modulos/08_Screener_Tablas.txt`
+  - Contenido: Modo Wizard determinístico en Telegram, diccionario `TABLA_CAMPOS`, permitiendo filtros estrictos manuales.
+
+--------------------------------------------------------------------------------
+5. Operaciones, Monetización y Seguridad
+--------------------------------------------------------------------------------
+- **09_Seguridad_y_Moderacion.txt**
+  - Ubicación: `documentacion/modulos/09_Seguridad_y_Moderacion.txt`
+  - Contenido: Intercepción del `conversacion_inversor` para validar inputs. Aplica baneos (strikes) de base de datos a usuarios maliciosos.
+
+- **10_Pagos_y_Monetizacion.txt**
+  - Ubicación: `documentacion/modulos/10_Pagos_y_Monetizacion.txt`
+  - Contenido: Gestión del enlace de compra en `/comprar` y endpoint de Stripe Webhooks en FastAPI para confirmar cobros y asignar créditos atómicamente.
+
+- **11_Alertas_y_Cron.txt**
+  - Ubicación: `documentacion/modulos/11_Alertas_y_Cron.txt`
+  - Contenido: Infraestructura del Bot para ejecutar re-escaneos asíncronos bajo el endpoint de background `/cron/ejecutar`.
+
+================================================================================
+ESTADO TÉCNICO V4.5
+- Backend: Python + FastAPI + python-telegram-bot (Vía Webhook).
+- AI Motor: Google Gemini (v2.5-flash y v2.0-flash-lite).
+- Datos: yfinance (Principal histórico), FMP (Principal Fundamentales Libre IP).
+- Concurrencia: Semáforos Locales asyncio ajustados para Render Free-Tier limits.
+================================================================================

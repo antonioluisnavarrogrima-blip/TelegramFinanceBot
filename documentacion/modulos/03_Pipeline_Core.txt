@@ -1,0 +1,400 @@
+--- MÓDULO: 03_Pipeline_Core ---
+
+// ARCHIVO DE ORIGEN: bot.py
+// LÍNEAS ORIGINALES: 629-721, 986-1285
+
+# --- 3. EL PIPELINE MAESTRO (ORQUESTADOR) ---
+
+def _construir_filtros(perfil: str, filtros_dinamicos: list) -> dict:
+    """Construye el diccionario unificado de filtros combinando perfil base + overrides dinámicos."""
+
+    # Umbrales base actualizados a la realidad del mercado actual
+    if perfil == "Seguro":
+        base_per, base_div_pct, base_div_abs = 45.0, 0.015, 0.0  # PER 25 es lo normal hoy para Blue Chips
+    elif perfil == "Riesgo":
+        base_per, base_div_pct, base_div_abs = 999.0, 0.0, 0.0   # Crecimiento puro, ignoramos el PER
+    else:  # Balanceado
+        base_per, base_div_pct, base_div_abs = 35.0, 0.005, 0.0
+
+    filtros = {
+        "max_per": base_per,
+        "min_div_pct": base_div_pct,
+        "min_div_abs": base_div_abs,
+        "per_op": operator.lt,
+        "div_op": operator.ge,
+        "div_abs_op": operator.ge,
+        "rendimiento_objetivo": 0.0,
+        "rendimiento_op": operator.ge,
+        "temporalidad": "3mo",
+        "filtros_extra": [],
+        "ignorar_per_estricto": False,
+    }
+
+    # Detectar si el usuario pidió explícitamente un PER
+    usuario_pidio_per = any(
+        f.get("metrica", "").lower() == "per" for f in filtros_dinamicos
+    )
+
+    for f in filtros_dinamicos:
+        metrica = f.get("metrica", "").lower()
+        valor = f.get("valor")
+        operador_str = f.get("operador", "")
+
+        if valor is None:
+            continue
+
+        try:
+            valor = float(valor)
+        except (ValueError, TypeError):
+            continue
+
+        if metrica == "per":
+            filtros["max_per"] = valor
+            filtros["per_op"] = OPS.get(operador_str, operator.lt)
+
+        elif "rendimiento" in metrica:
+            filtros["rendimiento_objetivo"] = valor
+            filtros["rendimiento_op"] = OPS.get(operador_str, operator.ge)
+            if f.get("temporalidad"):
+                filtros["temporalidad"] = f["temporalidad"]
+
+        elif metrica == "dividendo_porcentaje":
+            if valor > 1:
+                valor /= 100.0
+            filtros["min_div_pct"] = valor
+            filtros["div_op"] = OPS.get(operador_str, operator.ge)
+
+        elif metrica == "dividendo_absoluto":
+            filtros["min_div_abs"] = valor
+            filtros["div_abs_op"] = OPS.get(operador_str, operator.ge)
+
+        elif metrica in METRICAS_YF:
+            if metrica in METRICAS_PORCENTUALES and valor > 1:
+                valor /= 100.0
+            filtros["filtros_extra"].append({
+                "key": METRICAS_YF[metrica],
+                "op": OPS.get(operador_str, operator.ge),
+                "val": valor,
+            })
+            # Solo relajar PER si el usuario NO lo pidió explícitamente
+            if not usuario_pidio_per and metrica in ("crecimiento_ingresos", "precio_ventas", "per_futuro"):
+                filtros["ignorar_per_estricto"] = True
+
+    if filtros["ignorar_per_estricto"]:
+        filtros["max_per"] = 99999.0
+
+    # --- Guardián Matemático de Filtros ---
+    if 300 < filtros["max_per"] < 900:  # Acotamos los peticiones absurdas reales, respetando 999.0 y 99999.0 como bypass
+        filtros["max_per"] = 300.0
+        
+    if filtros["min_div_pct"] > 0.40:
+        filtros["min_div_pct"] = 0.40
+        
+    for f in filtros["filtros_extra"]:
+        if f["key"] == "revenueGrowth" and f["val"] > 5.0:
+            f["val"] = 5.0
+
+    return filtros
+
+async def pipeline_hibrido(solicitud: str, msg_espera=None, fuente_datos: str = "yahoo"):
+    """Wrapper: ejecuta la fase NLP (barata/Gemini) fuera del semáforo y la fase
+    intensiva de I/O (Yahoo/QuickChart) dentro. Así el semáforo no bloquea durante
+    los reintentos NLP de 10-20 segundos.
+    """
+    if _PIPELINE_SEMA is None:
+        raise HTTPException(status_code=503, detail="Bot iniciando, reintenta en 5s")
+
+    # --- FASE 1: NLP (fuera del semáforo — no consume slot de concurrencia YF) ---
+    if msg_espera:
+        try: await msg_espera.edit_text("🔍 Analizando tipo de activo e infiriendo perfil del inversor...")
+        except BadRequest: pass
+
+    extraccion = None
+    for i_retry, espera_retry in enumerate([10, 20, None]):
+        extraccion = await extractor_intenciones(solicitud)
+        if extraccion and extraccion.get("_rate_limit"):
+            if espera_retry is not None:
+                logger.warning(f"Rate limit Gemini, reintentando en {espera_retry}s (intento {i_retry+1})...")
+                if msg_espera:
+                    try: await msg_espera.edit_text(f"⏳ Motor IA ocupado, reintentando en {espera_retry}s...")
+                    except BadRequest: pass
+                await asyncio.sleep(espera_retry)  # duerme FUERA del semáforo
+                continue
+            else:
+                return "⚠️ El motor IA está temporalmente saturado. Por favor, espera 1 minuto e inténtalo de nuevo.", None, None, None
+        break
+
+    # --- FASE 2: I/O intensiva (dentro del semáforo) ---
+    async with _PIPELINE_SEMA:
+        return await _pipeline_hibrido_interno(extraccion, solicitud, msg_espera, fuente_datos)
+
+async def _pipeline_hibrido_interno(
+    extraccion: dict | None,
+    solicitud: str,
+    msg_espera=None,
+    fuente_datos: str = "yahoo"
+) -> tuple[str | None, str | None, str | None, str | None]:
+    """Orquesta Filtro Fundamentales → Gráfico → Goldman Sachs.
+    La fase NLP ya se ejecutó en pipeline_hibrido() fuera del semáforo.
+    Retorna SIEMPRE 4 valores: (texto_final, ruta_grafico, url_compra, ticker_final)
+    """
+    if extraccion and extraccion.get("error_api"):
+        return f"__TROLL__ ⚠️ {extraccion['error_api']}", None, None, None
+
+    _t_manuales = extraccion.get("tickers_manuales") if extraccion else None
+    _t_legacy   = extraccion.get("tickers") if extraccion else None
+    _hay_clase  = extraccion.get("clase_activo") if extraccion else None
+    if not extraccion or not (_t_manuales or _t_legacy or _hay_clase):
+        logger.error(f"[PIPELINE] Extractor devolvio resultado invalido: {extraccion}")
+        return (
+            "❌ El Extractor IA no logró identificar activos para esa consulta.\n"
+            "Prueba a ser más específico, por ejemplo:\n"
+            "  • 'acciones con dividendo >5% del sector energía'\n"
+            "  • 'ETFs tecnológicos baratos'\n"
+            "  • 'REITs con rentabilidad alta'",
+            None, None, None
+        )
+
+    clase_activo = extraccion.get("clase_activo", "ACCION").upper()
+    perfil = extraccion.get("perfil", "Balanceado")
+    sector_ia = extraccion.get("sector")
+    filtros_dinamicos_raw = extraccion.get("filtros_dinamicos", [])
+
+    logger.info(f"[PIPELINE] Solicitud='{solicitud[:80]}' | Clase={clase_activo} | Perfil={perfil} | Sector={sector_ia} | FiltrosDin={filtros_dinamicos_raw}")
+
+    tickers = extraccion.get("tickers_manuales") or extraccion.get("tickers") or []
+    if not tickers:
+        if msg_espera:
+            try: await msg_espera.edit_text(f"📡 Consultando terminal de activos para sector: <b>{sector_ia}</b>...", parse_mode="HTML")
+            except BadRequest: pass
+        tickers = await db.obtener_semillas_busqueda(clase_activo, sector_ia)
+        logger.info(f"[PIPELINE] Semillas obtenidas para ({clase_activo}, {sector_ia}): {tickers}")
+        if not tickers:
+            tickers = await db.obtener_semillas_busqueda(clase_activo)
+            logger.info(f"[PIPELINE] Semillas fallback para {clase_activo}: {tickers}")
+    else:
+        logger.info(f"[PIPELINE] Tickers manuales/extractados: {tickers}")
+
+    if not tickers:
+        logger.error(f"[PIPELINE] Sin tickers candidatos para clase={clase_activo} sector={sector_ia}")
+        return "❌ No se han encontrado activos candidatos en el registro para esa categoría.", None, None, None
+
+    EMOJIS_CLASE = {
+        "ACCION": "🏢", "REIT": "🏠", "ETF": "📈", "CRIPTO": "₿", "BONO": "📜"
+    }
+    emoji_clase = EMOJIS_CLASE.get(clase_activo, "📈")
+
+    if msg_espera:
+        try:
+            await msg_espera.edit_text(
+                f"🛠️ Clase detectada: <b>{emoji_clase} {clase_activo}</b> | Perfil: <b>{perfil}</b>.\n"
+                f"Lanzando escáner a {len(tickers)} activos simultáneamente...",
+                parse_mode="HTML"
+            )
+        except BadRequest: pass
+
+    pre_ganadores = []
+    filtros: dict = {"temporalidad": "3mo", "rendimiento_objetivo": 0.0, "rendimiento_op": operator.ge}
+
+    # --- Dispatch por clase ---
+    if clase_activo == "ACCION":
+        filtros_base = _construir_filtros(perfil, filtros_dinamicos_raw)
+        logger.info(f"[FILTROS BASE] max_per={filtros_base.get('max_per')} min_div_pct={filtros_base.get('min_div_pct')} min_div_abs={filtros_base.get('min_div_abs')} extras={filtros_base.get('filtros_extra')}")
+        max_intentos = 4
+
+        for intento in range(max_intentos):
+            filtros = copy.deepcopy(filtros_base)
+
+            if intento > 0:
+                if intento == max_intentos - 1:
+                    filtros["max_per"]     = 99999
+                    filtros["min_div_pct"] = 0.0
+                    filtros["min_div_abs"] = 0.0
+                else:
+                    factor_per = 1.5 ** intento
+                    factor_div = 0.60 ** intento
+                    if filtros["max_per"] < 99999:
+                        filtros["max_per"] = min(filtros_base["max_per"] * factor_per, 99998)
+                    filtros["min_div_pct"] = max(0, filtros_base["min_div_pct"] * factor_div)
+                    filtros["min_div_abs"] = max(0, filtros_base["min_div_abs"] * factor_div)
+
+                if msg_espera:
+                    try:
+                        estado = "críticos" if intento == max_intentos - 1 else "relajados"
+                        await msg_espera.edit_text(
+                            f"🔄 Reintentando con filtros {estado} (intento {intento+1}/{max_intentos})..."
+                        )
+                    except BadRequest: pass
+                await asyncio.sleep(0.5)
+
+            logger.info(f"[FILTROS INTENTO {intento+1}/{max_intentos}] max_per={filtros['max_per']:.1f} min_div_pct={filtros['min_div_pct']:.4f} min_div_abs={filtros['min_div_abs']:.4f}")
+
+            filtros_snap = {
+                "max_per":     filtros["max_per"],
+                "min_div_pct": filtros["min_div_pct"],
+                "min_div_abs": filtros["min_div_abs"],
+                "per_op":      filtros["per_op"],
+                "div_op":      filtros["div_op"],
+                "div_abs_op":  filtros["div_abs_op"],
+                "filtros_extra": list(filtros["filtros_extra"]),
+            }
+            datos_bulk = await _obtener_info_bulk(tickers, "ACCION")
+
+            # Log por ticker: qué datos reales tiene y si pasa el checker
+            for t in tickers:
+                d = datos_bulk.get(t, {})
+                per_real = d.get("trailingPE") or d.get("forwardPE")
+                div_real = d.get("dividendYield") or d.get("dividendRate", 0)
+                logger.info(f"[CHECKER ACCION] {t} | PER={per_real} DIV_YIELD={div_real} | claves_total={len(d)}")
+
+            resultados = [_chequear_fundamentales_accion(t, datos_bulk.get(t, {}), filtros_snap) for t in tickers]
+            pre_ganadores = [r for r in resultados if r is not None]
+            logger.info(f"[ACCION INTENTO {intento+1}] pre_ganadores={len(pre_ganadores)}/{len(tickers)} -> {[g['ticker'] for g in pre_ganadores]}")
+            if pre_ganadores:
+                break
+
+    elif clase_activo == "REIT":
+        datos_bulk = await _obtener_info_bulk(tickers, "REIT")
+        resultados = [_chequear_fundamentales_reit(t, datos_bulk.get(t, {}), filtros_dinamicos_raw) for t in tickers]
+        pre_ganadores = [r for r in resultados if r is not None]
+        logger.info(f"[REIT] pre_ganadores={len(pre_ganadores)}/{len(tickers)} -> {[g['ticker'] for g in pre_ganadores]}")
+
+    elif clase_activo == "ETF":
+        datos_bulk = await _obtener_info_bulk(tickers, "ETF")
+        resultados = [_chequear_fundamentales_etf(t, datos_bulk.get(t, {}), filtros_dinamicos_raw) for t in tickers]
+        pre_ganadores = [r for r in resultados if r is not None]
+        logger.info(f"[ETF] pre_ganadores={len(pre_ganadores)}/{len(tickers)} -> {[g['ticker'] for g in pre_ganadores]}")
+
+    elif clase_activo == "CRIPTO":
+        datos_bulk = await _obtener_info_bulk(tickers, "CRIPTO")
+        resultados = [_chequear_fundamentales_cripto(t, datos_bulk.get(t, {}), filtros_dinamicos_raw) for t in tickers]
+        pre_ganadores = [r for r in resultados if r is not None]
+        logger.info(f"[CRIPTO] pre_ganadores={len(pre_ganadores)}/{len(tickers)} -> {[g['ticker'] for g in pre_ganadores]}")
+
+    elif clase_activo == "BONO":
+        datos_bulk = await _obtener_info_bulk(tickers, "BONO")
+        resultados = [_chequear_fundamentales_bono(t, datos_bulk.get(t, {}), filtros_dinamicos_raw) for t in tickers]
+        pre_ganadores = [r for r in resultados if r is not None]
+        logger.info(f"[BONO] pre_ganadores={len(pre_ganadores)}/{len(tickers)} -> {[g['ticker'] for g in pre_ganadores]}")
+
+    else:
+        return f"❌ Clase de activo no reconocida: {clase_activo}.", None, None, None
+
+    if not pre_ganadores:
+        logger.warning(f"[PIPELINE] CERO pre_ganadores para {clase_activo}. YF puede estar bloqueando o los filtros son demasiado estrictos incluso en el intento final.")
+        return (
+            "⚠️ El mercado actual no ofrece activos que cumplan exactamente esos filtros tan estrictos.",
+            None, None, f"FALLBACK_REQ_{clase_activo}"
+        )
+
+    # --- 3. Filtro de rendimiento gráfico (FIX #2: prefetch concurrente + ordenación) ---
+    temporalidad = "3mo"
+    if clase_activo == "ACCION":
+        temporalidad = filtros.get("temporalidad", "3mo")
+    elif clase_activo == "CRIPTO":
+        temporalidad = "1mo"
+
+    rendimiento_objetivo = 0.0
+    rendimiento_op = operator.ge
+    if clase_activo == "ACCION":
+        rendimiento_objetivo = filtros.get("rendimiento_objetivo", 0.0)
+        rendimiento_op = filtros.get("rendimiento_op", operator.ge)
+
+    if msg_espera:
+        try:
+            await msg_espera.edit_text(
+                f"🔥 ¡Criba superada por {len(pre_ganadores)} activos!\n"
+                f"Prefetch concurrente de rendimiento ({temporalidad})..."
+            )
+        except BadRequest: pass
+
+    # Pre-fetch concurrente: obtenemos el rendimiento de todos los candidatos a la vez
+    # usando solo yfinance (sin generar imágenes). Coste: N llamadas YF en paralelo.
+    async def _fetch_rend_solo(gan: dict) -> tuple[dict, float]:
+        """Obtiene el rendimiento histórico sin generar la imagen del gráfico."""
+        try:
+            hist = await asyncio.wait_for(
+                asyncio.to_thread(
+                    lambda: yf.Ticker(gan["ticker"], session=_YF_SESSION).history(period=temporalidad)
+                ),
+                timeout=10.0
+            )
+            hist = hist.dropna(subset=["Close"])
+            if hist.empty or len(hist) < 2:
+                logger.warning(f"[REND PREFETCH] {gan['ticker']}: hist vacío en {temporalidad}")
+                return gan, 0.0
+            p0, p1 = float(hist["Close"].iloc[0]), float(hist["Close"].iloc[-1])
+            rend = 0.0 if p0 == 0 else ((p1 - p0) / p0) * 100
+            logger.info(f"[REND PREFETCH] {gan['ticker']}: {rend:+.2f}% ({temporalidad}) | umbral={rendimiento_objetivo}% op={rendimiento_op.__name__ if hasattr(rendimiento_op,'__name__') else rendimiento_op}")
+            return gan, rend
+        except asyncio.TimeoutError:
+            logger.warning(f"[REND PREFETCH] {gan['ticker']}: TIMEOUT en history()")
+            return gan, 0.0
+        except Exception as e:
+            logger.warning(f"[REND PREFETCH] {gan['ticker']}: ERROR {type(e).__name__}: {e}")
+            return gan, 0.0
+
+    tuples_rend = await asyncio.gather(*(_fetch_rend_solo(g) for g in pre_ganadores))
+
+    candidatos_validos = [
+        (gan, rend) for gan, rend in tuples_rend
+        if gan.get("_best_effort", False) or rendimiento_op(rend, rendimiento_objetivo)
+    ]
+    candidatos_validos.sort(key=lambda x: x[1], reverse=True)
+
+    logger.info(f"[PIPELINE] candidatos_validos tras filtro rend={rendimiento_objetivo}%: {[(g['ticker'], round(r,2)) for g,r in candidatos_validos]}")
+
+    if not candidatos_validos:
+        logger.warning(f"[PIPELINE] CERO candidatos_validos. Pre-ganadores tenían rends: {[(t for t,r in [(g['ticker'],r) for g,r in tuples_rend])]}")
+        return (
+            f"❌ Filtro Gráfico Fallido.\n"
+            f"He analizado las {len(pre_ganadores)} finalistas, pero ninguna cumple "
+            f"el umbral de rendimiento en {temporalidad}.\n"
+            f"Intenta relajar tu exigencia numérica.",
+            None, None, None
+        )
+
+    # Solicitamos el gráfico únicamente al ganador real (mejor rendimiento)
+    mejor_opcion, mejor_rend = candidatos_validos[0]
+    mejor_opcion = dict(mejor_opcion)  # copia defensiva antes de mutar
+    mejor_opcion["rendimiento_real"] = round(mejor_rend, 2)
+    ruta_captura_final, _ = await fabricante_de_graficos(mejor_opcion["ticker"], temporalidad)
+
+    if msg_espera:
+        try:
+            await msg_espera.edit_text(
+                f"✅ ¡Gema {clase_activo} localizada: {mejor_opcion['ticker']}!\n"
+                f"Redactando sumario ejecutivo Goldman Sachs..."
+            )
+        except BadRequest: pass
+
+    # --- 4. Generador Goldman Sachs ---
+    ticker_final = mejor_opcion["ticker"]
+    try:
+        informe_gs = await generador_informe_goldman(
+            ticker_final, sector_ia, mejor_opcion, perfil, clase_activo
+        )
+    except Exception as e:
+        logger.error(f"[GS] Error generando informe: {e}")
+        return "❌ Error al generar el informe ejecutivo. Intenta de nuevo.", None, None, None
+
+    if not informe_gs:
+        informe_gs = f"Datos Crudos: {ticker_final} | Clase: {clase_activo} | {json.dumps(mejor_opcion)}"
+    else:
+        informe_gs = informe_gs.replace("*", "")
+
+    fuente = fuente_datos if fuente_datos in FUENTES_DATOS else "yahoo"
+    url_compra = FUENTES_DATOS[fuente]["url"].format(ticker=ticker_final)
+
+    rend_str = mejor_opcion.get("rendimiento_real", 0)
+    texto_final = (
+        f"⚡ ALERTA {emoji_clase} {clase_activo}: {ticker_final}\n"
+        f"📈 Momentum ({temporalidad}): {'+' if rend_str >= 0 else ''}{rend_str}%\n\n"
+        f"{informe_gs}"
+    )
+    texto_final = _limpiar_html_telegram(texto_final)
+    return texto_final, ruta_captura_final, url_compra, ticker_final
+
+
+
+

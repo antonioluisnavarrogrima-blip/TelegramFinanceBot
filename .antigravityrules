@@ -1,0 +1,7 @@
+# REGLAS GLOBALES DE MEMORIA Y NOTEBOOKLM
+
+1. CONSULTA OBLIGATORIA: Antes de sugerir cambios en la arquitectura o resolver bugs complejos, usa el MCP para consultar nuestro cuaderno de NotebookLM.
+2. MAPA DE DEPENDENCIAS: Si creas un nuevo archivo .py o modificas cómo se conectan los módulos, actualiza el archivo MAPA_DEPENDENCIAS.md (ubicado en Drive).
+3. DIARIO DE DECISIONES: Si cambiamos una librería, alteramos la base de datos o tomamos una decisión de diseño, documenta el "por qué" en DECISION_LOG.md (ubicado en Drive).
+4. FLUJO DE GIT: Cada vez que me ayudes a hacer un `git commit` o te diga "guarda los cambios", debes ejecutar un comando vía MCP para sincronizar el estado actual de los archivos MD con NotebookLM.
+5. EFICIENCIA DE LECTURA (SYMBOLS): Antes de analizar todo el código fuente o buscar una función, revisa primero `SYMBOLS.md`. Este índice te dirá exactamente en qué módulo y línea se encuentra el elemento que buscas, ahorrando millones de tokens a largo plazo.

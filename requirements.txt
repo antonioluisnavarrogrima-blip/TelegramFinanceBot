@@ -16,3 +16,8 @@ stripe==11.5.0
 requests==2.32.3
 cachetools==5.3.3
 
+# --- Google APIs y Sincronización ---
+google-auth==2.38.0
+google-auth-oauthlib==1.3.1
+google-api-python-client==2.160.0
+notebooklm-mcp-cli==1.1.2

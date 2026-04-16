@@ -1,0 +1,371 @@
+--- MÓDULO: 08_Screener_Tablas ---
+
+// ARCHIVO DE ORIGEN: bot.py
+// LÍNEAS ORIGINALES: 166-209, 1286-1605
+
+# --- CONFIGURACIÓN DE TABLAS DE FILTROS (Análisis sin IA) ---
+TABLA_CAMPOS = {
+    "ACCION": [
+        {"key": "sector",        "label": "🏭 Sector de búsqueda",           "tipo": "opcion",
+         "opciones_btn": [("💻 Tecnología","tecnologia"),("⚡ Energía","energia"),("🏦 Banca","banca"),("🏥 Salud","salud"),("🏭 Industria","industria"),("🛒 Consumo","consumo"),("🌍 Todos","__all__")],
+         "default": None},
+        {"key": "per_max",       "label": "📊 PER máximo",                    "tipo": "numero",
+         "opciones_btn": [("≤15","15"),("≤20","20"),("≤25","25"),("≤40","40"),("Sin filtro","9999")],
+         "default": 9999.0},
+        {"key": "dividendo_min", "label": "💰 Dividendo mínimo (%)",            "tipo": "numero",
+         "opciones_btn": [("Sin div.","0"),("≥1%","1"),("≥3%","3"),("≥5%","5"),("≥8%","8")],
+         "default": 0.0},
+        {"key": "beta_max",      "label": "🎢 Beta máxima (volatilidad)",       "tipo": "numero",
+         "opciones_btn": [("≤0.7","0.7"),("≤1.0","1.0"),("≤1.5","1.5"),("Sin filtro","99")],
+         "default": 99.0},
+    ],
+    "REIT": [
+        {"key": "dividendo_min", "label": "💰 Dividend Yield mínimo (%)",       "tipo": "numero",
+         "opciones_btn": [("≥3%","3"),("≥4%","4"),("≥5%","5"),("≥6%","6"),("≥8%","8")],
+         "default": 3.0},
+        {"key": "p_ffo_max",    "label": "📐 P/FFO máximo (valoración)",        "tipo": "numero",
+         "opciones_btn": [("≤15x","15"),("≤20x","20"),("≤30x","30"),("Sin filtro","999")],
+         "default": 999.0},
+    ],
+    "ETF": [
+        {"key": "ter_max",      "label": "💼 TER máximo - Coste anual (%)",    "tipo": "numero",
+         "opciones_btn": [("≤0.1%","0.1"),("≤0.2%","0.2"),("≤0.5%","0.5"),("Sin filtro","99")],
+         "default": 99.0},
+        {"key": "aum_min_bn",   "label": "🏦 AUM mínimo (Bn USD)",             "tipo": "numero",
+         "opciones_btn": [("≥1 Bn","1"),("≥5 Bn","5"),("≥10 Bn","10"),("Sin filtro","0")],
+         "default": 0.0},
+    ],
+    "CRIPTO": [
+        {"key": "market_cap_min_bn", "label": "💹 Market Cap mínimo (Bn USD)", "tipo": "numero",
+         "opciones_btn": [("≥1 Bn","1"),("≥10 Bn","10"),("≥50 Bn","50"),("≥100 Bn","100"),("Sin filtro","0")],
+         "default": 1.0},
+    ],
+    "BONO": [
+        {"key": "ytm_min",      "label": "📈 YTM / Cupón mínimo (%)",          "tipo": "numero",
+         "opciones_btn": [("≥2%","2"),("≥3%","3"),("≥4%","4"),("≥5%","5"),("Sin filtro","0")],
+         "default": 2.0},
+    ],
+}
+
+# --- 4b. SISTEMA DE AN\u00c1LISIS POR TABLA (sin IA) ---
+
+async def _pipeline_por_tabla(
+    clase_activo: str,
+    filtros_tabla: dict,
+    msg_espera=None
+) -> tuple[str | None, bytes | None, str | None]:
+    """Screener determin\u00edstico sin IA. Retorna (texto, bytes_grafico, ticker)."""
+    clase_activo = clase_activo.upper()
+    sector_tabla = filtros_tabla.get("sector")
+    if sector_tabla == "__all__":
+        sector_tabla = None
+
+    tickers = await db.obtener_semillas_busqueda(clase_activo, sector_tabla)
+    if not tickers:
+        tickers = await db.obtener_semillas_busqueda(clase_activo)
+    if not tickers:
+        return "\u274c No hay activos registrados para esa categor\u00eda.", None, None
+
+    if msg_espera:
+        try:
+            await msg_espera.edit_text(f"\ud83d\udd0d Escaneando {len(tickers)} activos {clase_activo} en Yahoo Finance...")
+        except Exception:
+            pass
+
+    ganadores = []
+    if clase_activo == "ACCION":
+        per_max  = float(filtros_tabla.get("per_max", 9999))
+        div_min  = float(filtros_tabla.get("dividendo_min", 0)) / 100.0
+        beta_max = float(filtros_tabla.get("beta_max", 99))
+        filtros_a = {
+            "max_per": per_max, "min_div_pct": div_min, "min_div_abs": 0.0,
+            "per_op": operator.le, "div_op": operator.ge, "div_abs_op": operator.ge,
+            "rendimiento_objetivo": 0.0, "rendimiento_op": operator.ge,
+            "temporalidad": "3mo", "ignorar_per_estricto": per_max >= 9999,
+            "filtros_extra": [{"key": "beta", "op": operator.le, "val": beta_max}] if beta_max < 99 else [],
+        }
+        datos_bulk = await _obtener_info_bulk(tickers, "ACCION")
+        resultados = [_chequear_fundamentales_accion(t, datos_bulk.get(t, {}), filtros_a) for t in tickers]
+        try:
+            ganadores = [r for r in resultados if r is not None]
+        except asyncio.TimeoutError:
+            ganadores = []
+
+    elif clase_activo == "REIT":
+        div_min   = float(filtros_tabla.get("dividendo_min", 3))
+        p_ffo_max = float(filtros_tabla.get("p_ffo_max", 999))
+        fe = [{"metrica": "dividend_yield", "operador": ">=", "valor": div_min},
+              {"metrica": "p_ffo",           "operador": "<=", "valor": p_ffo_max}]
+        datos_bulk = await _obtener_info_bulk(tickers, "REIT")
+        resultados = [_chequear_fundamentales_reit(t, datos_bulk.get(t, {}), fe) for t in tickers]
+        try:
+            ganadores = [r for r in resultados if r is not None]
+        except asyncio.TimeoutError:
+            ganadores = []
+
+    elif clase_activo == "ETF":
+        ter_max = float(filtros_tabla.get("ter_max", 99))
+        aum_min = float(filtros_tabla.get("aum_min_bn", 0)) * 1e9
+        fe = [{"metrica": "ter", "operador": "<=", "valor": ter_max},
+              {"metrica": "aum", "operador": ">=", "valor": aum_min}]
+        datos_bulk = await _obtener_info_bulk(tickers, "ETF")
+        resultados = [_chequear_fundamentales_etf(t, datos_bulk.get(t, {}), fe) for t in tickers]
+        try:
+            ganadores = [r for r in resultados if r is not None]
+        except asyncio.TimeoutError:
+            ganadores = []
+
+    elif clase_activo == "CRIPTO":
+        mcap_min = float(filtros_tabla.get("market_cap_min_bn", 0)) * 1e9
+        fe = [{"metrica": "market_cap", "operador": ">=", "valor": mcap_min}]
+        datos_bulk = await _obtener_info_bulk(tickers, "CRIPTO")
+        resultados = [_chequear_fundamentales_cripto(t, datos_bulk.get(t, {}), fe) for t in tickers]
+        try:
+            ganadores = [r for r in resultados if r is not None]
+        except asyncio.TimeoutError:
+            ganadores = []
+
+    elif clase_activo == "BONO":
+        ytm_min = float(filtros_tabla.get("ytm_min", 0))
+        fe = [{"metrica": "dividend_yield", "operador": ">=", "valor": ytm_min}]
+        datos_bulk = await _obtener_info_bulk(tickers, "BONO")
+        resultados = [_chequear_fundamentales_bono(t, datos_bulk.get(t, {}), fe) for t in tickers]
+        try:
+            ganadores = [r for r in resultados if r is not None]
+        except asyncio.TimeoutError:
+            ganadores = []
+    else:
+        return f"\u274c Clase no reconocida: {clase_activo}.", None, None
+
+    if not ganadores:
+        return (
+            f"\u274c Ning\u00fan activo {clase_activo} cumple los filtros especificados.\n"
+            "Prueba a relajar los umbrales.",
+            None, None
+        )
+
+    mejor = None
+    grafico_bytes = None
+    temporalidad  = "1mo" if clase_activo == "CRIPTO" else "3mo"
+    # Evaluación perezosa (Lazy Load): Solo pedimos el gráfico que necesitamos
+    for gan in ganadores:
+        buf_graf, rend = await fabricante_de_graficos(gan["ticker"], temporalidad)
+        if rend is not None:
+            gan["rendimiento_real"] = round(rend, 2)
+            mejor = gan
+            grafico_bytes = buf_graf
+            break
+    if not mejor:
+        mejor = ganadores[0]
+        mejor["rendimiento_real"] = 0.0
+
+    texto = _formatear_resultado_tabla(mejor, clase_activo)
+    return texto, grafico_bytes, mejor["ticker"]
+
+
+def _formatear_resultado_tabla(datos: dict, clase_activo: str) -> str:
+    """Formatea el resultado del an\u00e1lisis por tabla en un mensaje Telegram legible."""
+    ticker = datos.get("ticker", "?")
+    rend   = datos.get("rendimiento_real", 0.0)
+    EMOJIS = {"ACCION": "\ud83c\udfe2", "REIT": "\ud83c\udfe0", "ETF": "\ud83d\udcc8", "CRIPTO": "\u20bf", "BONO": "\ud83d\udcdc"}
+    emoji  = EMOJIS.get(clase_activo, "\ud83d\udcca")
+
+    lineas = [
+        f"\ud83d\udcca <b>RESULTADO \u2014 AN\u00c1LISIS POR TABLA</b>",
+        f"",
+        f"{emoji} <b>Ticker:</b> {ticker}",
+        f"\ud83d\uddc2 <b>Clase:</b> {clase_activo}",
+        f"",
+        f"\ud83d\udcc8 <b>M\u00e9tricas verificadas (Yahoo Finance):</b>",
+    ]
+    if clase_activo == "ACCION":
+        if datos.get("per") not in (None, "N/A"):
+            lineas.append(f"  \u2022 PER: <b>{datos['per']}</b>")
+        if datos.get("div_yield_pct") is not None:
+            lineas.append(f"  \u2022 Dividendo Yield: <b>{datos['div_yield_pct']}%</b>")
+        if datos.get("div_rate_abs"):
+            lineas.append(f"  \u2022 Dividendo Abs.: <b>${datos['div_rate_abs']}/a\u00f1o</b>")
+    elif clase_activo == "REIT":
+        if datos.get("div_yield_pct"):
+            lineas.append(f"  \u2022 Dividend Yield: <b>{datos['div_yield_pct']}%</b>")
+        if datos.get("p_ffo_proxy") not in (None, "N/A"):
+            lineas.append(f"  \u2022 P/FFO (proxy): <b>{datos['p_ffo_proxy']}x</b>")
+        if datos.get("sector"):
+            lineas.append(f"  \u2022 Subsector: <b>{datos['sector']}</b>")
+    elif clase_activo == "ETF":
+        if datos.get("ter_pct") not in (None, "N/A"):
+            lineas.append(f"  \u2022 TER anual: <b>{datos['ter_pct']}%</b>")
+        if datos.get("aum_bn"):
+            lineas.append(f"  \u2022 AUM: <b>{datos['aum_bn']} Bn USD</b>")
+        if datos.get("div_yield_pct"):
+            lineas.append(f"  \u2022 Dividend Yield: <b>{datos['div_yield_pct']}%</b>")
+    elif clase_activo == "CRIPTO":
+        if datos.get("market_cap_bn"):
+            lineas.append(f"  \u2022 Market Cap: <b>{datos['market_cap_bn']} Bn USD</b>")
+        if datos.get("nombre"):
+            lineas.append(f"  \u2022 Nombre: <b>{datos['nombre']}</b>")
+    elif clase_activo == "BONO":
+        if datos.get("ytm_proxy_pct"):
+            lineas.append(f"  \u2022 YTM / Cup\u00f3n: <b>{datos['ytm_proxy_pct']}%</b>")
+        if datos.get("aum_bn"):
+            lineas.append(f"  \u2022 AUM: <b>{datos['aum_bn']} Bn USD</b>")
+        if datos.get("nombre"):
+            lineas.append(f"  \u2022 Nombre: <b>{datos['nombre']}</b>")
+
+    rend_str = f"+{rend}%" if rend >= 0 else f"{rend}%"
+    lineas.append(f"  \u2022 Momentum 3m: <b>{rend_str}</b>")
+    lineas.append("")
+    lineas.append("<i>\u2139\ufe0f An\u00e1lisis determin\u00edstico sin IA. Para un informe Goldman Sachs completo, usa la b\u00fasqueda libre.</i>")
+    return "\n".join(lineas)
+
+
+async def _enviar_pregunta_tabla(query, context, clase: str, paso: int):
+    """Enviar pregunta del wizard via edit_message_text (flujo de botones)."""
+    campos = TABLA_CAMPOS.get(clase, [])
+    if paso >= len(campos):
+        return
+    campo = campos[paso]
+    total = len(campos)
+    botones, fila = [], []
+    for etiqueta, val in campo.get("opciones_btn", []):
+        fila.append(InlineKeyboardButton(etiqueta, callback_data=f"tabla_resp_{paso}_{val}"))
+        if len(fila) == 2:
+            botones.append(fila); fila = []
+    if fila:
+        botones.append(fila)
+    botones.append([InlineKeyboardButton("\u2b05\ufe0f Cancelar", callback_data="volver_menu")])
+    await query.edit_message_text(
+        f"\ud83d\udcca <b>AN\u00c1LISIS POR TABLA \u2014 {clase}</b> ({paso+1}/{total})\n\n"
+        f"<b>{campo['label']}</b>\n\n"
+        "Selecciona una opci\u00f3n:",
+        reply_markup=InlineKeyboardMarkup(botones),
+        parse_mode="HTML"
+    )
+
+
+async def _enviar_pregunta_tabla_message(update, context, clase: str, paso: int):
+    """Enviar pregunta del wizard via reply_text (flujo de texto del usuario)."""
+    campos = TABLA_CAMPOS.get(clase, [])
+    if paso >= len(campos):
+        return
+    campo = campos[paso]
+    total = len(campos)
+    botones, fila = [], []
+    for etiqueta, val in campo.get("opciones_btn", []):
+        fila.append(InlineKeyboardButton(etiqueta, callback_data=f"tabla_resp_{paso}_{val}"))
+        if len(fila) == 2:
+            botones.append(fila); fila = []
+    if fila:
+        botones.append(fila)
+    botones.append([InlineKeyboardButton("\u2b05\ufe0f Cancelar", callback_data="volver_menu")])
+    await update.message.reply_text(
+        f"\ud83d\udcca <b>AN\u00c1LISIS POR TABLA \u2014 {clase}</b> ({paso+1}/{total})\n\n"
+        f"<b>{campo['label']}</b>\n\n"
+        "Selecciona una opci\u00f3n:",
+        reply_markup=InlineKeyboardMarkup(botones),
+        parse_mode="HTML"
+    )
+
+
+async def _ejecutar_tabla_wizard(query, context, chat_id: int):
+    """Ejecutar el screener al completar el wizard (flujo de botones)."""
+    wizard    = context.user_data.get("tabla_wizard", {})
+    clase     = wizard.get("clase", "ACCION")
+    respuestas = wizard.get("respuestas", {})
+    context.user_data["tabla_wizard"] = {}
+
+    await query.edit_message_text("\u23f3 Ejecutando criba sin IA... Por favor espera.")
+    texto, grafico_bytes, ticker = await _pipeline_por_tabla(clase, respuestas)
+
+    if not ticker:
+        await query.edit_message_text(texto or "\u274c No se encontraron activos con esos filtros.")
+        return
+
+    # Bloque de facturación estricto para Wizard
+    creditos = await db.obtener_creditos(chat_id)
+    if creditos <= 0:
+        await query.edit_message_text("💳 <b>Saldo agotado.</b> Recarga créditos desde /comprar.", parse_mode="HTML")
+        return
+    await db.restar_credito(chat_id)
+    cred_r = await db.obtener_creditos(chat_id)
+    texto += f"\n\n<i>Te quedan {cred_r} créditos.</i>"
+
+    fuente      = await db.obtener_fuente_datos(chat_id)
+    fuente_info = FUENTES_DATOS.get(fuente, FUENTES_DATOS["yahoo"])
+    url_chart   = fuente_info["url"].format(ticker=ticker)
+    broker_url  = await db.obtener_broker_url(chat_id)
+    botones = []
+    if broker_url:
+        u = broker_url.replace("{ticker}", ticker) if "{ticker}" in broker_url else broker_url
+        botones.append([InlineKeyboardButton("Comprar en Broker \ud83d\uded2", url=u)])
+    botones.append([InlineKeyboardButton(f"Ver en {fuente_info['nombre']} \ud83d\udcc8", url=url_chart)])
+    teclado = InlineKeyboardMarkup(botones)
+
+    try:
+        if grafico_bytes:
+            await query.message.reply_photo(
+                photo=InputFile(io.BytesIO(grafico_bytes), filename=f"chart_{ticker}.webp"), # replaced
+                caption=texto, reply_markup=teclado, parse_mode="HTML"
+            )
+            try: await query.message.delete()
+            except Exception as e: logger.debug(f"[TABLA] Ignorado al borrar mensaje: {e}")
+        else:
+            await query.edit_message_text(texto, reply_markup=teclado, parse_mode="HTML")
+    except Exception as e:
+        logger.error(f"[TABLA] Error enviando resultado: {e}")
+        try: await query.edit_message_text(texto[:4096], parse_mode=None)
+        except Exception as e2: logger.debug(f"[TABLA] Ignorado en fallback edit: {e2}")
+
+
+async def _ejecutar_tabla_desde_message(update, context, chat_id: int):
+    """Ejecutar el screener al completar el wizard (flujo desde mensaje de texto)."""
+    wizard     = context.user_data.get("tabla_wizard", {})
+    clase      = wizard.get("clase", "ACCION")
+    respuestas = wizard.get("respuestas", {})
+    context.user_data["tabla_wizard"] = {}
+
+    msg = await update.message.reply_text("\u23f3 Ejecutando criba sin IA... Por favor espera.")
+    texto, grafico_bytes, ticker = await _pipeline_por_tabla(clase, respuestas)
+
+    if not ticker:
+        await msg.edit_text(texto or "\u274c No se encontraron activos con esos filtros.")
+        return
+
+    # Bloque de facturación estricto para Wizard
+    creditos = await db.obtener_creditos(chat_id)
+    if creditos <= 0:
+        await msg.edit_text("💳 <b>Saldo agotado.</b> Recarga créditos desde /comprar.", parse_mode="HTML")
+        return
+    await db.restar_credito(chat_id)
+    cred_r = await db.obtener_creditos(chat_id)
+    texto += f"\n\n<i>Te quedan {cred_r} créditos.</i>"
+
+    fuente      = await db.obtener_fuente_datos(chat_id)
+    fuente_info = FUENTES_DATOS.get(fuente, FUENTES_DATOS["yahoo"])
+    url_chart   = fuente_info["url"].format(ticker=ticker)
+    broker_url  = await db.obtener_broker_url(chat_id)
+    botones = []
+    if broker_url:
+        u = broker_url.replace("{ticker}", ticker) if "{ticker}" in broker_url else broker_url
+        botones.append([InlineKeyboardButton("Comprar en Broker 🛒", url=u)])
+    botones.append([InlineKeyboardButton(f"Ver en {fuente_info['nombre']} 📈", url=url_chart)])
+    teclado = InlineKeyboardMarkup(botones)
+
+    try:
+        if grafico_bytes:
+            await update.message.reply_photo(
+                photo=InputFile(io.BytesIO(grafico_bytes), filename=f"chart_{ticker}.webp"), # replaced
+                caption=texto, reply_markup=teclado, parse_mode="HTML"
+            )
+            try: await msg.delete()
+            except Exception as e: logger.debug(f"[TABLA] Ignorado al borrar msg espera: {e}")
+        else:
+            await msg.edit_text(texto, reply_markup=teclado, parse_mode="HTML")
+    except Exception as e:
+        logger.error(f"[TABLA] Error enviando resultado desde msg: {e}")
+        try: await msg.edit_text(texto[:4096], parse_mode=None)
+        except Exception as e2: logger.debug(f"[TABLA] Ignorado en fallback edit msg: {e2}")
+
+
+
+

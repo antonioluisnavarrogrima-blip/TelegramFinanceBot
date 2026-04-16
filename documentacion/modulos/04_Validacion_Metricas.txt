@@ -1,11 +1,12 @@
-import re
+--- MÓDULO: 04_Validacion_Metricas ---
 
-def main():
-    with open('bot.py', 'r', encoding='utf-8') as f:
-        content = f.read()
+// ARCHIVO DE ORIGEN: bot.py
+// LÍNEAS ORIGINALES: 722-819
 
-    # Zombi 1: Replace all _chequear_fundamentales_* functions 
-    new_chequeos = '''def _chequear_fundamentales_accion(ticker: str, info: dict, filtros: dict) -> dict | None:
+
+# --- CACHÉ YFINANCE Y POOLING (FMP ASYNC) ---
+# Inicializado en lifespan para garantizar el event loop correcto de Uvicorn
+def _chequear_fundamentales_accion(ticker: str, info: dict, filtros: dict) -> dict | None:
     try:
         if not info: return None
         per = info.get('trailingPE') or info.get('forwardPE') or 999
@@ -98,94 +99,7 @@ def _chequear_fundamentales_bono(ticker: str, info: dict, filtros_extra: list) -
             "nombre": info.get("shortName", ticker),
         }
     except Exception as e: logger.debug(f"[YF] Error {ticker} (Bono): {e}")
-'''
-    content = re.sub(r'def _chequear_fundamentales_accion.*?def iterar', new_chequeos + '\n\ndef iterar', content, flags=re.DOTALL)
-    # The above regex might fail if `def iterar` isn't immediately after it. Thus, let's use a tighter bound:
-    # Actually, replacing all 5 functions individually or tightly bound is safer.
-    content = re.sub(r'def _chequear_fundamentales_accion.*?def _obtener_info_bulk', new_chequeos + '\n\nasync def _obtener_info_bulk', content, flags=re.DOTALL)
 
-    # Zombi 2: fabricante_de_graficos
-    new_fabricante = '''async def fabricante_de_graficos(ticker: str, periodo: str = "3mo") -> tuple[bytes | None, float]:
-    """Genera un gráfico usando Yahoo Finance y QuickChart.io de forma asíncrona."""
-    try:
-        import yfinance as yf
-        hist = await asyncio.wait_for(
-            asyncio.to_thread(lambda: yf.Ticker(ticker).history(period=periodo)), timeout=10
-        )
-        
-        if hist.empty or len(hist) < 2:
-            return None, 0.0
-            
-        labels = hist.index.strftime('%Y-%m-%d').tolist()
-        prices = [round(p, 2) for p in hist['Close'].tolist()]
-        
-        rendimiento = ((prices[-1] - prices[0]) / prices[0]) * 100
-        color = "rgb(44, 160, 44)" if rendimiento >= 0 else "rgb(214, 39, 40)"
-        
-        qc_payload = {
-            "chart": {
-                "type": "line",
-                "data": {
-                    "labels": labels,
-                    "datasets": [{
-                        "label": f"Precio {ticker}",
-                        "data": prices,
-                        "borderColor": color,
-                        "backgroundColor": "rgba(0,0,0,0)",
-                        "borderWidth": 2,
-                        "pointRadius": 0
-                    }]
-                },
-                "options": {
-                    "legend": {"display": False},
-                    "title": {"display": True, "text": f"Evolución {ticker} ({periodo})"}
-                }
-            },
-            "width": 600,
-            "height": 300,
-            "format": "webp"
-        }
-        
-        global _QUICKCHART_SEMA, http_client
-        if _QUICKCHART_SEMA:
-            async with _QUICKCHART_SEMA:
-                resp_qc = await http_client.post("https://quickchart.io/chart", json=qc_payload)
-        else:
-            resp_qc = await http_client.post("https://quickchart.io/chart", json=qc_payload)
-            
-        if resp_qc.status_code == 200:
-            return resp_qc.content, rendimiento
-        return None, rendimiento
-    except Exception as e:
-        logger.error(f"[CHART] Error generando gráfico para {ticker}: {e}")
-        return None, 0.0'''
 
-    # Wait, in the source code it was `async def fabricante_de_graficos` -> replace till the end of the function.
-    # The function ends before `def _pipeline_hibrido_interno` ? No, before `_REGEX_URL`.
-    content = re.sub(r'async def fabricante_de_graficos.*?_REGEX_URL = re\.compile', new_fabricante + '\n\n_REGEX_URL = re.compile', content, flags=re.DOTALL)
 
-    # Zombi 3: lifespan and dead code _obtener_info_fmp
-    lifespan_new = '''@asynccontextmanager
-async def lifespan(app: FastAPI):
-    global _PIPELINE_SEMA, _CRON_SEMA, _CRON_LOCK, _QUICKCHART_SEMA, http_client
-    _QUICKCHART_SEMA = asyncio.Semaphore(2)
-    _PIPELINE_SEMA = asyncio.Semaphore(15)
-    _CRON_SEMA = asyncio.Semaphore(5)
-    _CRON_LOCK = asyncio.Lock()
-    import httpx
-    http_client = httpx.AsyncClient(timeout=15.0)
-    
-    await db.inicializar_pool()
-    await db.inicializar_db()
-    await db.precargar_semillas_basicas()'''
 
-    content = re.sub(r'@asynccontextmanager\nasync def lifespan\(app: FastAPI\):.*?await db\.precargar_semillas_basicas\(\)', lifespan_new, content, flags=re.DOTALL)
-
-    # Remove _obtener_info_fmp (dead code)
-    content = re.sub(r'async def _obtener_info_fmp.*?return None', '', content, flags=re.DOTALL)
-
-    with open('bot.py', 'w', encoding='utf-8') as f:
-        f.write(content)
-
-if __name__ == "__main__":
-    main()

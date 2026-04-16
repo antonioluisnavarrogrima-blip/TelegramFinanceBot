@@ -81,7 +81,9 @@ TELEGRAM_WEBHOOK_SECRET  = os.getenv("TELEGRAM_WEBHOOK_SECRET", "")
 CRON_SECRET              = os.getenv("CRON_SECRET", "")
 RENDER_EXTERNAL_URL      = os.getenv("RENDER_EXTERNAL_URL", "").rstrip("/")
 CREDITOS_POR_COMPRA      = _obtener_int_env("CREDITOS_POR_COMPRA", 10)
-STRIPE_PAYMENT_URL       = "https://buy.stripe.com/28EcN70yD05tcjHgZm3VC00"
+STRIPE_PAYMENT_URL       = os.getenv("STRIPE_PAYMENT_URL", "")
+FMP_API_KEY              = os.getenv("FMP_API_KEY", "")  # financialmodelingprep.com — free tier, sin tarjeta
+CF_WORKER_PROXY          = os.getenv("CF_WORKER_PROXY", "")
 
 OPS = {
     ">": operator.gt, "<": operator.lt, ">=": operator.ge,
@@ -226,6 +228,56 @@ _REGEX_URL = re.compile(
 )
 
 _INTENT_CACHE = {}
+
+# ── DATASET ESTÁTICO DE EMERGENCIA ──────────────────────────────────────────────
+# Se activa cuando Yahoo Finance bloquea la IP de Render (devuelve 0 tickers válidos).
+# Datos aproximados actualizados a Q1 2026. Permiten responder a consultas genéricas
+# incluso con YF totalmente bloqueado. Goldman Sachs genera el informe sobre estos datos.
+_DATOS_ESTATICOS: dict[str, dict[str, dict]] = {
+    "ACCION": {
+        "T":    {"trailingPE": 17.2, "dividendYield": 0.051, "dividendRate": 1.11, "beta": 0.61, "marketCap": 131e9, "shortName": "AT&T Inc.",             "sector": "Communication Services", "regularMarketPrice": 21.8},
+        "VZ":   {"trailingPE": 15.6, "dividendYield": 0.066, "dividendRate": 2.66, "beta": 0.40, "marketCap": 169e9, "shortName": "Verizon Comm.",          "sector": "Communication Services", "regularMarketPrice": 40.3},
+        "KO":   {"trailingPE": 23.8, "dividendYield": 0.031, "dividendRate": 1.94, "beta": 0.57, "marketCap": 264e9, "shortName": "Coca-Cola Co.",          "sector": "Consumer Staples",       "regularMarketPrice": 62.4},
+        "PG":   {"trailingPE": 26.1, "dividendYield": 0.024, "dividendRate": 3.76, "beta": 0.52, "marketCap": 374e9, "shortName": "Procter & Gamble",       "sector": "Consumer Staples",       "regularMarketPrice": 157.8},
+        "JNJ":  {"trailingPE": 22.4, "dividendYield": 0.034, "dividendRate": 4.96, "beta": 0.54, "marketCap": 395e9, "shortName": "Johnson & Johnson",      "sector": "Healthcare",             "regularMarketPrice": 148.0},
+        "XOM":  {"trailingPE": 14.3, "dividendYield": 0.036, "dividendRate": 3.80, "beta": 0.89, "marketCap": 501e9, "shortName": "Exxon Mobil Corp.",       "sector": "Energy",                 "regularMarketPrice": 104.5},
+        "CVX":  {"trailingPE": 14.8, "dividendYield": 0.046, "dividendRate": 6.52, "beta": 0.85, "marketCap": 273e9, "shortName": "Chevron Corporation",    "sector": "Energy",                 "regularMarketPrice": 143.2},
+        "MO":   {"trailingPE": 9.8,  "dividendYield": 0.085, "dividendRate": 3.92, "beta": 0.56, "marketCap":  84e9, "shortName": "Altria Group Inc.",       "sector": "Consumer Staples",       "regularMarketPrice": 46.1},
+        "IBM":  {"trailingPE": 20.5, "dividendYield": 0.031, "dividendRate": 6.68, "beta": 0.72, "marketCap": 196e9, "shortName": "IBM Corporation",          "sector": "Technology",             "regularMarketPrice": 214.0},
+        "PFE":  {"trailingPE": 10.3, "dividendYield": 0.069, "dividendRate": 1.68, "beta": 0.61, "marketCap": 154e9, "shortName": "Pfizer Inc.",              "sector": "Healthcare",             "regularMarketPrice": 27.2},
+        "ABBV": {"trailingPE": 16.2, "dividendYield": 0.037, "dividendRate": 6.28, "beta": 0.63, "marketCap": 309e9, "shortName": "AbbVie Inc.",              "sector": "Healthcare",             "regularMarketPrice": 174.3},
+        "ENB":  {"trailingPE": 18.4, "dividendYield": 0.076, "dividendRate": 3.77, "beta": 0.70, "marketCap":  81e9, "shortName": "Enbridge Inc.",            "sector": "Energy",                 "regularMarketPrice": 39.6},
+        "MMM":  {"trailingPE": 11.5, "dividendYield": 0.020, "dividendRate": 1.40, "beta": 0.94, "marketCap":  78e9, "shortName": "3M Company",               "sector": "Industrials",            "regularMarketPrice": 138.0},
+        "WBA":  {"trailingPE":  8.1, "dividendYield": 0.095, "dividendRate": 0.91, "beta": 0.77, "marketCap":   9e9, "shortName": "Walgreens Boots Alliance",  "sector": "Healthcare",             "regularMarketPrice": 10.5},
+        "INTC": {"trailingPE": 12.4, "dividendYield": 0.013, "dividendRate": 0.50, "beta": 0.80, "marketCap":  94e9, "shortName": "Intel Corporation",         "sector": "Technology",             "regularMarketPrice": 22.0},
+    },
+    "REIT": {
+        "O":    {"dividendYield": 0.057, "dividendRate": 3.16, "priceToBook": 12.8, "marketCap": 50e9,  "shortName": "Realty Income Corp.",   "sector": "Real Estate", "regularMarketPrice": 55.2},
+        "VNQ":  {"dividendYield": 0.040, "dividendRate": 3.60, "priceToBook": 10.1, "totalAssets": 62e9, "shortName": "Vanguard Real Estate ETF","sector": "Real Estate", "regularMarketPrice": 90.1},
+        "SPG":  {"dividendYield": 0.052, "dividendRate": 8.20, "priceToBook": 16.5, "marketCap": 57e9,  "shortName": "Simon Property Group",   "sector": "Real Estate", "regularMarketPrice": 158.0},
+        "AMT":  {"dividendYield": 0.033, "dividendRate": 6.80, "priceToBook": 14.2, "marketCap": 83e9,  "shortName": "American Tower Corp.",   "sector": "Real Estate", "regularMarketPrice": 176.0},
+    },
+    "ETF": {
+        "VYM":  {"dividendYield": 0.030, "yield": 0.030, "totalAssets": 78e9,  "shortName": "Vanguard High Div Yield ETF", "regularMarketPrice": 121.0},
+        "SCHD": {"dividendYield": 0.038, "yield": 0.038, "totalAssets": 57e9,  "shortName": "Schwab US Dividend Equity ETF","regularMarketPrice": 79.0},
+        "HDV":  {"dividendYield": 0.040, "yield": 0.040, "totalAssets": 10e9,  "shortName": "iShares Core High Div ETF",    "regularMarketPrice": 108.0},
+        "SPY":  {"dividendYield": 0.013, "yield": 0.013, "totalAssets": 530e9, "shortName": "SPDR S&P 500 ETF Trust",        "regularMarketPrice": 550.0},
+        "QQQ":  {"dividendYield": 0.006, "yield": 0.006, "totalAssets": 250e9, "shortName": "Invesco QQQ Trust",             "regularMarketPrice": 472.0},
+    },
+    "CRIPTO": {
+        "BTC-USD": {"marketCap": 1350e9, "shortName": "Bitcoin",  "regularMarketPrice": 68000},
+        "ETH-USD": {"marketCap": 420e9,  "shortName": "Ethereum", "regularMarketPrice": 3500},
+        "BNB-USD": {"marketCap":  85e9,  "shortName": "BNB",      "regularMarketPrice": 600},
+        "SOL-USD": {"marketCap":  75e9,  "shortName": "Solana",   "regularMarketPrice": 160},
+    },
+    "BONO": {
+        "TLT":  {"dividendYield": 0.043, "yield": 0.043, "totalAssets": 41e9, "shortName": "iShares 20+ Year Treasury Bond", "regularMarketPrice": 95.0},
+        "BND":  {"dividendYield": 0.038, "yield": 0.038, "totalAssets": 114e9,"shortName": "Vanguard Total Bond Market",     "regularMarketPrice": 73.0},
+        "AGG":  {"dividendYield": 0.038, "yield": 0.038, "totalAssets": 106e9,"shortName": "iShares Core US Aggregate Bond","regularMarketPrice": 96.5},
+        "HYG":  {"dividendYield": 0.058, "yield": 0.058, "totalAssets": 17e9, "shortName": "iShares iBoxx High Yield Corp",  "regularMarketPrice": 78.0},
+    },
+}
+
 
 def _guardar_en_cache(hash_key: str, data: dict):
     """Guarda en caché y purga proactivamente (FIFO) si excede 1000 elementos para evitar OOM."""
@@ -430,7 +482,7 @@ async def generador_informe_goldman(ticker: str, sector: str, datos: dict, perfi
 
     try:
         res = await client.aio.models.generate_content(
-            model='gemini-2.0-flash-lite',  # P3: coste ~10x menor que 2.5-flash para resúmenes
+            model='gemini-1.5-flash-8b',  # Coste ínfimo para resúmenes de texto básicos.
             contents=(
                 f"{prompt_sistema}\n"
                 f"Perfil:{perfil}|Sector:{sector}|"  # separadores compactos
@@ -766,10 +818,88 @@ def _chequear_fundamentales_bono(ticker: str, info: dict, filtros_extra: list) -
     except Exception as e: logger.debug(f"[YF] Error {ticker} (Bono): {e}")
 
 
+async def _fetch_fmp_batch(tickers: list[str]) -> dict[str, dict]:
+    """
+    Fuente primaria: Financial Modeling Prep free tier (financialmodelingprep.com).
+    Plan free: 250 req/día, sin tarjeta, funciona desde IPs de datacenter.
+    1 sola request para todos los tickers = máxima eficiencia de cuota.
+    """
+    if not FMP_API_KEY or not tickers:
+        return {}
+    simbolos = ",".join(t.upper() for t in tickers)
+    url = f"https://financialmodelingprep.com/api/v3/quote/{simbolos}?apikey={FMP_API_KEY}"
+    try:
+        resp = await http_client.get(url, timeout=12.0)
+        if resp.status_code != 200:
+            logger.warning(f"[FMP] HTTP {resp.status_code} para {simbolos[:60]}")
+            return {}
+        data = resp.json()
+        if not isinstance(data, list):
+            logger.warning(f"[FMP] Respuesta inesperada: {str(data)[:200]}")
+            return {}
+        resultado = {}
+        for item in data:
+            sym = item.get("symbol", "").upper()
+            if not sym:
+                continue
+            precio = item.get("price") or 0
+            div_anual = item.get("lastDiv") or 0
+            resultado[sym] = {
+                "regularMarketPrice":    precio,
+                "previousClose":         item.get("previousClose"),
+                "marketCap":             item.get("marketCap"),
+                "shortName":             item.get("name", sym),
+                "trailingPE":            item.get("pe"),
+                "forwardPE":             item.get("pe"),
+                "dividendYield":         (div_anual / precio) if precio and div_anual else None,
+                "dividendRate":          div_anual,
+                "beta":                  None,
+                "totalAssets":           item.get("marketCap"),
+                "yield":                 (div_anual / precio) if precio and div_anual else None,
+                "_fuente":               "FMP",
+            }
+        logger.info(f"[FMP] Batch recibido: {len(resultado)}/{len(tickers)} tickers")
+        return resultado
+    except asyncio.TimeoutError:
+        logger.warning("[FMP] Timeout en batch quote")
+        return {}
+    except Exception as e:
+        logger.warning(f"[FMP] Error batch: {type(e).__name__}: {e}")
+        return {}
+
+
+async def _enriquecer_fmp_perfil(ticker: str) -> dict:
+    """Enriquece el ticker ganador con sector/beta/dividendo histórico (1 request extra)."""
+    if not FMP_API_KEY:
+        return {}
+    url = f"https://financialmodelingprep.com/api/v3/profile/{ticker.upper()}?apikey={FMP_API_KEY}"
+    try:
+        resp = await http_client.get(url, timeout=10.0)
+        if resp.status_code != 200:
+            return {}
+        data = resp.json()
+        perfil = data[0] if isinstance(data, list) and data else {}
+        precio = perfil.get("price") or 0
+        div = perfil.get("lastDiv") or 0
+        enrich = {
+            "beta":         perfil.get("beta"),
+            "sector":       perfil.get("sector", ""),
+            "industry":     perfil.get("industry", ""),
+            "dividendRate": div,
+        }
+        if precio and div:
+            enrich["dividendYield"] = div / precio
+        logger.info(f"[FMP PROFILE] {ticker}: sector={enrich['sector']} beta={enrich['beta']} div={div}")
+        return enrich
+    except Exception as e:
+        logger.warning(f"[FMP PROFILE] Error {ticker}: {e}")
+        return {}
+
+
 async def _obtener_info_bulk(tickers: list[str], clase: str) -> dict:
     cached = await db.obtener_yf_cache_bulk(tickers)
     faltantes = [t for t in tickers if t.upper() not in cached]
-    logger.info(f"[YF BULK] {clase} | Total:{len(tickers)} En-cache:{len(cached)} A-descargar:{len(faltantes)}")
+    logger.info(f"[BULK] {clase} | Total:{len(tickers)} En-cache:{len(cached)} A-descargar:{len(faltantes)}")
 
     if faltantes:
         async def fetch_yf(t: str):
@@ -829,6 +959,29 @@ async def _obtener_info_bulk(tickers: list[str], clase: str) -> dict:
             await db.guardar_yf_cache_bulk(nuevos_datos, clase)
 
     logger.info(f"[YF BULK] Cache total disponible: {len(cached)} tickers")
+
+    # ── FALLBACK ESTÁTICO DE EMERGENCIA ──────────────────────────────────────────
+    # Si Yahoo Finance ha bloqueado la IP y no hay ningún ticker válido,
+    # inyectamos el dataset estático para que el bot siempre pueda responder.
+    if not cached:
+        dataset_clase = _DATOS_ESTATICOS.get(clase, {})
+        if dataset_clase:
+            logger.warning(
+                f"[FALLBACK ESTÁTICO] YF retornó 0 tickers válidos para {clase}. "
+                f"Usando dataset estático con {len(dataset_clase)} activos."
+            )
+            # Solo devolvemos los tickers que fueron pedidos (salvo que no haya solapamiento)
+            tickers_upper = {t.upper() for t in tickers}
+            interseccion = {k: v for k, v in dataset_clase.items() if k in tickers_upper}
+            if interseccion:
+                cached = interseccion
+            else:
+                # Los tickers de semillas no coinciden con el estático -> usar todos
+                cached = dict(dataset_clase)
+                logger.warning(f"[FALLBACK ESTÁTICO] Sin solapamiento con semillas {list(tickers_upper)[:5]}... usando toda la clase {clase}.")
+        else:
+            logger.error(f"[FALLBACK ESTÁTICO] Tampoco hay dataset estático para {clase}.")
+
     return cached
 
 async def pipeline_hibrido(solicitud: str, msg_espera=None, fuente_datos: str = "yahoo"):
@@ -2366,16 +2519,32 @@ async def comando_comprar(update: Update, context: ContextTypes.DEFAULT_TYPE):
 telegram_app.add_handler(CommandHandler("comprar", comando_comprar))
 
 
+import urllib.parse
+
 # ── FASTAPI + LIFESPAN ────────────────────────────────────────────────────────
 # Uvicorn es el dueño del bucle de eventos. El bot de Telegram arranca y para
 # dentro del lifespan para compartir ese mismo bucle sin conflictos.
+
+class YahooCloudflareInterceptor(requests.Session):
+    def __init__(self, worker_url: str):
+        super().__init__()
+        self.worker_url = worker_url.rstrip("/")
+
+    def request(self, method, url, **kwargs):
+        parsed = urllib.parse.urlparse(url)
+        if "finance.yahoo.com" in parsed.netloc:
+            new_path = parsed.path
+            if parsed.query:
+                new_path += "?" + parsed.query
+            url = f"{self.worker_url}{new_path}"
+        return super().request(method, url, **kwargs)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global _PIPELINE_SEMA, _CRON_SEMA, _CRON_LOCK, _QUICKCHART_SEMA, http_client, _YF_SESSION
 
-    # P1: Sesión requests con User-Agent de browser real para evitar bloqueo de Yahoo en Render
-    sess = requests.Session()
+    # P1: Proxy de Cloudflare (configurado via .env) para evadir bloqueos de Yahoo Finance en Render
+    sess = YahooCloudflareInterceptor(worker_url=CF_WORKER_PROXY)
     sess.headers.update({
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
                       "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
@@ -2384,6 +2553,7 @@ async def lifespan(app: FastAPI):
         "Accept-Encoding": "gzip, deflate, br",
     })
     _YF_SESSION = sess
+
 
     # P4: Render free tier (512 MB / 0.5 vCPU) — semáforos conservadores
     _QUICKCHART_SEMA = asyncio.Semaphore(2)

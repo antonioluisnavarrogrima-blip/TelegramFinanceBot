@@ -1,0 +1,96 @@
+--- MÓDULO: 10_Pagos_y_Monetizacion ---
+
+// ARCHIVO DE ORIGEN: bot.py
+// LÍNEAS ORIGINALES: 2499-2519, 2630-2697
+
+# ── COMANDO /comprar ──────────────────────────────────────────────────────────
+
+async def comando_comprar(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Genera un enlace de pago de Stripe personalizado con el telegram_id del usuario."""
+    user_id  = update.effective_user.id
+    creditos = await db.obtener_creditos(user_id)
+    url_pago = f"{STRIPE_PAYMENT_URL}?client_reference_id={user_id}"
+    teclado  = InlineKeyboardMarkup([[
+        InlineKeyboardButton(f"💳 Comprar {CREDITOS_POR_COMPRA} créditos →", url=url_pago)
+    ]])
+    await update.message.reply_text(
+        f"💎 <b>Terminal de Recarga Segura</b>\n\n"
+        f"📊 Saldo actual: <b>{creditos}</b> análisis Quant.\n\n"
+        "Descubre activos ganadores en segundos y ahorra horas de criba manual frente a miles de gráficos.\n\n"
+        f"⚡ <b>Cada paquete añade {CREDITOS_POR_COMPRA} créditos automáticamente tras completar el pago (Apple Pay / Google Pay / Tarjeta).</b>",
+        parse_mode="HTML",
+        reply_markup=teclado
+    )
+
+telegram_app.add_handler(CommandHandler("comprar", comando_comprar))
+
+@web_app.post("/webhook-pago")
+async def webhook_pago(request: Request):
+    """
+    Webhook oficial de Stripe. Valida la firma criptográfica HMAC-SHA256.
+    Acredita CREDITOS_POR_COMPRA al telegram_id enviado en client_reference_id.
+    """
+    payload    = await request.body()
+    sig_header = request.headers.get("stripe-signature", "")
+
+    if not STRIPE_WEBHOOK_SECRET:
+        logger.error("[STRIPE] STRIPE_WEBHOOK_SECRET no configurado. Rechazando evento.")
+        raise HTTPException(status_code=500, detail="Webhook no configurado en el servidor.")
+
+    try:
+        event = await asyncio.to_thread(
+            stripe.Webhook.construct_event,
+            payload, sig_header, STRIPE_WEBHOOK_SECRET
+        )
+    except stripe.SignatureVerificationError as e:
+        logger.warning(f"[STRIPE] Firma inválida: {e}")
+        raise HTTPException(status_code=400, detail="Firma Stripe inválida.")
+    except Exception as e:
+        logger.error(f"[STRIPE] Error procesando evento: {e}")
+        raise HTTPException(status_code=400, detail="Evento malformado.")
+
+    event_id = event.get("id", "")
+
+    if event["type"] == "checkout.session.completed":
+        session     = event["data"]["object"]
+        telegram_id = session.get("client_reference_id")
+        
+        # Calcular creditos dinamicos
+        metadata = session.get("metadata", {})
+        if "creditos" in metadata:
+            creditos_a_sumar = int(metadata["creditos"])
+        else:
+            creditos_a_sumar = CREDITOS_POR_COMPRA # Fallback de seguridad puro
+
+        if creditos_a_sumar <= 0:
+            creditos_a_sumar = CREDITOS_POR_COMPRA # Fallback de seguridad
+
+        if telegram_id and event_id:
+            try:
+                # Transacción atómica: inserta evento + acredita créditos en un solo paso.
+                # Si el evento ya existe (duplicado de Stripe), retorna False sin acreditar.
+                acreditado = await db.acreditar_pago_atomico(
+                    event_id, int(telegram_id), creditos_a_sumar
+                )
+                if acreditado:
+                    logger.info(
+                        f"[STRIPE] Pago completado → +{creditos_a_sumar} créditos "
+                        f"al usuario {telegram_id}"
+                    )
+                else:
+                    logger.info(f"[STRIPE] Evento {event_id} duplicado. Sin acreditar.")
+                    return {"ok": True, "duplicado": True}
+            except Exception as e:
+                logger.error(f"[STRIPE] Error acreditando créditos: {e}")
+        else:
+            logger.warning("[STRIPE] Evento sin client_reference_id o event_id.")
+    else:
+        logger.debug(f"[STRIPE] Evento ignorado: {event['type']}")
+        # Marcar igualmente para no reprocesar otros tipos de eventos
+        if event_id:
+            await db.marcar_evento_procesado(event_id)
+
+    return {"ok": True}
+
+
+

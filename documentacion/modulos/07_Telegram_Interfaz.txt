@@ -1,0 +1,580 @@
+--- MÓDULO: 07_Telegram_Interfaz ---
+
+// ARCHIVO DE ORIGEN: bot.py
+// LÍNEAS ORIGINALES: 1606-2178
+
+# --- 4. TELEGRAM BOT HANDLERS ---
+
+
+async def comando_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    # Registrar/actualizar usuario en BD (guarda username si lo tiene)
+    await db.upsert_usuario(user.id, username=user.username or user.first_name)
+    # SINGLE SOURCE OF TRUTH: limpiar cualquier estado bloqueante en BD Y en RAM.
+    # Esto previene soft-locks si Render reinicia el servidor mientras el usuario
+    # estaba en medio de un flujo (ESPERANDO_URL, TABLA_WIZARD, etc.).
+    await db.upsert_usuario(user.id, estado=None)
+    context.user_data.pop('estado', None)
+    context.user_data.pop('tabla_wizard', None)
+    context.user_data.pop('manual_clase', None)
+    context.user_data.pop('manual_perfil', None)
+    creditos = await db.obtener_creditos(user.id)
+    mensaje = (
+        f"🤖 <b>Plataforma Ejecutiva Quant</b>, bienvenido/a {user.first_name}.\n\n"
+        "Soy tu analista financiero personal impulsado por IA. Entiendo tus palabras, infiero tu nivel de riesgo y escaneo miles de activos en tiempo real.\n\n"
+        "🔍 <b>Cobertura de Mercado:</b>\n"
+        "• 🏢 <b>Acciones</b> (Crecimiento, Valor, Dividendos)\n"
+        "• 📈 <b>ETFs</b> (Indexados, Sectoriales)\n"
+        "• 🏗️ <b>REITs</b> (Renta Inmobiliaria)\n"
+        "• 🪙 <b>Cripto</b> (Tokens de capitalización robusta)\n"
+        "• 📊 <b>Bonos</b> (Refugio, Deuda Soberana)\n\n"
+        f"💳 Créditos Quant disponibles: <b>{creditos}</b>\n\n"
+        "<i>¿Qué sector, activo o estrategia quieres analizar hoy?</i>\n"
+        "(Para suscripciones periódicas e integraciones, usa /menu)"
+    )
+    await update.message.reply_text(mensaje, parse_mode="HTML")
+
+
+async def comando_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    tid = update.effective_user.id
+    creditos = await db.obtener_creditos(tid)
+    # Fix: leer strikes reales desde la BD en vez de user_data (en memoria)
+    usuario = await db.obtener_usuario(tid)
+    strikes = usuario["strikes"] if usuario else 0
+    teclado = InlineKeyboardMarkup([
+        [InlineKeyboardButton(f"⚠️ Ver mis Strikes ({strikes})", callback_data="ver_strikes")],
+        [InlineKeyboardButton("🔗 Configurar mi Broker (URL)", callback_data="pedir_url")],
+        [InlineKeyboardButton("🌐 Fuente de Validación", callback_data="pedir_fuente")],
+        [InlineKeyboardButton("⌨️ Bypass (Manual)", callback_data="manual_input"),
+         InlineKeyboardButton("📊 Análisis Tabla", callback_data="tabla_input")],
+        [InlineKeyboardButton("💰 Dividendos VIP", callback_data="btn1click_divs"),
+         InlineKeyboardButton("🚀 Growth Tech", callback_data="btn1click_growth")],
+        [InlineKeyboardButton("🛡️ Blue Chips Seguras", callback_data="btn1click_blue"),
+         InlineKeyboardButton("📉 Buscachollos", callback_data="btn1click_value")],
+        [InlineKeyboardButton("🔔 Configurar Alerta (6h)", callback_data="alerta_6")],
+        [InlineKeyboardButton("🔔 Configurar Alerta (12h)", callback_data="alerta_12")],
+        [InlineKeyboardButton("🛑 Detener Alertas", callback_data="alerta_stop")]
+    ])
+    await update.message.reply_text(
+        f"⚙️ <b>PANEL DE CONTROL CUANTITATIVO</b>\n\n"
+        f"💳 Créditos disponibles: <b>{creditos}</b>\n\n"
+        "Configura tus enlaces al Broker, cambia las fuentes de datos, o activa el <b>Motor Inteligente de Alertas</b> para automatizar la búsqueda de tu nicho favorito.",
+        reply_markup=teclado,
+        parse_mode="HTML"
+    )
+
+
+async def manejador_botones(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    chat_id = update.effective_chat.id
+
+    # --- 🛡️ SISTEMA ANTI-SPAM GLOBAL PARA BOTONES (Prevención DoS) ---
+    # Solo limitamos los botones que activan el escáner o IA. 
+    # Botones de navegación ("volver_menu", etc.) siguen siendo instantáneos.
+    es_boton_pesado = query.data.startswith("btn1click_") or query.data == "reintentar"
+    
+    if es_boton_pesado:
+        ahora = time.time()
+        ultimo_uso = await db.obtener_ultimo_uso(chat_id)
+        ban_level = await db.obtener_ban_level(chat_id)
+        cooldown_segundos = obtener_penalizacion_por_ban_level(ban_level)
+
+        if ahora - ultimo_uso < cooldown_segundos:
+            tiempo_restante = int(cooldown_segundos - (ahora - ultimo_uso))
+            # Muestra un popup flotante en Telegram y detiene la ejecución
+            await query.answer(f"🛑 Sistema procesando. Espera {tiempo_restante}s antes de volver a pulsar.", show_alert=True)
+            return
+            
+        # Si pasa el filtro, bloqueamos inmediatamente para evitar el doble-click accidental
+        await db.actualizar_ultimo_uso(chat_id, ahora)
+
+    await query.answer()  # Responder a Telegram para apagar el relojito del botón
+
+    # --- 1-Click Macros (Bypass Inteligente) ---
+    if query.data.startswith("btn1click_"):
+        modo = query.data.replace("btn1click_", "")
+        await query.edit_message_text("⏳ Ejecutando escáner determinístico ultra-rápido...")
+        
+        filtros = {}
+        clase = "ACCION"
+        if modo == "divs":
+            filtros = {"per_max": 9999, "dividendo_min": 5.0, "beta_max": 99, "sector": "__all__"}
+        elif modo == "growth":
+            filtros = {"per_max": 9999, "dividendo_min": 0, "beta_max": 99, "sector": "tecnologia"}
+        elif modo == "blue":
+            filtros = {"per_max": 20, "dividendo_min": 0, "beta_max": 1.0, "sector": "__all__"}
+        elif modo == "value":
+            filtros = {"per_max": 15, "dividendo_min": 0, "beta_max": 99, "sector": "__all__"}
+            
+        texto, grafico_bytes, ticker = await _pipeline_por_tabla(clase, filtros)
+
+        if not ticker:
+            await query.edit_message_text(texto or "❌ No se encontraron activos con estos filtros extremos hoy.")
+            return
+
+        # Verificar y cobrar créditos para Macros 1-Click
+        creditos = await db.obtener_creditos(chat_id)
+        if creditos <= 0:
+            await query.edit_message_text("💳 <b>Saldo agotado.</b> Recarga créditos desde /comprar.", parse_mode="HTML")
+            return
+        
+        await db.restar_credito(chat_id)
+        cred_r = await db.obtener_creditos(chat_id)
+        texto += f"\n\n<i>Te quedan {cred_r} créditos.</i>"
+
+        fuente = await db.obtener_fuente_datos(chat_id)
+        fuente_info = FUENTES_DATOS.get(fuente, FUENTES_DATOS["yahoo"])
+        url_chart = fuente_info["url"].format(ticker=ticker)
+        broker_url = await db.obtener_broker_url(chat_id)
+        botones = []
+        if broker_url:
+            u = broker_url.replace("{ticker}", ticker) if "{ticker}" in broker_url else broker_url
+            botones.append([InlineKeyboardButton("Comprar en Broker 🛒", url=u)])
+        botones.append([InlineKeyboardButton(f"Ver en {fuente_info['nombre']} 📈", url=url_chart)])
+        teclado = InlineKeyboardMarkup(botones)
+
+        import io
+        from telegram import InputFile
+        try:
+            if grafico_bytes:
+                with io.BytesIO(grafico_bytes) as buf:
+                    await query.message.reply_photo(
+                        photo=InputFile(buf, filename=f"chart_{ticker}.webp"),
+                        caption=texto, reply_markup=teclado, parse_mode="HTML"
+                    )
+                try: await query.message.delete()
+                except Exception: pass
+            else:
+                await query.edit_message_text(texto, reply_markup=teclado, parse_mode="HTML")
+        except Exception as e:
+            logger.error(f"[MACRO] Error: {e}")
+            await query.edit_message_text(texto[:4096], parse_mode=None)
+        return
+
+    # --- Ver Strikes ---
+    if query.data == "ver_strikes":
+        usuario = await db.obtener_usuario(chat_id)
+        strikes   = usuario["strikes"]   if usuario else 0
+        ban_level = usuario["banLevel"]   if usuario else 0
+        cooldown  = obtener_penalizacion_por_ban_level(ban_level)
+        str_tiempo = formatear_tiempo(cooldown)
+        # Fix: el popup de query.answer tiene límite de 200 chars; usamos edit_message_text
+        teclado_volver = InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Volver al Panel", callback_data="volver_menu")]])
+        await query.edit_message_text(
+            text=(
+                f"⚠️ <b>Estado de Moderación</b>\n\n"
+                f"Strikes acumulados: <b>{strikes}</b>\n"
+                f"Nivel de ban: <b>{ban_level}</b>\n"
+                f"Cooldown activo: <b>{str_tiempo}</b>\n\n"
+                "<i>Realiza una consulta financiera válida para resetear a 0.</i>"
+            ),
+            reply_markup=teclado_volver,
+            parse_mode="HTML"
+        )
+        return
+
+    # --- An\u00e1lisis por Tabla (sin IA) ---
+    if query.data == "tabla_input":
+        context.user_data["tabla_wizard"] = {}
+        botones = [
+            [InlineKeyboardButton("\ud83c\udfe2 Acciones",  callback_data="tabla_clase_ACCION"),
+             InlineKeyboardButton("\ud83d\udcc8 ETFs",      callback_data="tabla_clase_ETF")],
+            [InlineKeyboardButton("\ud83c\udfe0 REITs",    callback_data="tabla_clase_REIT"),
+             InlineKeyboardButton("\u20bf Cripto",         callback_data="tabla_clase_CRIPTO")],
+            [InlineKeyboardButton("\ud83d\udcdc Bonos",    callback_data="tabla_clase_BONO")],
+            [InlineKeyboardButton("\u2b05\ufe0f Volver",   callback_data="volver_menu")],
+        ]
+        await query.edit_message_text(
+            "\ud83d\udcca <b>AN\u00c1LISIS POR TABLA</b>\n\n"
+            "Selecciona el tipo de activo a cribar.\n"
+            "<i>No se usa IA \u2014 solo datos reales de Yahoo Finance en tiempo real.</i>",
+            reply_markup=InlineKeyboardMarkup(botones),
+            parse_mode="HTML"
+        )
+        return
+
+    if query.data.startswith("tabla_clase_"):
+        clase = query.data.replace("tabla_clase_", "")
+        if clase not in TABLA_CAMPOS:
+            await query.edit_message_text("\u274c Clase de activo no reconocida.")
+            return
+        context.user_data["tabla_wizard"] = {"clase": clase, "paso": 0, "respuestas": {}, "esperando_texto": False}
+        await _enviar_pregunta_tabla(query, context, clase, 0)
+        return
+
+    if query.data.startswith("tabla_resp_"):
+        # Formato: tabla_resp_{paso}_{valor}
+        partes = query.data.split("_", 3)
+        if len(partes) < 4:
+            return
+        paso = int(partes[2])
+        valor_str = partes[3]
+        wizard = context.user_data.get("tabla_wizard", {})
+        clase  = wizard.get("clase", "ACCION")
+        campos = TABLA_CAMPOS.get(clase, [])
+        if paso >= len(campos):
+            return
+        campo = campos[paso]
+        if campo["tipo"] == "numero":
+            try:
+                wizard["respuestas"][campo["key"]] = float(valor_str)
+            except ValueError:
+                wizard["respuestas"][campo["key"]] = campo.get("default", 0.0)
+        else:
+            wizard["respuestas"][campo["key"]] = valor_str
+        wizard["esperando_texto"] = False
+        siguiente = paso + 1
+        wizard["paso"] = siguiente
+        context.user_data["tabla_wizard"] = wizard
+        if siguiente >= len(campos):
+            await _ejecutar_tabla_wizard(query, context, chat_id)
+        else:
+            await _enviar_pregunta_tabla(query, context, clase, siguiente)
+        return
+
+    # --- Configurar Broker ---
+    if query.data == "pedir_url":
+
+        context.user_data['estado'] = "ESPERANDO_URL"  # En memoria (rápido)
+        await db.upsert_usuario(chat_id, estado="ESPERANDO_URL")  # Persistente en BD
+        teclado_volver = InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Cancelar y Volver", callback_data="volver_menu")]])
+        await query.edit_message_text(
+            text=(
+                "🏦 <b>CONFIGURACIÓN DE CONEXIÓN A BROKER</b>\n\n"
+                "Pégame el enlace absoluto de la plataforma o broker donde suelas operar.\n\n"
+                "💡 <b>Tip Pro:</b> Puedes incluir <code>{ticker}</code> en la URL para enlace dinámico.\n"
+                "Ej: <code>https://www.degiro.es/trade/{ticker}</code>\n\n"
+                "Si no incluyes <code>{ticker}</code>, el botón redirigirá a la página principal de tu broker."
+            ),
+            reply_markup=teclado_volver,
+            parse_mode="HTML"
+        )
+        return
+
+    # --- Selector de Fuente de Datos ---
+    if query.data == "pedir_fuente":
+        fuente_actual = await db.obtener_fuente_datos(chat_id)
+        botones = []
+        for clave, info in FUENTES_DATOS.items():
+            marcador = " ✅" if clave == fuente_actual else ""
+            botones.append([InlineKeyboardButton(
+                f"{info['nombre']}{marcador}",
+                callback_data=f"fuente_{clave}"
+            )])
+        botones.append([InlineKeyboardButton("⬅️ Volver al menú", callback_data="volver_menu")])
+        await query.edit_message_text(
+            text="🌐 <b>FUENTE DE VALIDACIÓN</b>\n\nElige dónde quieres que apunten los enlaces de los reportes:",
+            reply_markup=InlineKeyboardMarkup(botones),
+            parse_mode="HTML"
+        )
+        return
+
+    if query.data.startswith("fuente_"):
+        fuente_elegida = query.data.replace("fuente_", "")
+        if fuente_elegida in FUENTES_DATOS:
+            await db.upsert_usuario(chat_id, fuente_datos=fuente_elegida)
+            nombre = FUENTES_DATOS[fuente_elegida]["nombre"]
+            await query.edit_message_text(
+                text=f"✅ Fuente de validación actualizada a <b>{nombre}</b>.",
+                parse_mode="HTML"
+            )
+        else:
+            await query.edit_message_text(text="❌ Fuente no reconocida.")
+        return
+
+    if query.data == "manual_input":
+        botones = [
+            [InlineKeyboardButton("🏢 Acciones", callback_data="manual_clase_ACCION"),
+             InlineKeyboardButton("📈 ETFs", callback_data="manual_clase_ETF")],
+            [InlineKeyboardButton("🏗️ REITs", callback_data="manual_clase_REIT"),
+             InlineKeyboardButton("🪙 Cripto", callback_data="manual_clase_CRIPTO")],
+            [InlineKeyboardButton("📊 Bonos", callback_data="manual_clase_BONO")],
+            [InlineKeyboardButton("⬅️ Volver", callback_data="volver_menu")]
+        ]
+        await query.edit_message_text(
+            text="⌨️ <b>Entrada Manual de Tickers</b>\n\n¿Qué <b>clase de activo</b> vas a introducir?\n\n<i>Esto permite al motor validar los filtros matemáticos correctos (PER, FFO, TER, etc).</i>",
+            reply_markup=InlineKeyboardMarkup(botones),
+            parse_mode="HTML"
+        )
+        return
+
+    if query.data.startswith("manual_clase_"):
+        clase_elegida = query.data.split("_")[2]
+        context.user_data['manual_clase'] = clase_elegida
+        botones = [
+            [InlineKeyboardButton("🛡️ Seguro / Conservador", callback_data="manual_perfil_Seguro")],
+            [InlineKeyboardButton("⚖️ Balanceado", callback_data="manual_perfil_Balanceado")],
+            [InlineKeyboardButton("🚀 Riesgo / Crecimiento", callback_data="manual_perfil_Riesgo")],
+            [InlineKeyboardButton("⬅️ Volver", callback_data="volver_menu")]
+        ]
+        await query.edit_message_text(
+            text=f"Seleccionado: <b>{clase_elegida}</b>\n\n¿Qué <b>perfil de exigencia</b> matemática deben cumplir tus tickers en Yahoo Finance?",
+            reply_markup=InlineKeyboardMarkup(botones),
+            parse_mode="HTML"
+        )
+        return
+
+    if query.data.startswith("manual_perfil_"):
+        perfil_elegido = query.data.split("_")[2]
+        context.user_data['manual_perfil'] = perfil_elegido
+        clase = context.user_data.get('manual_clase', 'ACCION')
+        
+        context.user_data['estado'] = "ESPERANDO_TICKERS_MANUALES"
+        await db.upsert_usuario(chat_id, estado="ESPERANDO_TICKERS_MANUALES")
+        
+        teclado = InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Cancelar", callback_data="volver_menu")]])
+        await query.edit_message_text(
+            text=f"☑️ <b>Modo Manual (Bypass IA)</b>\n\nClase: <b>{clase}</b>\nFiltros: <b>{perfil_elegido}</b>\n\n✍️ <i>Escribe los símbolos que quieres escanear separados por espacios o comas.\n(Ejemplo: MSFT NVDA AAPL TSLA)</i>",
+            reply_markup=teclado,
+            parse_mode="HTML"
+        )
+        return
+
+    if query.data == "volver_menu":
+        # Limpiar cualquier estado pendiente (ej. si escapan de pedir_url)
+        context.user_data['estado'] = None
+        await db.upsert_usuario(chat_id, estado=None)
+        
+        # Fix: leer strikes reales desde BD
+        usuario_menu = await db.obtener_usuario(chat_id)
+        strikes = usuario_menu["strikes"] if usuario_menu else 0
+        creditos = usuario_menu["creditos"] if usuario_menu else 3
+        # Limpiar wizard de tabla si estaba en curso
+        context.user_data["tabla_wizard"] = {}
+        teclado = InlineKeyboardMarkup([
+            [InlineKeyboardButton(f"⚠️ Ver mis Strikes ({strikes})", callback_data="ver_strikes")],
+            [InlineKeyboardButton("🔗 Configurar mi Broker (URL)", callback_data="pedir_url")],
+            [InlineKeyboardButton("🌐 Fuente de Validación", callback_data="pedir_fuente")],
+        [InlineKeyboardButton("⌨️ Bypass (Manual)", callback_data="manual_input"),
+         InlineKeyboardButton("📊 Análisis Tabla", callback_data="tabla_input")],
+        [InlineKeyboardButton("💰 Dividendos VIP", callback_data="btn1click_divs"),
+         InlineKeyboardButton("🚀 Growth Tech", callback_data="btn1click_growth")],
+        [InlineKeyboardButton("🛡️ Blue Chips Seguras", callback_data="btn1click_blue"),
+         InlineKeyboardButton("📉 Buscachollos", callback_data="btn1click_value")],
+        [InlineKeyboardButton("🔔 Configurar Alerta (6h)", callback_data="alerta_6")],
+            [InlineKeyboardButton("🔔 Configurar Alerta (12h)", callback_data="alerta_12")],
+            [InlineKeyboardButton("🛑 Detener Alertas", callback_data="alerta_stop")]
+        ])
+        await query.edit_message_text(
+            text=(
+                f"⚙️ <b>PANEL DE CONTROL CUANTITATIVO</b>\n\n"
+                f"💳 Créditos disponibles: <b>{creditos}</b>\n\n"
+                "Configura tus enlaces al Broker, cambia las fuentes de datos, o activa el <b>Motor Inteligente de Alertas</b> para automatizar la búsqueda de tu nicho favorito."
+            ),
+            reply_markup=teclado,
+            parse_mode="HTML"
+        )
+        return
+
+    # --- Protocolo Salvavidas (Best Effort) ---
+    if query.data.startswith("best_effort_"):
+        clase_req = query.data.replace("best_effort_", "")
+        busqueda = await db.obtener_ultima_busqueda(chat_id)
+        
+        if not busqueda:
+            await query.edit_message_text(text="❌ Sesión expirada. Por favor, escribe tu consulta de nuevo.")
+            return
+
+        # Control de saldo estricto
+        creditos = await db.obtener_creditos(chat_id)
+        if creditos <= 0:
+            teclado_pago = InlineKeyboardMarkup([
+                [InlineKeyboardButton("💳 Recargar Créditos", url=f"{STRIPE_PAYMENT_URL}?client_reference_id={chat_id}")]
+            ])
+            await query.edit_message_text(
+                text="💳 <b>Saldo agotado.</b>\nRecarga tus créditos para continuar.",
+                parse_mode="HTML", reply_markup=teclado_pago
+            )
+            return
+
+        await query.edit_message_text(text=f"🔄 Activando protocolo de rescate para {clase_req}...")
+        msg_espera = await query.message.reply_text("⏳ Relajando filtros matemáticos y buscando líderes del sector...")
+
+        fuente = await db.obtener_fuente_datos(chat_id)
+        
+        # Inyección heurística: forzamos a la IA a ignorar las métricas estrictas
+        busqueda_rescate = busqueda + f" (INSTRUCCIÓN DEL SISTEMA: El usuario ha activado el modo Best-Effort. Ignora las exigencias estrictas de PER, Dividendos o caídas. Entrégame los 3 activos más sólidos y representativos que tengas para {clase_req}, independientemente de su valoración actual)."
+
+        texto_final, grafico_bytes, url_compra, ticker = await pipeline_hibrido(
+            busqueda_rescate, msg_espera=msg_espera, fuente_datos=fuente
+        )
+
+        if not url_compra:
+            teclado_error = InlineKeyboardMarkup([
+                [InlineKeyboardButton("🔄 Reintentar búsqueda libre", callback_data="reintentar")]
+            ])
+            await msg_espera.edit_text(texto_final or "❌ El mercado está excesivamente volátil. Imposible extraer datos coherentes.", reply_markup=teclado_error)
+            return
+
+        # Facturación en éxito
+        await db.restar_credito(chat_id)
+        cred_r = await db.obtener_creditos(chat_id)
+        texto_final += f"\n\n<i>Te quedan {cred_r} créditos.</i>"
+
+        broker_url = await db.obtener_broker_url(chat_id)
+        botones = []
+        if broker_url:
+            u_broker = broker_url.replace("{ticker}", ticker) if "{ticker}" in broker_url else broker_url
+            botones.append([InlineKeyboardButton(text="Ejecutar Compra 🛒", url=u_broker)])
+        
+        n_fuente = FUENTES_DATOS.get(fuente, FUENTES_DATOS["yahoo"])["nombre"]
+        botones.append([InlineKeyboardButton(text=f"Validar en {n_fuente} 📈", url=url_compra)])
+        teclado_final = InlineKeyboardMarkup(botones)
+
+        # Entrega de datos y renderizado (reutilizando tu manejador de excepciones)
+        try:
+            if grafico_bytes:
+                with io.BytesIO(grafico_bytes) as buf:
+                    await context.bot.send_photo(
+                        chat_id=chat_id, photo=InputFile(buf, filename=f"chart_{ticker}.webp"), 
+                        caption=texto_final, reply_markup=teclado_final, parse_mode="HTML"
+                    )
+            else:
+                await context.bot.send_message(chat_id=chat_id, text=texto_final, reply_markup=teclado_final, parse_mode="HTML")
+            await msg_espera.delete()
+        except Exception as e:
+            logger.warning(f"[UI] Fallo en entrega de salvavidas: {e}")
+            await context.bot.send_message(chat_id=chat_id, text=re.sub(r'<[^>]+>', '', texto_final), reply_markup=teclado_final)
+            
+        return
+
+    # --- Botón Reintentar ---
+    if query.data == "reintentar":
+        busqueda = await db.obtener_ultima_busqueda(chat_id)
+        if not busqueda:
+            await query.edit_message_text(text="❌ No hay búsqueda previa registrada. Escríbeme tu consulta de inversión.")
+            return
+
+        # Verificar créditos
+        creditos = await db.obtener_creditos(chat_id)
+        if creditos <= 0:
+            teclado_pago = InlineKeyboardMarkup([
+                [InlineKeyboardButton("💳 Recargar Créditos", url=f"{STRIPE_PAYMENT_URL}?client_reference_id={chat_id}")]
+            ])
+            await query.edit_message_text(
+                text="💳 <b>Saldo agotado.</b>\nHas consumido tus análisis Quant.\nRecarga tus créditos para continuar.",
+                parse_mode="HTML", reply_markup=teclado_pago
+            )
+            return
+
+        await query.edit_message_text(text="🔄 Forzando a los agentes a buscar activos alternativos...")
+        msg_espera = await query.message.reply_text("⏳ Explorando rincones secundarios del mercado...")
+
+        fuente = await db.obtener_fuente_datos(chat_id)
+        
+        # EL FIX: Inyectar orden secreta para evitar bucle de tickers idénticos
+        busqueda_forzada = busqueda + " (IMPORTANTE: Esto es un reintento. Dame 10 tickers COMPLETAMENTE DISTINTOS a los habituales. Sé muy flexible con los números)."
+        
+        texto_final, grafico_bytes, url_compra, ticker = await pipeline_hibrido(
+            busqueda_forzada, msg_espera=msg_espera, fuente_datos=fuente
+        )
+
+        if not url_compra:
+            if texto_final and "Petición rechazada" in texto_final:
+                 await msg_espera.edit_text(texto_final)
+                 return
+                 
+            teclado_error = InlineKeyboardMarkup([
+                [InlineKeyboardButton("🔄 Reintentar con otros tickers", callback_data="reintentar")]
+            ])
+            # EL FIX: Añadir la hora para que Telegram no bloquee la edición por ser texto duplicado
+            hora_actual = time.strftime('%H:%M:%S')
+            texto_error_unico = f"{texto_final}\n\n<i>(Intento fallido a las {hora_actual})</i>"
+            
+            try:
+                await msg_espera.edit_text(texto_error_unico, reply_markup=teclado_error, parse_mode="HTML")
+            except BadRequest:
+                pass
+            return
+
+        # Cobro Justo: solo cobrar en éxito
+        await db.restar_credito(chat_id)
+        creditos_restantes = await db.obtener_creditos(chat_id)
+        texto_final += f"\n\n<i>Te quedan {creditos_restantes} créditos.</i>"  # BUG FIX 5
+
+        broker_url = await db.obtener_broker_url(chat_id)
+        botones = []
+        if broker_url:
+            url_broker_final = broker_url.replace("{ticker}", ticker) if "{ticker}" in broker_url else broker_url
+            botones.append([InlineKeyboardButton(text="Ejecutar Compra en Broker 🛒", url=url_broker_final)])
+        nombre_fuente = FUENTES_DATOS.get(fuente, FUENTES_DATOS["yahoo"])["nombre"]
+        botones.append([InlineKeyboardButton(text=f"Validar en {nombre_fuente} 📈", url=url_compra)])
+        teclado = InlineKeyboardMarkup(botones)
+
+        try:
+            if grafico_bytes:
+                try:
+                    with io.BytesIO(grafico_bytes) as buf:
+                        if len(texto_final) > 1000:
+                            await context.bot.send_photo(chat_id=chat_id, photo=InputFile(buf, filename=f"chart_{ticker}.webp"), read_timeout=60, write_timeout=60, connect_timeout=60)
+                            await context.bot.send_message(chat_id=chat_id, text=texto_final, reply_markup=teclado, parse_mode="HTML")
+                        else:
+                            await context.bot.send_photo(
+                                chat_id=chat_id, photo=InputFile(buf, filename=f"chart_{ticker}.webp"), caption=texto_final,
+                                reply_markup=teclado, read_timeout=60, write_timeout=60, connect_timeout=60,
+                                parse_mode="HTML"
+                            )
+                except Exception as e:
+                    logger.warning(f"[UI] Fallo foto reintento, usando texto: {e}")
+                    await context.bot.send_message(chat_id=chat_id, text=texto_final, reply_markup=teclado, parse_mode="HTML")
+            else:
+                await context.bot.send_message(chat_id=chat_id, text=texto_final, reply_markup=teclado, parse_mode="HTML")
+            try:
+                await msg_espera.delete()
+            except Exception:
+                pass
+        except Exception as e:
+            logger.error(f"Fallo envío reintento: {e}")
+        return
+
+
+    # --- Detener Alertas ---
+    if query.data == "alerta_stop":
+        # Desactivar en BD (persistente)
+        await db.actualizar_alerta(chat_id, None)
+        # Limpiar jobs legacy en memoria (por si acaso)
+        try:
+            for job in context.job_queue.get_jobs_by_name(str(chat_id)):
+                job.schedule_removal()
+        except Exception:
+            pass
+        await query.edit_message_text(text="✅ Alertas desactivadas. Puedes reactivarlas desde /menu.")
+        return
+
+    # --- Configurar Alerta Periódica ---
+    if query.data.startswith("alerta_"):
+        busqueda = await db.obtener_ultima_busqueda(chat_id)
+        ultima_busqueda = (
+            busqueda if busqueda and not busqueda.startswith("__")
+            else "empresas tecnológicas de crecimiento"
+        )
+
+        try:
+            intervalo_horas = int(query.data.split("_")[1])
+        except (IndexError, ValueError):
+            await query.edit_message_text(text="❌ Error procesando la solicitud.")
+            return
+
+        # Guardar alerta en BD (sobrevive reinicios de Render)
+        await db.actualizar_alerta(chat_id, intervalo_horas)
+        # Limpiar jobs legacy en memoria
+        try:
+            for job in context.job_queue.get_jobs_by_name(str(chat_id)):
+                job.schedule_removal()
+        except Exception:
+            pass
+
+        await query.edit_message_text(
+            text=(
+                f"✅ <b>¡ALERTA ACTIVADA!</b>\n\n"
+                f"Recibirás análisis de '{ultima_busqueda}' cada <b>{intervalo_horas}h</b>.\n"
+                "El sistema es persistente — sobrevive reinicios del servidor.\n"
+                "Desáctivalo desde /menu → Detener Alertas."
+            ),
+            parse_mode="HTML"
+        )
+        return
+
+
+
+

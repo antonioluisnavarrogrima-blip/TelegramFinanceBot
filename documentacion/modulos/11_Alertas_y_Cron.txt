@@ -1,0 +1,199 @@
+--- MÓDULO: 11_Alertas_y_Cron ---
+
+// ARCHIVO DE ORIGEN: bot.py
+// LÍNEAS ORIGINALES: 2698-2889
+
+
+# ── SISTEMA DE ALERTAS PERSISTENTES (DB-BASED CRON) ──────────────────────────
+
+async def _ejecutar_alerta_usuario(tid: int, solicitud: str, fuente: str):
+    """Ejecuta el pipeline para un usuario y le envía el resultado. Fire-and-forget."""
+    try:
+        texto_final, grafico_bytes, url_compra, ticker = await pipeline_hibrido(
+            solicitud, msg_espera=None, fuente_datos=fuente
+        )
+        if not url_compra:
+            logger.warning(f"[CRON-DB] Sin resultado para usuario {tid}")
+            fallos = await db.incrementar_fallos_cron(tid)
+            if fallos >= 3:
+                try:
+                    await telegram_app.bot.send_message(
+                        chat_id=tid, 
+                        text="⚠️ <b>Aviso de Sistema:</b>\nHe intentado escanear tu nicho favorito en mis últimas 3 rondas y el mercado actual no ha superado nuestros estrictos filtros.\n\nPrueba a cambiar tu estrategia o fuente en el /menu.",
+                        parse_mode="HTML"
+                    )
+                except Exception:
+                    pass
+                await db.resetear_fallos_cron(tid)
+            return
+
+        # Éxito: Reseteamos fallos y procedemos
+        await db.resetear_fallos_cron(tid)
+        await db.restar_credito(tid)
+        creditos_restantes = await db.obtener_creditos(tid)
+        texto_final += f"\n\n<i>Te quedan {creditos_restantes} créditos.</i>"  # BUG FIX 5
+
+        broker_url = await db.obtener_broker_url(tid)
+        botones = []
+        if broker_url:
+            url_broker_final = broker_url.replace("{ticker}", ticker) if "{ticker}" in broker_url else broker_url
+            botones.append([InlineKeyboardButton(text="Comprar en tu Broker 🛒", url=url_broker_final)])
+        nombre_fuente = FUENTES_DATOS.get(fuente, FUENTES_DATOS["yahoo"])["nombre"]
+        botones.append([InlineKeyboardButton(text=f"Métricas en {nombre_fuente} 📈", url=url_compra)])
+        teclado = InlineKeyboardMarkup(botones)
+
+        try:
+            if grafico_bytes:
+                try:
+                    with io.BytesIO(grafico_bytes) as buf:
+                        # Margen súper conservador para el límite 1024 de Telegram API
+                        if len(texto_final) > 900:
+                            await telegram_app.bot.send_photo(chat_id=tid, photo=InputFile(buf, filename=f"chart_{ticker}.webp"))
+                            await telegram_app.bot.send_message(chat_id=tid, text=texto_final, reply_markup=teclado, parse_mode="HTML")
+                        else:
+                            await telegram_app.bot.send_photo(
+                                chat_id=tid, photo=InputFile(buf, filename=f"chart_{ticker}.webp"), caption=texto_final, reply_markup=teclado, parse_mode="HTML"
+                            )
+                except BadRequest:
+                    raise # Delegar fallback HTML exterior
+                except Exception as e:
+                    logger.warning(f"[CRON] Error envío de foto: {e}")
+                    await telegram_app.bot.send_message(chat_id=tid, text=texto_final, reply_markup=teclado, parse_mode="HTML")
+            else:
+                await telegram_app.bot.send_message(chat_id=tid, text=texto_final, reply_markup=teclado, parse_mode="HTML")
+        except BadRequest as e:
+            logger.warning(f"[CRON UI] Fallback a texto crudo por posible HTML inválido: {e}")
+            texto_limpio = re.sub(r'<[^>]+>', '', texto_final)
+            if grafico_bytes:
+                try:
+                    with io.BytesIO(grafico_bytes) as buf:
+                        if len(texto_limpio) > 900:
+                            await telegram_app.bot.send_photo(chat_id=tid, photo=InputFile(buf, filename=f"chart_{ticker}.webp"))
+                            await telegram_app.bot.send_message(chat_id=tid, text=texto_limpio, reply_markup=teclado, parse_mode=None)
+                        else:
+                            await telegram_app.bot.send_photo(
+                                chat_id=tid, photo=InputFile(buf, filename=f"chart_{ticker}.webp"), caption=texto_limpio, reply_markup=teclado, parse_mode=None
+                            )
+                except Exception as e:
+                    logger.warning(f"[CRON] Error envío de foto fallback: {e}")
+                    await telegram_app.bot.send_message(chat_id=tid, text=texto_limpio, reply_markup=teclado, parse_mode=None)
+            else:
+                await telegram_app.bot.send_message(chat_id=tid, text=texto_limpio, reply_markup=teclado, parse_mode=None)
+        except Exception as e:
+            logger.error(f"Fallo envío cron res: {e}")
+
+    except Exception as e:
+        logger.error(f"[CRON-DB] Error ejecutando alerta para usuario {tid}: {e}")
+
+
+_usuarios_en_cron = set()
+
+
+async def procesador_lotes_cron(lista_usuarios: list):
+    """Procesa alertas con concurrencia controlada para equilibrar carga y velocidad."""
+    async def _worker_usuario(item):
+        if _CRON_SEMA is None:
+            logger.error("[CRON] Semáforo no inicializado")
+            return
+        async with _CRON_SEMA:
+            tid = item['tid']
+            try:
+                # Jitter aleatorio (0 a 3s) para no golpear la DB o APIs exactamente a la vez
+                await asyncio.sleep(random.uniform(0, 3.0)) 
+                await _ejecutar_alerta_usuario(tid, item['solicitud'], item['fuente'])
+                # Mover la actualización de la BD aquí para confirmar el éxito de ejecución
+                await db.desbloquear_y_actualizar_cron(tid, time.time())
+            except Exception as e:
+                logger.error(f"[CRON QUEUE] Error procesando al usuario {tid}: {e}")
+                await db.desbloquear_cron_fallido(tid)
+            finally:
+                _usuarios_en_cron.discard(tid)
+
+    # Lanza todas las tareas, el semáforo se encargará de que solo 5 corran simultáneamente
+    tareas = [_worker_usuario(item) for item in lista_usuarios]
+    await asyncio.gather(*tareas)
+
+@web_app.post("/cron/ejecutar")
+async def cron_ejecutar(request: Request, background_tasks: BackgroundTasks):
+    """
+    Endpoint llamado por el servicio externo (cron-job.org) cada hora.
+    Lee la BD, localiza usuarios con alerta activa y lanza su pipeline.
+    Requiere el header X-Cron-Secret configurado en CRON_SECRET.
+    """
+    secret = request.headers.get("X-Cron-Secret", "")
+    if not CRON_SECRET or secret != CRON_SECRET:
+        raise HTTPException(status_code=403, detail="Forbidden")
+
+    # ── SWEEPER: Rescate de deadlocks (Enterprise Pattern) ────────────────────
+    # Si el proceso del cron murió en una ejecución anterior, los usuarios con
+    # cron_procesando = TRUE quedan bloqueados para siempre. Esta llamada los
+    # libera automáticamente si llevan más de 60 minutos bloqueados.
+    await db.rescatar_bloqueos_cron_muertos(max_edad_segundos=3600)
+
+    ahora = time.time()
+    ejecutados = 0
+    omitidos = 0
+    
+    # Paginación de usuarios para evitar saturar RAM en Render (v4.3)
+    limit = 50
+    offset = 0
+    
+    while True:
+        usuarios = await db.obtener_usuarios_con_alerta(limit=limit, offset=offset)
+        if not usuarios:
+            break
+            
+        lote_activo = []
+        ids_por_bloquear = []
+
+        for usuario in usuarios:
+            tid             = usuario["id"]
+            intervalo_s     = (usuario["alerta_intervalo"] or 6) * 3600
+            ultima_alerta   = float(usuario["ultima_alerta"] or 0)
+            solicitud       = usuario["ultima_busqueda"]
+            fuente          = usuario["fuente_datos"] or "yahoo"
+
+            if ahora - ultima_alerta < intervalo_s:
+                omitidos += 1
+                continue
+
+            creditos = await db.obtener_creditos(tid)
+            if creditos <= 0:
+                await db.actualizar_alerta(tid, None)
+                try:
+                    teclado_pago = InlineKeyboardMarkup([[
+                        InlineKeyboardButton("💳 Recargar", url=f"{STRIPE_PAYMENT_URL}?client_reference_id={tid}")
+                    ]])
+                    await telegram_app.bot.send_message(
+                        chat_id=tid,
+                        text="💳 <b>Alerta Cron Pausada</b>\n\nSin créditos. Recarga y reactiva desde /menu.",
+                        parse_mode="HTML", reply_markup=teclado_pago
+                    )
+                except Exception as e: logger.debug(f'Ignorado: {e}')
+                continue
+
+            async with _CRON_LOCK:
+                if tid in _usuarios_en_cron:
+                    omitidos += 1
+                    continue
+                _usuarios_en_cron.add(tid)
+            lote_activo.append({"tid": tid, "solicitud": solicitud, "fuente": fuente})
+            ids_por_bloquear.append(tid)
+            ejecutados += 1
+
+        if lote_activo:
+            exito_bloqueo = await db.bloquear_lote_cron(ids_por_bloquear)
+            if exito_bloqueo:
+                background_tasks.add_task(procesador_lotes_cron, lote_activo)
+            else:
+                for tid in ids_por_bloquear: _usuarios_en_cron.discard(tid)
+
+        if len(usuarios) < limit:
+            break
+        offset += limit
+
+    return {"ok": True, "ejecutados": ejecutados, "omitidos": omitidos}
+
+
+
+

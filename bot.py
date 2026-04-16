@@ -1264,10 +1264,10 @@ async def _pipeline_hibrido_interno(
         )
     except Exception as e:
         logger.error(f"[GS] Error generando informe: {e}")
-        return "❌ Error al generar el informe ejecutivo. Intenta de nuevo.", None, None, None
+        informe_gs = None  # Continuar con fallback en lugar de abortar
 
     if not informe_gs:
-        informe_gs = f"Datos Crudos: {ticker_final} | Clase: {clase_activo} | {json.dumps(mejor_opcion)}"
+        informe_gs = "⚠️ <i>Resumen de texto no disponible temporalmente. Los datos numéricos mostrados son correctos.</i>"
     else:
         informe_gs = informe_gs.replace("*", "")
 
@@ -1275,13 +1275,18 @@ async def _pipeline_hibrido_interno(
     url_compra = FUENTES_DATOS[fuente]["url"].format(ticker=ticker_final)
 
     rend_str = mejor_opcion.get("rendimiento_real", 0)
+    signo   = "+" if rend_str >= 0 else ""
+    aviso_grafico = "" if ruta_captura_final else "\n⚠️ <i>Gráfico no disponible en este momento.</i>"
+
     texto_final = (
-        f"⚡ ALERTA {emoji_clase} {clase_activo}: {ticker_final}\n"
-        f"📈 Momentum ({temporalidad}): {'+' if rend_str >= 0 else ''}{rend_str}%\n\n"
+        f"⚡ <b>Señal {emoji_clase} {clase_activo}: {ticker_final}</b>{aviso_grafico}\n"
+        f"📈 Rendimiento ({temporalidad}): <b>{signo}{rend_str}%</b>\n\n"
+        f"🔍 <b>Análisis:</b>\n"
         f"{informe_gs}"
     )
     texto_final = _limpiar_html_telegram(texto_final)
     return texto_final, ruta_captura_final, url_compra, ticker_final
+
 
 
 # --- 4b. SISTEMA DE AN\u00c1LISIS POR TABLA (sin IA) ---
@@ -1776,6 +1781,17 @@ async def manejador_botones(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # --- An\u00e1lisis por Tabla (sin IA) ---
     if query.data == "tabla_input":
+        # 🛡️ Verificar créditos antes de entrar al wizard (evita UX frustrante)
+        creditos_tab = await db.obtener_creditos(chat_id)
+        if creditos_tab <= 0:
+            teclado_pago = InlineKeyboardMarkup([
+                [InlineKeyboardButton("💳 Recargar Créditos", url=f"{STRIPE_PAYMENT_URL}?client_reference_id={chat_id}")]
+            ])
+            await query.edit_message_text(
+                "💳 <b>Saldo agotado.</b>\nNecesitas créditos para usar el Análisis por Tabla.",
+                parse_mode="HTML", reply_markup=teclado_pago
+            )
+            return
         context.user_data["tabla_wizard"] = {}
         botones = [
             [InlineKeyboardButton("\ud83c\udfe2 Acciones",  callback_data="tabla_clase_ACCION"),
@@ -2046,19 +2062,38 @@ async def manejador_botones(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text(text="❌ No hay búsqueda previa registrada. Escríbeme tu consulta de inversión.")
             return
 
-        # Verificar créditos
-        creditos = await db.obtener_creditos(chat_id)
-        if creditos <= 0:
-            teclado_pago = InlineKeyboardMarkup([
-                [InlineKeyboardButton("💳 Recargar Créditos", url=f"{STRIPE_PAYMENT_URL}?client_reference_id={chat_id}")]
-            ])
-            await query.edit_message_text(
-                text="💳 <b>Saldo agotado.</b>\nHas consumido tus análisis Quant.\nRecarga tus créditos para continuar.",
-                parse_mode="HTML", reply_markup=teclado_pago
-            )
-            return
+        # 🛡️ Anti-Abuso: máximo 2 reintentos gratuitos por sesión de mensaje
+        reintentos_usados = context.user_data.get("reintentos_gratis", 0)
+        if reintentos_usados >= 2:
+            creditos_ret = await db.obtener_creditos(chat_id)
+            if creditos_ret <= 0:
+                teclado_pago = InlineKeyboardMarkup([
+                    [InlineKeyboardButton("💳 Recargar Créditos", url=f"{STRIPE_PAYMENT_URL}?client_reference_id={chat_id}")]
+                ])
+                await query.edit_message_text(
+                    "💳 <b>Saldo agotado.</b>\nHas alcanzado el límite de reintentos gratuitos.\nRecarga para continuar.",
+                    parse_mode="HTML", reply_markup=teclado_pago
+                )
+                return
+            # A partir del 3er reintento, cobrar 1 crédito
+            await db.restar_credito(chat_id)
+            cred_r = await db.obtener_creditos(chat_id)
+            logger.info(f"[ANTI-ABUSO] Usuario {chat_id}: reintento #{reintentos_usados+1} cobrado. Quedan {cred_r} créditos.")
+        else:
+            # Verificar solo que existan créditos para los 2 primeros reintentos
+            creditos = await db.obtener_creditos(chat_id)
+            if creditos <= 0:
+                teclado_pago = InlineKeyboardMarkup([
+                    [InlineKeyboardButton("💳 Recargar Créditos", url=f"{STRIPE_PAYMENT_URL}?client_reference_id={chat_id}")]
+                ])
+                await query.edit_message_text(
+                    text="💳 <b>Saldo agotado.</b>\nHas consumido tus análisis Quant.\nRecarga tus créditos para continuar.",
+                    parse_mode="HTML", reply_markup=teclado_pago
+                )
+                return
 
-        await query.edit_message_text(text="🔄 Forzando a los agentes a buscar activos alternativos...")
+        context.user_data["reintentos_gratis"] = reintentos_usados + 1
+        await query.edit_message_text(text="🔄 Buscando activos alternativos para ti...")
         msg_espera = await query.message.reply_text("⏳ Explorando rincones secundarios del mercado...")
 
         fuente = await db.obtener_fuente_datos(chat_id)
@@ -2304,6 +2339,14 @@ async def conversacion_inversor(update: Update, context: ContextTypes.DEFAULT_TY
                 parse_mode="HTML"
             )
             return
+        # 🛡️ Anti-DDoS: limitar a 10 tickers para proteger el servidor
+        if len(tickers_validos) > 10:
+            await update.message.reply_text(
+                f"⚠️ Solo puedo analizar hasta <b>10 tickers</b> a la vez para garantizar calidad.\n"
+                f"He tomado los primeros 10: <code>{' '.join(tickers_validos[:10])}</code>",
+                parse_mode="HTML"
+            )
+            tickers_validos = tickers_validos[:10]
         context.user_data['estado'] = None
         await db.upsert_usuario(tid, estado=None)
         clase_elegida  = context.user_data.get('manual_clase',  'ACCION')
@@ -2719,6 +2762,23 @@ async def webhook_pago(request: Request):
 async def _ejecutar_alerta_usuario(tid: int, solicitud: str, fuente: str):
     """Ejecuta el pipeline para un usuario y le envía el resultado. Fire-and-forget."""
     try:
+        # 🛡️ Verificar saldo antes de lanzar el pipeline (alertas deben cobrar)
+        creditos_prev = await db.obtener_creditos(tid)
+        if creditos_prev <= 0:
+            logger.info(f"[CRON] Usuario {tid} sin créditos. Alerta pausada automáticamente.")
+            try:
+                await telegram_app.bot.send_message(
+                    chat_id=tid,
+                    text=(
+                        "⏸️ <b>Alerta pausada.</b>\n\n"
+                        "Tu saldo de créditos es 0. Recarga para que el motor siga enviándote señales automáticas."
+                    ),
+                    parse_mode="HTML"
+                )
+            except Exception:
+                pass
+            return
+
         texto_final, grafico_bytes, url_compra, ticker = await pipeline_hibrido(
             solicitud, msg_espera=None, fuente_datos=fuente
         )

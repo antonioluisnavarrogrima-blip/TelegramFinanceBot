@@ -482,7 +482,7 @@ async def generador_informe_goldman(ticker: str, sector: str, datos: dict, perfi
 
     try:
         res = await client.aio.models.generate_content(
-            model='gemini-1.5-flash-8b',  # Coste ínfimo para resúmenes de texto básicos.
+            model='gemini-2.5-flash',  # FIX: Modelo actualizado (1.5-flash-8b fue retirado)
             contents=(
                 f"{prompt_sistema}\n"
                 f"Perfil:{perfil}|Sector:{sector}|"  # separadores compactos
@@ -2574,12 +2574,13 @@ class YahooCloudflareInterceptor(requests.Session):
         self.worker_url = worker_url.rstrip("/")
 
     def request(self, method, url, **kwargs):
-        parsed = urllib.parse.urlparse(url)
-        if "finance.yahoo.com" in parsed.netloc:
-            new_path = parsed.path
-            if parsed.query:
-                new_path += "?" + parsed.query
-            url = f"{self.worker_url}{new_path}"
+        if self.worker_url:  # FIX: Solo interceptar si hay un proxy configurado
+            parsed = urllib.parse.urlparse(url)
+            if "finance.yahoo.com" in parsed.netloc:
+                new_path = parsed.path
+                if parsed.query:
+                    new_path += "?" + parsed.query
+                url = f"{self.worker_url}{new_path}"
         return super().request(method, url, **kwargs)
 
 @asynccontextmanager

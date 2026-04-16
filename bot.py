@@ -525,9 +525,17 @@ async def fabricante_de_graficos(ticker: str, periodo: str = "3mo") -> tuple[byt
             hist = None
         except Exception as e:
             logger.warning(f"[YF] Error descargando {ticker} (intento {intento+1}/3): {e}")
+            if "Rate limited" in str(e) or "429" in str(e):
+                await asyncio.sleep(5)
             hist = None
+        
+        if hist is not None and not hist.empty and len(hist) >= 2:
+            break
+
         if intento < 2:
-            await asyncio.sleep([0, 1, 3][intento + 1])
+            import random
+            base_sleep = [0.5, 1.5, 3.0][intento]
+            await asyncio.sleep(base_sleep + random.uniform(0.1, 1.0))
 
     if hist is None or hist.empty or len(hist) < 2:
         return None, 0.0
@@ -905,10 +913,21 @@ async def _obtener_info_bulk(tickers: list[str], clase: str) -> dict:
         async def fetch_yf(t: str):
             """Descarga info de yfinance con sesión browser y fallback a fast_info."""
             try:
-                info = await asyncio.wait_for(
-                    asyncio.to_thread(lambda: yf.Ticker(t, session=_YF_SESSION).info),
-                    timeout=15
-                )
+                try:
+                    info = await asyncio.wait_for(
+                        asyncio.to_thread(lambda: yf.Ticker(t, session=_YF_SESSION).info),
+                        timeout=15
+                    )
+                except Exception as e:
+                    if "Rate limited" in str(e) or "429" in str(e):
+                        logger.warning(f"[YF BULK] RATE LIMIT para {t}, esperando 5s...")
+                        await asyncio.sleep(5)
+                        info = await asyncio.wait_for(
+                            asyncio.to_thread(lambda: yf.Ticker(t, session=_YF_SESSION).info),
+                            timeout=15
+                        )
+                    else:
+                        raise e
                 claves_validas = {k for k, v in info.items() if v is not None and k != 'trailingPegRatio'}
                 logger.info(f"[YF FETCH] {t} -> {len(claves_validas)} claves válidas | muestra: {list(claves_validas)[:5]}")
                 if len(claves_validas) < 3:
@@ -930,13 +949,14 @@ async def _obtener_info_bulk(tickers: list[str], clase: str) -> dict:
                 return t.upper(), {}
 
         resultados = []
-        for i in range(0, len(faltantes), 3):
-            lote = faltantes[i:i+3]
-            logger.info(f"[YF BULK] Lote {i//3+1}: descargando {lote}")
+        import random
+        for i in range(0, len(faltantes), 2):
+            lote = faltantes[i:i+2]
+            logger.info(f"[YF BULK] Lote {i//2+1}: descargando {lote}")
             res_lote = await asyncio.gather(*(fetch_yf(t) for t in lote))
             resultados.extend(res_lote)
-            if i + 3 < len(faltantes):
-                await asyncio.sleep(1.0)
+            if i + 2 < len(faltantes):
+                await asyncio.sleep(random.uniform(1.5, 3.0))
 
         nuevos_datos = {}
         _METRICAS_MINIMAS = {"regularMarketPrice", "currentPrice", "previousClose",
@@ -1201,6 +1221,8 @@ async def _pipeline_hibrido_interno(
     async def _fetch_rend_solo(gan: dict) -> tuple[dict, float]:
         """Obtiene el rendimiento histórico sin generar la imagen del gráfico."""
         try:
+            import random
+            await asyncio.sleep(random.uniform(0.1, 1.5))
             hist = await asyncio.wait_for(
                 asyncio.to_thread(
                     lambda: yf.Ticker(gan["ticker"], session=_YF_SESSION).history(period=temporalidad)

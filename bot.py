@@ -474,9 +474,9 @@ async def generador_informe_goldman(ticker: str, sector: str, datos: dict, perfi
     # 3. Prompt compacto (mínimo tokens, máximo precisión)
     prompt_sistema = (
         f"Quant Director. Flash Note {clase_activo}. 3 bullets MAX. "
-        f"HTML solo <b><i>. SIN markdown/asteriscos. "
+        f"HTML solo <b><i>. SIN markdown/asteriscos. "\n        f"PROHIBIDO usar etiquetas <font>, <span>, <div> o atributos CSS. Utiliza EXCLUSIVAMENTE HTML básico soportado por Telegram (<b>, <i>, <u>, <s>). "
         f"{restricciones} "
-        f"Estructura: f3af<b>Tesis:</b> [1 frase] | f4ca<b>Datos:</b> [métricas] | ⚖️<b>Veredicto:</b> [1 frase]\n"
+        f"Estructura: 🎯<b>Tesis:</b> [1 frase] | 📊<b>Datos:</b> [métricas] | ⚖️<b>Veredicto:</b> [1 frase]\n"
         f"{ejemplo}"
     )
 

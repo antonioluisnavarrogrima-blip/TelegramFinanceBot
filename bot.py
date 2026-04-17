@@ -918,30 +918,28 @@ async def _obtener_info_bulk(tickers: list[str], clase: str) -> dict:
 
     if faltantes:
         async def fetch_yf(t: str):
-            """Descarga info de yfinance con sesión browser y fallback a fast_info."""
+            """Descarga info de yfinance usando el emulador JA3 (curl_cffi) y Circuit Breaker."""
             try:
                 import random
-                await asyncio.sleep(random.uniform(1.8, 4.2))
+                # Jitter asíncrono preservando rango solicitado
+                await asyncio.sleep(random.uniform(2.0, 5.0))
                 
                 info = await asyncio.wait_for(
                     asyncio.to_thread(lambda: yf.Ticker(t, session=_YF_SESSION).info),
-                    timeout=25 # timeout alto para dar margen al ciclo interno de proxys
+                    timeout=15.0
                 )
                 claves_validas = {k for k, v in info.items() if v is not None and k != 'trailingPegRatio'}
-                logger.info(f"[YF FETCH] {t} -> {len(claves_validas)} claves válidas | muestra: {list(claves_validas)[:5]}")
+                logger.info(f"[YF FETCH JA3] {t} -> {len(claves_validas)} claves válidas")
                 if len(claves_validas) < 3:
-                    logger.warning(f"[YF] Bloqueo silencioso detectado para {t}, reintentando con fast_info...")
-                    await asyncio.sleep(2)
+                    logger.warning(f"[YF JA3] Bloqueo silencioso para {t}, fallback a fast_info...")
                     fi = await asyncio.wait_for(
                         asyncio.to_thread(lambda: dict(yf.Ticker(t, session=_YF_SESSION).fast_info)),
-                        timeout=10
+                        timeout=10.0
                     )
-                    logger.info(f"[YF FAST_INFO] {t} -> {len(fi)} claves | muestra: {list(fi.keys())[:5]}")
-                    if fi:
-                        info = fi
+                    if fi: info = fi
                 return t.upper(), info
             except Exception as e:
-                logger.warning(f"[CIRCUIT BREAKER PASIVO] Data nula para {t} tras agotar Stealth Session y reintentos: {e}")
+                logger.warning(f"[CIRCUIT BREAKER PASIVO] JA3 Fallido para {t}. Excepción: {type(e).__name__} - {e}")
                 return t.upper(), {}
 
         resultados = []
@@ -2580,66 +2578,32 @@ async def comando_comprar(update: Update, context: ContextTypes.DEFAULT_TYPE):
 telegram_app.add_handler(CommandHandler("comprar", comando_comprar))
 
 
-import urllib.parse
+import urllib.parse\nfrom curl_cffi import requests as requests_cffi
 
 # ── FASTAPI + LIFESPAN ────────────────────────────────────────────────────────
 # Uvicorn es el dueño del bucle de eventos. El bot de Telegram arranca y para
 # dentro del lifespan para compartir ese mismo bucle sin conflictos.
 
-class YahooStealthInterceptor(requests.Session):
-    USER_AGENTS = [
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
-        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
-    ]
-    def __init__(self, proxies_list: list[str]):
-        super().__init__()
-        self.proxies_list = [p.rstrip("/") for p in proxies_list if p]
-        self._proxy_index = 0
-        self.headers.update({
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-            "Accept-Language": "en-US,en;q=0.5",
-            "Sec-Fetch-Dest": "document",
-            "Sec-Fetch-Mode": "navigate",
-            "Sec-Ch-Ua": '"Google Chrome";v="124", "Chromium";v="124", "Not-A.Brand";v="24"',
-            "Sec-Ch-Ua-Mobile": "?0",
-            "Sec-Ch-Ua-Platform": '"Windows"'
-        })
-
-    def request(self, method, url, **kwargs):
-        self.headers["User-Agent"] = random.choice(self.USER_AGENTS)
-        kwargs.setdefault("timeout", 8.0)
-        parsed = urllib.parse.urlparse(url)
-        max_attempts = max(1, len(self.proxies_list))
-        
-        for attempt in range(max_attempts):
-            target_url = url
-            if self.proxies_list and "finance.yahoo.com" in parsed.netloc:
-                worker = self.proxies_list[self._proxy_index]
-                new_path = parsed.path
-                if parsed.query: new_path += "?" + parsed.query
-                target_url = f"{worker}{new_path}"
-                
-            try:
-                resp = super().request(method, target_url, **kwargs)
-                if resp.status_code == 429 or "Rate limited" in resp.text:
-                    raise requests.exceptions.RequestException("Rate limited / 429 en la respuesta")
-                return resp
-            except requests.exceptions.RequestException as e:
-                logger.warning(f"[STEALTH] Proxy colapsado (Intento {attempt+1}/{max_attempts}): {e}")
-                if self.proxies_list:
-                    self._proxy_index = (self._proxy_index + 1) % len(self.proxies_list)
-                if attempt == max_attempts - 1:
-                    raise e
+def obtener_sesion_stealth_ja3(proxy_url: str = None):
+    """
+    Motor de evasión TLS para suplantar la firma JA3 de Chrome 120
+    bypasseando WAFs a nivel de protocolo de transporte.
+    """
+    sesion = requests_cffi.Session(impersonate="chrome120")
+    if proxy_url:
+        worker = proxy_url.rstrip("/")
+        sesion.proxies = {"http": worker, "https": worker}
+    sesion.timeout = 10.0
+    return sesion
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global _PIPELINE_SEMA, _CRON_SEMA, _CRON_LOCK, _QUICKCHART_SEMA, http_client, _YF_SESSION
 
-    # P1: Stealth Session Wrapper rotativo para el pool de Proxies
-    proxy_urls = [p.strip() for p in CF_WORKER_PROXY.split(",") if p.strip()] if CF_WORKER_PROXY else []
-    _YF_SESSION = YahooStealthInterceptor(proxies_list=proxy_urls)
+    # P1: Emulador JA3/TLS Stealth Session (curl_cffi)
+    proxy_url = CF_WORKER_PROXY.split(",")[0].strip() if CF_WORKER_PROXY else None
+    _YF_SESSION = obtener_sesion_stealth_ja3(proxy_url)
 
 
     # P4: Render free tier (512 MB / 0.5 vCPU) — semáforos conservadores

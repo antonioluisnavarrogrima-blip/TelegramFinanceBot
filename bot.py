@@ -949,6 +949,12 @@ async def _obtener_info_bulk(tickers: list[str], clase: str) -> dict:
             logger.info(f"[YF BULK] Lote {i//2+1}: descargando {lote}")
             res_lote = await asyncio.gather(*(fetch_yf(t) for t in lote))
             resultados.extend(res_lote)
+            
+            # Global Kill Switch - TAREA 1
+            if all(not info for ticker, info in res_lote):
+                logger.critical(f"[GLOBAL KILL SWITCH] WAF Bloqueado o nulo sistemático en Lote {i//2+1}. Abortando descarga masiva restante.")
+                return {"_RATE_LIMIT_HIT": True} # Propagación de estado - TAREA 2
+
             if i + 2 < len(faltantes):
                 await asyncio.sleep(random.uniform(1.5, 3.0))
 
@@ -1141,6 +1147,8 @@ async def _pipeline_hibrido_interno(
                 "filtros_extra": list(filtros["filtros_extra"]),
             }
             datos_bulk = await _obtener_info_bulk(tickers, "ACCION")
+            if datos_bulk.get("_RATE_LIMIT_HIT"):
+                return "⚠️ <b>Degradación de Servicio Temporal</b>\nYahoo Finance ha bloqueado temporalmente la IP por motivos de Rate Limit masivo. Por favor, espere.", None, None
 
             # Log por ticker: qué datos reales tiene y si pasa el checker
             for t in tickers:
@@ -1157,24 +1165,32 @@ async def _pipeline_hibrido_interno(
 
     elif clase_activo == "REIT":
         datos_bulk = await _obtener_info_bulk(tickers, "REIT")
+        if datos_bulk.get("_RATE_LIMIT_HIT"):
+            return "⚠️ <b>Degradación de Servicio Temporal</b>\nYahoo Finance ha bloqueado temporalmente la IP por motivos de Rate Limit masivo. Por favor, espere.", None, None
         resultados = [_chequear_fundamentales_reit(t, datos_bulk.get(t, {}), filtros_dinamicos_raw) for t in tickers]
         pre_ganadores = [r for r in resultados if r is not None]
         logger.info(f"[REIT] pre_ganadores={len(pre_ganadores)}/{len(tickers)} -> {[g['ticker'] for g in pre_ganadores]}")
 
     elif clase_activo == "ETF":
         datos_bulk = await _obtener_info_bulk(tickers, "ETF")
+        if datos_bulk.get("_RATE_LIMIT_HIT"):
+            return "⚠️ <b>Degradación de Servicio Temporal</b>\nYahoo Finance ha bloqueado temporalmente la IP por motivos de Rate Limit masivo. Por favor, espere.", None, None
         resultados = [_chequear_fundamentales_etf(t, datos_bulk.get(t, {}), filtros_dinamicos_raw) for t in tickers]
         pre_ganadores = [r for r in resultados if r is not None]
         logger.info(f"[ETF] pre_ganadores={len(pre_ganadores)}/{len(tickers)} -> {[g['ticker'] for g in pre_ganadores]}")
 
     elif clase_activo == "CRIPTO":
         datos_bulk = await _obtener_info_bulk(tickers, "CRIPTO")
+        if datos_bulk.get("_RATE_LIMIT_HIT"):
+            return "⚠️ <b>Degradación de Servicio Temporal</b>\nYahoo Finance ha bloqueado temporalmente la IP por motivos de Rate Limit masivo. Por favor, espere.", None, None
         resultados = [_chequear_fundamentales_cripto(t, datos_bulk.get(t, {}), filtros_dinamicos_raw) for t in tickers]
         pre_ganadores = [r for r in resultados if r is not None]
         logger.info(f"[CRIPTO] pre_ganadores={len(pre_ganadores)}/{len(tickers)} -> {[g['ticker'] for g in pre_ganadores]}")
 
     elif clase_activo == "BONO":
         datos_bulk = await _obtener_info_bulk(tickers, "BONO")
+        if datos_bulk.get("_RATE_LIMIT_HIT"):
+            return "⚠️ <b>Degradación de Servicio Temporal</b>\nYahoo Finance ha bloqueado temporalmente la IP por motivos de Rate Limit masivo. Por favor, espere.", None, None
         resultados = [_chequear_fundamentales_bono(t, datos_bulk.get(t, {}), filtros_dinamicos_raw) for t in tickers]
         pre_ganadores = [r for r in resultados if r is not None]
         logger.info(f"[BONO] pre_ganadores={len(pre_ganadores)}/{len(tickers)} -> {[g['ticker'] for g in pre_ganadores]}")
@@ -1343,6 +1359,8 @@ async def _pipeline_por_tabla(
             "filtros_extra": [{"key": "beta", "op": operator.le, "val": beta_max}] if beta_max < 99 else [],
         }
         datos_bulk = await _obtener_info_bulk(tickers, "ACCION")
+        if datos_bulk.get("_RATE_LIMIT_HIT"):
+            return "⚠️ <b>Degradación de Servicio Temporal</b>\nYahoo Finance ha bloqueado temporalmente la IP por motivos de Rate Limit masivo. Por favor, espere.", None, None
         resultados = [_chequear_fundamentales_accion(t, datos_bulk.get(t, {}), filtros_a) for t in tickers]
         try:
             ganadores = [r for r in resultados if r is not None]
@@ -1355,6 +1373,8 @@ async def _pipeline_por_tabla(
         fe = [{"metrica": "dividend_yield", "operador": ">=", "valor": div_min},
               {"metrica": "p_ffo",           "operador": "<=", "valor": p_ffo_max}]
         datos_bulk = await _obtener_info_bulk(tickers, "REIT")
+        if datos_bulk.get("_RATE_LIMIT_HIT"):
+            return "⚠️ <b>Degradación de Servicio Temporal</b>\nYahoo Finance ha bloqueado temporalmente la IP por motivos de Rate Limit masivo. Por favor, espere.", None, None
         resultados = [_chequear_fundamentales_reit(t, datos_bulk.get(t, {}), fe) for t in tickers]
         try:
             ganadores = [r for r in resultados if r is not None]
@@ -1367,6 +1387,8 @@ async def _pipeline_por_tabla(
         fe = [{"metrica": "ter", "operador": "<=", "valor": ter_max},
               {"metrica": "aum", "operador": ">=", "valor": aum_min}]
         datos_bulk = await _obtener_info_bulk(tickers, "ETF")
+        if datos_bulk.get("_RATE_LIMIT_HIT"):
+            return "⚠️ <b>Degradación de Servicio Temporal</b>\nYahoo Finance ha bloqueado temporalmente la IP por motivos de Rate Limit masivo. Por favor, espere.", None, None
         resultados = [_chequear_fundamentales_etf(t, datos_bulk.get(t, {}), fe) for t in tickers]
         try:
             ganadores = [r for r in resultados if r is not None]
@@ -1377,6 +1399,8 @@ async def _pipeline_por_tabla(
         mcap_min = float(filtros_tabla.get("market_cap_min_bn", 0)) * 1e9
         fe = [{"metrica": "market_cap", "operador": ">=", "valor": mcap_min}]
         datos_bulk = await _obtener_info_bulk(tickers, "CRIPTO")
+        if datos_bulk.get("_RATE_LIMIT_HIT"):
+            return "⚠️ <b>Degradación de Servicio Temporal</b>\nYahoo Finance ha bloqueado temporalmente la IP por motivos de Rate Limit masivo. Por favor, espere.", None, None
         resultados = [_chequear_fundamentales_cripto(t, datos_bulk.get(t, {}), fe) for t in tickers]
         try:
             ganadores = [r for r in resultados if r is not None]
@@ -1387,6 +1411,8 @@ async def _pipeline_por_tabla(
         ytm_min = float(filtros_tabla.get("ytm_min", 0))
         fe = [{"metrica": "dividend_yield", "operador": ">=", "valor": ytm_min}]
         datos_bulk = await _obtener_info_bulk(tickers, "BONO")
+        if datos_bulk.get("_RATE_LIMIT_HIT"):
+            return "⚠️ <b>Degradación de Servicio Temporal</b>\nYahoo Finance ha bloqueado temporalmente la IP por motivos de Rate Limit masivo. Por favor, espere.", None, None
         resultados = [_chequear_fundamentales_bono(t, datos_bulk.get(t, {}), fe) for t in tickers]
         try:
             ganadores = [r for r in resultados if r is not None]

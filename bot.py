@@ -2578,7 +2578,8 @@ async def comando_comprar(update: Update, context: ContextTypes.DEFAULT_TYPE):
 telegram_app.add_handler(CommandHandler("comprar", comando_comprar))
 
 
-import urllib.parse\nfrom curl_cffi import requests as requests_cffi
+import urllib.parse
+from curl_cffi import requests as requests_cffi
 
 # ── FASTAPI + LIFESPAN ────────────────────────────────────────────────────────
 # Uvicorn es el dueño del bucle de eventos. El bot de Telegram arranca y para

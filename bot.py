@@ -464,8 +464,13 @@ async def generador_informe_goldman(ticker: str, sector: str, datos: dict, perfi
     # 1. Sanitización de datos (Mantenemos los 0, ignoramos nulos)
     datos_limpios = {
         k: v for k, v in datos.items()
-        if v is not None and str(v).strip().upper() != "N/A"
+        if v is not None and str(v).strip().upper() != "N/A" and k not in ["ticker", "_best_effort", "_fuente", "rendimiento_real", "analisis_relevancia"]
     }
+
+    # Circuit Breaker: Si tras limpiar variables de metadata no hay fundamentales reales (ej. 429 Rate Limit)
+    if len(datos_limpios) == 0:
+        logger.error(f"[CIRCUIT BREAKER] Abortando Goldman para {ticker}. Falta de fundamentos reales.")
+        return "⚠️ <b>Degradación de Servicio Temporal</b>\nEl orquestador de datos en tiempo real está sufriendo picos de saturación masiva intermitente.\nNo se consumirán tokens de IA ni se emitirá reporte parcial para salvaguardar la veracidad de su señal financiera. Reintente en un momento."
 
     # 2. Contexto específico según clase
     ejemplo = _EJEMPLOS_POR_CLASE.get(clase_activo, _EJEMPLOS_POR_CLASE["ACCION"])
@@ -476,6 +481,7 @@ async def generador_informe_goldman(ticker: str, sector: str, datos: dict, perfi
         f"Quant Director. Flash Note {clase_activo}. 3 bullets MAX. "
         f"HTML solo <b><i>. SIN markdown/asteriscos. "
         f"PROHIBIDO usar etiquetas <font>, <span>, <div> o atributos CSS. Utiliza EXCLUSIVAMENTE HTML básico soportado por Telegram (<b>, <i>, <u>, <s>). "
+        f"REGLA CRUCIAL: Si los datos provistos en el json del contexto son vacíos parciales o nulos (ej. {{}}), DEBES NEGARTE a generar un veredicto de invencion. Responde estrictamente con: 'DATOS INSUFICIENTES'. "
         f"{restricciones} "
         f"Estructura: 🎯<b>Tesis:</b> [1 frase] | 📊<b>Datos:</b> [métricas] | ⚖️<b>Veredicto:</b> [1 frase]\n"
         f"{ejemplo}"
@@ -914,21 +920,13 @@ async def _obtener_info_bulk(tickers: list[str], clase: str) -> dict:
         async def fetch_yf(t: str):
             """Descarga info de yfinance con sesión browser y fallback a fast_info."""
             try:
-                try:
-                    info = await asyncio.wait_for(
-                        asyncio.to_thread(lambda: yf.Ticker(t, session=_YF_SESSION).info),
-                        timeout=15
-                    )
-                except Exception as e:
-                    if "Rate limited" in str(e) or "429" in str(e):
-                        logger.warning(f"[YF BULK] RATE LIMIT para {t}, esperando 5s...")
-                        await asyncio.sleep(5)
-                        info = await asyncio.wait_for(
-                            asyncio.to_thread(lambda: yf.Ticker(t, session=_YF_SESSION).info),
-                            timeout=15
-                        )
-                    else:
-                        raise e
+                import random
+                await asyncio.sleep(random.uniform(1.8, 4.2))
+                
+                info = await asyncio.wait_for(
+                    asyncio.to_thread(lambda: yf.Ticker(t, session=_YF_SESSION).info),
+                    timeout=25 # timeout alto para dar margen al ciclo interno de proxys
+                )
                 claves_validas = {k for k, v in info.items() if v is not None and k != 'trailingPegRatio'}
                 logger.info(f"[YF FETCH] {t} -> {len(claves_validas)} claves válidas | muestra: {list(claves_validas)[:5]}")
                 if len(claves_validas) < 3:
@@ -942,11 +940,8 @@ async def _obtener_info_bulk(tickers: list[str], clase: str) -> dict:
                     if fi:
                         info = fi
                 return t.upper(), info
-            except asyncio.TimeoutError:
-                logger.warning(f"[YF FETCH] TIMEOUT descargando {t} (15s superados)")
-                return t.upper(), {}
             except Exception as e:
-                logger.warning(f"[YF FETCH] ERROR {t}: {type(e).__name__}: {e}")
+                logger.warning(f"[CIRCUIT BREAKER PASIVO] Data nula para {t} tras agotar Stealth Session y reintentos: {e}")
                 return t.upper(), {}
 
         resultados = []
@@ -2591,35 +2586,60 @@ import urllib.parse
 # Uvicorn es el dueño del bucle de eventos. El bot de Telegram arranca y para
 # dentro del lifespan para compartir ese mismo bucle sin conflictos.
 
-class YahooCloudflareInterceptor(requests.Session):
-    def __init__(self, worker_url: str):
+class YahooStealthInterceptor(requests.Session):
+    USER_AGENTS = [
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
+        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+    ]
+    def __init__(self, proxies_list: list[str]):
         super().__init__()
-        self.worker_url = worker_url.rstrip("/")
+        self.proxies_list = [p.rstrip("/") for p in proxies_list if p]
+        self._proxy_index = 0
+        self.headers.update({
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.5",
+            "Sec-Fetch-Dest": "document",
+            "Sec-Fetch-Mode": "navigate",
+            "Sec-Ch-Ua": '"Google Chrome";v="124", "Chromium";v="124", "Not-A.Brand";v="24"',
+            "Sec-Ch-Ua-Mobile": "?0",
+            "Sec-Ch-Ua-Platform": '"Windows"'
+        })
 
     def request(self, method, url, **kwargs):
-        if self.worker_url:  # FIX: Solo interceptar si hay un proxy configurado
-            parsed = urllib.parse.urlparse(url)
-            if "finance.yahoo.com" in parsed.netloc:
+        self.headers["User-Agent"] = random.choice(self.USER_AGENTS)
+        kwargs.setdefault("timeout", 8.0)
+        parsed = urllib.parse.urlparse(url)
+        max_attempts = max(1, len(self.proxies_list))
+        
+        for attempt in range(max_attempts):
+            target_url = url
+            if self.proxies_list and "finance.yahoo.com" in parsed.netloc:
+                worker = self.proxies_list[self._proxy_index]
                 new_path = parsed.path
-                if parsed.query:
-                    new_path += "?" + parsed.query
-                url = f"{self.worker_url}{new_path}"
-        return super().request(method, url, **kwargs)
+                if parsed.query: new_path += "?" + parsed.query
+                target_url = f"{worker}{new_path}"
+                
+            try:
+                resp = super().request(method, target_url, **kwargs)
+                if resp.status_code == 429 or "Rate limited" in resp.text:
+                    raise requests.exceptions.RequestException("Rate limited / 429 en la respuesta")
+                return resp
+            except requests.exceptions.RequestException as e:
+                logger.warning(f"[STEALTH] Proxy colapsado (Intento {attempt+1}/{max_attempts}): {e}")
+                if self.proxies_list:
+                    self._proxy_index = (self._proxy_index + 1) % len(self.proxies_list)
+                if attempt == max_attempts - 1:
+                    raise e
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global _PIPELINE_SEMA, _CRON_SEMA, _CRON_LOCK, _QUICKCHART_SEMA, http_client, _YF_SESSION
 
-    # P1: Proxy de Cloudflare (configurado via .env) para evadir bloqueos de Yahoo Finance en Render
-    sess = YahooCloudflareInterceptor(worker_url=CF_WORKER_PROXY)
-    sess.headers.update({
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                      "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-        "Accept":          "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Accept-Language": "en-US,en;q=0.5",
-        "Accept-Encoding": "gzip, deflate, br",
-    })
-    _YF_SESSION = sess
+    # P1: Stealth Session Wrapper rotativo para el pool de Proxies
+    proxy_urls = [p.strip() for p in CF_WORKER_PROXY.split(",") if p.strip()] if CF_WORKER_PROXY else []
+    _YF_SESSION = YahooStealthInterceptor(proxies_list=proxy_urls)
 
 
     # P4: Render free tier (512 MB / 0.5 vCPU) — semáforos conservadores

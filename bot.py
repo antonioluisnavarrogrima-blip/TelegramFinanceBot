@@ -1148,7 +1148,8 @@ async def _pipeline_hibrido_interno(
             }
             datos_bulk = await _obtener_info_bulk(tickers, "ACCION")
             if datos_bulk.get("_RATE_LIMIT_HIT"):
-                return "⚠️ <b>Degradación de Servicio Temporal</b>\nYahoo Finance ha bloqueado temporalmente la IP por motivos de Rate Limit masivo. Por favor, espere.", None, None
+                # TODO: IP de Render en lista negra de Yahoo. El WAF bloquea JA3 en el Lote 1. Migrar motor de extracción fundamental a API oficial REST (ej. Financial Modeling Prep o AlphaVantage)
+                return "⚠️ <b>Degradación de Servicio Temporal</b>\nYahoo Finance ha bloqueado temporalmente la IP por motivos de Rate Limit masivo. Por favor, espere.", None, None, None
 
             # Log por ticker: qué datos reales tiene y si pasa el checker
             for t in tickers:
@@ -1166,7 +1167,8 @@ async def _pipeline_hibrido_interno(
     elif clase_activo == "REIT":
         datos_bulk = await _obtener_info_bulk(tickers, "REIT")
         if datos_bulk.get("_RATE_LIMIT_HIT"):
-            return "⚠️ <b>Degradación de Servicio Temporal</b>\nYahoo Finance ha bloqueado temporalmente la IP por motivos de Rate Limit masivo. Por favor, espere.", None, None
+            # TODO: IP de Render en lista negra de Yahoo. El WAF bloquea JA3 en el Lote 1. Migrar motor de extracción fundamental a API oficial REST (ej. Financial Modeling Prep o AlphaVantage)
+            return "⚠️ <b>Degradación de Servicio Temporal</b>\nYahoo Finance ha bloqueado temporalmente la IP por motivos de Rate Limit masivo. Por favor, espere.", None, None, None
         resultados = [_chequear_fundamentales_reit(t, datos_bulk.get(t, {}), filtros_dinamicos_raw) for t in tickers]
         pre_ganadores = [r for r in resultados if r is not None]
         logger.info(f"[REIT] pre_ganadores={len(pre_ganadores)}/{len(tickers)} -> {[g['ticker'] for g in pre_ganadores]}")
@@ -1174,7 +1176,8 @@ async def _pipeline_hibrido_interno(
     elif clase_activo == "ETF":
         datos_bulk = await _obtener_info_bulk(tickers, "ETF")
         if datos_bulk.get("_RATE_LIMIT_HIT"):
-            return "⚠️ <b>Degradación de Servicio Temporal</b>\nYahoo Finance ha bloqueado temporalmente la IP por motivos de Rate Limit masivo. Por favor, espere.", None, None
+            # TODO: IP de Render en lista negra de Yahoo. El WAF bloquea JA3 en el Lote 1. Migrar motor de extracción fundamental a API oficial REST (ej. Financial Modeling Prep o AlphaVantage)
+            return "⚠️ <b>Degradación de Servicio Temporal</b>\nYahoo Finance ha bloqueado temporalmente la IP por motivos de Rate Limit masivo. Por favor, espere.", None, None, None
         resultados = [_chequear_fundamentales_etf(t, datos_bulk.get(t, {}), filtros_dinamicos_raw) for t in tickers]
         pre_ganadores = [r for r in resultados if r is not None]
         logger.info(f"[ETF] pre_ganadores={len(pre_ganadores)}/{len(tickers)} -> {[g['ticker'] for g in pre_ganadores]}")
@@ -1182,7 +1185,8 @@ async def _pipeline_hibrido_interno(
     elif clase_activo == "CRIPTO":
         datos_bulk = await _obtener_info_bulk(tickers, "CRIPTO")
         if datos_bulk.get("_RATE_LIMIT_HIT"):
-            return "⚠️ <b>Degradación de Servicio Temporal</b>\nYahoo Finance ha bloqueado temporalmente la IP por motivos de Rate Limit masivo. Por favor, espere.", None, None
+            # TODO: IP de Render en lista negra de Yahoo. El WAF bloquea JA3 en el Lote 1. Migrar motor de extracción fundamental a API oficial REST (ej. Financial Modeling Prep o AlphaVantage)
+            return "⚠️ <b>Degradación de Servicio Temporal</b>\nYahoo Finance ha bloqueado temporalmente la IP por motivos de Rate Limit masivo. Por favor, espere.", None, None, None
         resultados = [_chequear_fundamentales_cripto(t, datos_bulk.get(t, {}), filtros_dinamicos_raw) for t in tickers]
         pre_ganadores = [r for r in resultados if r is not None]
         logger.info(f"[CRIPTO] pre_ganadores={len(pre_ganadores)}/{len(tickers)} -> {[g['ticker'] for g in pre_ganadores]}")
@@ -1190,7 +1194,8 @@ async def _pipeline_hibrido_interno(
     elif clase_activo == "BONO":
         datos_bulk = await _obtener_info_bulk(tickers, "BONO")
         if datos_bulk.get("_RATE_LIMIT_HIT"):
-            return "⚠️ <b>Degradación de Servicio Temporal</b>\nYahoo Finance ha bloqueado temporalmente la IP por motivos de Rate Limit masivo. Por favor, espere.", None, None
+            # TODO: IP de Render en lista negra de Yahoo. El WAF bloquea JA3 en el Lote 1. Migrar motor de extracción fundamental a API oficial REST (ej. Financial Modeling Prep o AlphaVantage)
+            return "⚠️ <b>Degradación de Servicio Temporal</b>\nYahoo Finance ha bloqueado temporalmente la IP por motivos de Rate Limit masivo. Por favor, espere.", None, None, None
         resultados = [_chequear_fundamentales_bono(t, datos_bulk.get(t, {}), filtros_dinamicos_raw) for t in tickers]
         pre_ganadores = [r for r in resultados if r is not None]
         logger.info(f"[BONO] pre_ganadores={len(pre_ganadores)}/{len(tickers)} -> {[g['ticker'] for g in pre_ganadores]}")
@@ -1360,7 +1365,8 @@ async def _pipeline_por_tabla(
         }
         datos_bulk = await _obtener_info_bulk(tickers, "ACCION")
         if datos_bulk.get("_RATE_LIMIT_HIT"):
-            return "⚠️ <b>Degradación de Servicio Temporal</b>\nYahoo Finance ha bloqueado temporalmente la IP por motivos de Rate Limit masivo. Por favor, espere.", None, None
+            # TODO: IP de Render en lista negra de Yahoo. El WAF bloquea JA3 en el Lote 1. Migrar motor de extracción fundamental a API oficial REST (ej. Financial Modeling Prep o AlphaVantage)
+            return "⚠️ <b>Degradación de Servicio Temporal</b>\nYahoo Finance ha bloqueado temporalmente la IP por motivos de Rate Limit masivo. Por favor, espere.", None, None, None
         resultados = [_chequear_fundamentales_accion(t, datos_bulk.get(t, {}), filtros_a) for t in tickers]
         try:
             ganadores = [r for r in resultados if r is not None]
@@ -1374,7 +1380,8 @@ async def _pipeline_por_tabla(
               {"metrica": "p_ffo",           "operador": "<=", "valor": p_ffo_max}]
         datos_bulk = await _obtener_info_bulk(tickers, "REIT")
         if datos_bulk.get("_RATE_LIMIT_HIT"):
-            return "⚠️ <b>Degradación de Servicio Temporal</b>\nYahoo Finance ha bloqueado temporalmente la IP por motivos de Rate Limit masivo. Por favor, espere.", None, None
+            # TODO: IP de Render en lista negra de Yahoo. El WAF bloquea JA3 en el Lote 1. Migrar motor de extracción fundamental a API oficial REST (ej. Financial Modeling Prep o AlphaVantage)
+            return "⚠️ <b>Degradación de Servicio Temporal</b>\nYahoo Finance ha bloqueado temporalmente la IP por motivos de Rate Limit masivo. Por favor, espere.", None, None, None
         resultados = [_chequear_fundamentales_reit(t, datos_bulk.get(t, {}), fe) for t in tickers]
         try:
             ganadores = [r for r in resultados if r is not None]
@@ -1388,7 +1395,8 @@ async def _pipeline_por_tabla(
               {"metrica": "aum", "operador": ">=", "valor": aum_min}]
         datos_bulk = await _obtener_info_bulk(tickers, "ETF")
         if datos_bulk.get("_RATE_LIMIT_HIT"):
-            return "⚠️ <b>Degradación de Servicio Temporal</b>\nYahoo Finance ha bloqueado temporalmente la IP por motivos de Rate Limit masivo. Por favor, espere.", None, None
+            # TODO: IP de Render en lista negra de Yahoo. El WAF bloquea JA3 en el Lote 1. Migrar motor de extracción fundamental a API oficial REST (ej. Financial Modeling Prep o AlphaVantage)
+            return "⚠️ <b>Degradación de Servicio Temporal</b>\nYahoo Finance ha bloqueado temporalmente la IP por motivos de Rate Limit masivo. Por favor, espere.", None, None, None
         resultados = [_chequear_fundamentales_etf(t, datos_bulk.get(t, {}), fe) for t in tickers]
         try:
             ganadores = [r for r in resultados if r is not None]
@@ -1400,7 +1408,8 @@ async def _pipeline_por_tabla(
         fe = [{"metrica": "market_cap", "operador": ">=", "valor": mcap_min}]
         datos_bulk = await _obtener_info_bulk(tickers, "CRIPTO")
         if datos_bulk.get("_RATE_LIMIT_HIT"):
-            return "⚠️ <b>Degradación de Servicio Temporal</b>\nYahoo Finance ha bloqueado temporalmente la IP por motivos de Rate Limit masivo. Por favor, espere.", None, None
+            # TODO: IP de Render en lista negra de Yahoo. El WAF bloquea JA3 en el Lote 1. Migrar motor de extracción fundamental a API oficial REST (ej. Financial Modeling Prep o AlphaVantage)
+            return "⚠️ <b>Degradación de Servicio Temporal</b>\nYahoo Finance ha bloqueado temporalmente la IP por motivos de Rate Limit masivo. Por favor, espere.", None, None, None
         resultados = [_chequear_fundamentales_cripto(t, datos_bulk.get(t, {}), fe) for t in tickers]
         try:
             ganadores = [r for r in resultados if r is not None]
@@ -1412,7 +1421,8 @@ async def _pipeline_por_tabla(
         fe = [{"metrica": "dividend_yield", "operador": ">=", "valor": ytm_min}]
         datos_bulk = await _obtener_info_bulk(tickers, "BONO")
         if datos_bulk.get("_RATE_LIMIT_HIT"):
-            return "⚠️ <b>Degradación de Servicio Temporal</b>\nYahoo Finance ha bloqueado temporalmente la IP por motivos de Rate Limit masivo. Por favor, espere.", None, None
+            # TODO: IP de Render en lista negra de Yahoo. El WAF bloquea JA3 en el Lote 1. Migrar motor de extracción fundamental a API oficial REST (ej. Financial Modeling Prep o AlphaVantage)
+            return "⚠️ <b>Degradación de Servicio Temporal</b>\nYahoo Finance ha bloqueado temporalmente la IP por motivos de Rate Limit masivo. Por favor, espere.", None, None, None
         resultados = [_chequear_fundamentales_bono(t, datos_bulk.get(t, {}), fe) for t in tickers]
         try:
             ganadores = [r for r in resultados if r is not None]

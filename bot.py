@@ -2585,17 +2585,26 @@ from curl_cffi import requests as requests_cffi
 # Uvicorn es el dueño del bucle de eventos. El bot de Telegram arranca y para
 # dentro del lifespan para compartir ese mismo bucle sin conflictos.
 
-def obtener_sesion_stealth_ja3(proxy_url: str = None):
-    """
-    Motor de evasión TLS para suplantar la firma JA3 de Chrome 120
-    bypasseando WAFs a nivel de protocolo de transporte.
-    """
-    sesion = requests_cffi.Session(impersonate="chrome120")
-    if proxy_url:
-        worker = proxy_url.rstrip("/")
-        sesion.proxies = {"http": worker, "https": worker}
-    sesion.timeout = 10.0
-    return sesion
+class YFStealthSessionAdapter:
+    """Wrapper para hacer compatible curl_cffi con el parser de cookies de yfinance"""
+    def __init__(self, proxy_url=None):
+        self.cffi_session = requests_cffi.Session(impersonate="chrome120")
+        if proxy_url:
+            worker = proxy_url.rstrip("/")
+            self.cffi_session.proxies = {"http": worker, "https": worker}
+        self.headers = self.cffi_session.headers
+        self.cookies = requests.cookies.RequestsCookieJar()
+
+    def get(self, url, **kwargs):
+        kwargs.pop('proxies', None) 
+        kwargs.setdefault('timeout', 15.0)
+        response = self.cffi_session.get(url, **kwargs)
+        jar = requests.cookies.RequestsCookieJar()
+        for name, value in self.cffi_session.cookies.items():
+            jar.set(name, value)
+            self.cookies.set(name, value)
+        response.cookies = jar
+        return response
 
 
 @asynccontextmanager
@@ -2604,7 +2613,7 @@ async def lifespan(app: FastAPI):
 
     # P1: Emulador JA3/TLS Stealth Session (curl_cffi)
     proxy_url = CF_WORKER_PROXY.split(",")[0].strip() if CF_WORKER_PROXY else None
-    _YF_SESSION = obtener_sesion_stealth_ja3(proxy_url)
+    _YF_SESSION = YFStealthSessionAdapter(proxy_url=proxy_url)
 
 
     # P4: Render free tier (512 MB / 0.5 vCPU) — semáforos conservadores

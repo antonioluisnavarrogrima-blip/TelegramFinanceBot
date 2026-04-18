@@ -826,75 +826,90 @@ def _chequear_fundamentales_bono(ticker: str, info: dict, filtros_extra: list) -
     except Exception as e: logger.debug(f"[YF] Error {ticker} (Bono): {e}")
 
 
-_GLOBAL_YF_CRUMB = None
+async def _fetch_fmp_batch(tickers: list[str]) -> dict:
+    if not FMP_API_KEY or not tickers:
+        return {}
+    simbolos = ",".join(t.upper() for t in tickers)
+    url = f"https://financialmodelingprep.com/api/v3/quote/{simbolos}?apikey={FMP_API_KEY}"
+    try:
+        resp = await http_client.get(url, timeout=12.0)
+        if resp.status_code != 200:
+            logger.warning(f"[FMP] HTTP {resp.status_code} para {simbolos[:60]}")
+            return {}
+        data = resp.json()
+        if not isinstance(data, list):
+            logger.warning(f"[FMP] Respuesta inesperada: {str(data)[:200]}")
+            return {}
+        resultado = {}
+        for item in data:
+            sym = item.get("symbol", "").upper()
+            if not sym: continue
+            precio = item.get("price") or 0
+            div_anual = item.get("lastDiv") or 0
+            resultado[sym] = {
+                "regularMarketPrice":    precio,
+                "previousClose":         item.get("previousClose"),
+                "marketCap":             item.get("marketCap"),
+                "shortName":             item.get("name", sym),
+                "trailingPE":            item.get("pe"),
+                "forwardPE":             item.get("pe"),
+                "dividendYield":         (div_anual / precio) if precio and div_anual else None,
+                "dividendRate":          div_anual,
+                "beta":                  None,
+                "totalAssets":           item.get("marketCap"),
+                "yield":                 (div_anual / precio) if precio and div_anual else None,
+                "_fuente":               "FMP",
+            }
+        return resultado
+    except asyncio.TimeoutError:
+        return {}
+    except Exception as e:
+        logger.warning(f"[FMP] Error batch: {type(e).__name__}: {e}")
+        return {}
 
 async def _obtener_info_bulk(tickers: list[str], clase: str) -> dict:
-    global _GLOBAL_YF_CRUMB
     cached = await db.obtener_yf_cache_bulk(tickers)
     faltantes = [t for t in tickers if t.upper() not in cached]
     logger.info(f"[BULK] {clase} | Total:{len(tickers)} En-cache:{len(cached)} A-descargar:{len(faltantes)}")
 
     if faltantes:
-        chunk_size = 100
+        # FMP Free Tier restringe la cantidad de tickers simultáneos en /quote.
+        # Micro-lotes de 3 aseguran 0 fallos 403 a costa de mayor consumo (13 reqs por busqueda top).
+        chunk_size = 3
         nuevos_datos = {}
         
-        # 1. Obtencion de Crumb (Singleton en runtime)
-        if not _GLOBAL_YF_CRUMB:
-            try:
-                logger.info("[YF V7] Solicitando nuevo Crumb vía TLS...")
-                await asyncio.wait_for(asyncio.to_thread(lambda: _YF_SESSION.get("https://fc.yahoo.com")), timeout=10.0)
-                resp_crumb = await asyncio.wait_for(
-                    asyncio.to_thread(lambda: _YF_SESSION.get("https://query1.finance.yahoo.com/v1/test/getcrumb")), timeout=10.0
-                )
-                if resp_crumb.status_code == 200 and "<html>" not in resp_crumb.text:
-                    _GLOBAL_YF_CRUMB = resp_crumb.text
-            except Exception as e:
-                logger.warning(f"[YF V7] Fallo al obtener Crumb: {e}")
-                
         for i in range(0, len(faltantes), chunk_size):
             lote = faltantes[i:i+chunk_size]
-            logger.info(f"[YF V7 BULK] Descargando lote de {len(lote)} tickers...")
+            logger.info(f"[FMP BULK] Descargando lote de {len(lote)} tickers...")
             
             res = {}
-            if _GLOBAL_YF_CRUMB:
-                try:
-                    simbolos = ",".join(t.upper() for t in lote)
-                    url = f"https://query2.finance.yahoo.com/v7/finance/quote?symbols={simbolos}&crumb={_GLOBAL_YF_CRUMB}"
-                    resp = await asyncio.wait_for(asyncio.to_thread(lambda: _YF_SESSION.get(url)), timeout=10.0)
-                    
-                    if resp.status_code == 200:
-                        data = resp.json()
-                        quotes = data.get("quoteResponse", {}).get("result", [])
-                        for q in quotes:
-                            sym = q.get("symbol")
-                            if sym:
-                                res[sym] = q
-                    else:
-                        logger.warning(f"[YF V7] Rechazo HTTP {resp.status_code}")
-                        if resp.status_code == 401:
-                            _GLOBAL_YF_CRUMB = None # Forzar rotación de crumb en siguiente ciclo
-                except Exception as e:
-                    logger.warning(f"[YF V7] Error quote: {e}")
-                    
+            for _ in range(2):
+                res = await _fetch_fmp_batch(lote)
+                if res: break
+                import asyncio
+                await asyncio.sleep(2)
+                
             if not res:
-                logger.critical(f"[FAIL-FAST] Red interceptada y Crumb agotado en Lote {i//chunk_size+1}. Abortando.")
+                logger.critical(f"[FAIL-FAST] FMP bloqueado (Límite 250 diario alcanzado) en Lote {i//chunk_size+1}. Abortando masiva.")
                 return {"_RATE_LIMIT_HIT": True}
                 
             _METRICAS_MINIMAS = {"regularMarketPrice", "trailingPE", "marketCap"}
             for t, info in res.items():
                 if not info: continue
                 claves_presentes = set(info.keys()) & _METRICAS_MINIMAS
-                # Relajamos a regularMarketPrice minimo por V7
-                if not info.get("regularMarketPrice"):
+                # FMP a veces no da trailingPE para algunas empresas menores, lo relajamos un poco
+                if "regularMarketPrice" not in claves_presentes:
                     continue
                 nuevos_datos[t] = info
                 cached[t] = info
+                
+            await asyncio.sleep(0.5) # Jitter para FMP rate limits
         
-        logger.info(f"[YF V7 BULK] Resultado final: {len(nuevos_datos)}/{len(faltantes)} tickers con datos válidos")
+        logger.info(f"[FMP BULK] Resultado final: {len(nuevos_datos)}/{len(faltantes)} tickers.")
         if nuevos_datos:
             await db.guardar_yf_cache_bulk(nuevos_datos, clase)
 
-    logger.info(f"[YF V7 BULK] Cache total disponible: {len(cached)} tickers")
+    logger.info(f"[FMP BULK] Cache disponible: {len(cached)} tickers")
 
     # ── FALLBACK ESTÁTICO DE EMERGENCIA ──────────────────────────────────────────
     # Si Yahoo Finance ha bloqueado la IP y no hay ningún ticker válido,

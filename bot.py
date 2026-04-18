@@ -81,8 +81,9 @@ CRON_SECRET              = os.getenv("CRON_SECRET", "")
 RENDER_EXTERNAL_URL      = os.getenv("RENDER_EXTERNAL_URL", "").rstrip("/")
 CREDITOS_POR_COMPRA      = _obtener_int_env("CREDITOS_POR_COMPRA", 10)
 STRIPE_PAYMENT_URL       = os.getenv("STRIPE_PAYMENT_URL", "")
-FMP_API_KEY              = os.getenv("FMP_API_KEY", "")  # financialmodelingprep.com — free tier, sin tarjeta
-CF_WORKER_PROXY          = os.getenv("CF_WORKER_PROXY", "")
+FMP_API_KEYS               = os.getenv("FMP_API_KEYS", os.getenv("FMP_API_KEY", ""))
+ALPHAVANTAGE_API_KEYS      = os.getenv("ALPHAVANTAGE_API_KEYS", "")
+CF_WORKER_PROXY            = os.getenv("CF_WORKER_PROXY", "")
 
 OPS = {
     ">": operator.gt, "<": operator.lt, ">=": operator.ge,
@@ -826,90 +827,166 @@ def _chequear_fundamentales_bono(ticker: str, info: dict, filtros_extra: list) -
     except Exception as e: logger.debug(f"[YF] Error {ticker} (Bono): {e}")
 
 
-async def _fetch_fmp_batch(tickers: list[str]) -> dict:
-    if not FMP_API_KEY or not tickers:
-        return {}
-    simbolos = ",".join(t.upper() for t in tickers)
-    url = f"https://financialmodelingprep.com/api/v3/quote/{simbolos}?apikey={FMP_API_KEY}"
-    try:
-        resp = await http_client.get(url, timeout=12.0)
-        if resp.status_code != 200:
-            logger.warning(f"[FMP] HTTP {resp.status_code} para {simbolos[:60]}")
+class ExtractorBase:
+    def __init__(self, key: str):
+        self.key = key.strip()
+    async def fetch_batch(self, tickers: list[str]) -> dict:
+        raise NotImplementedError
+
+class ExtractorFMP(ExtractorBase):
+    async def fetch_batch(self, tickers: list[str]) -> dict:
+        if not self.key or not tickers: return {}
+        simbolos = ",".join(t.upper() for t in tickers)
+        url = f"https://financialmodelingprep.com/api/v3/quote/{simbolos}?apikey={self.key}"
+        try:
+            resp = await http_client.get(url, timeout=12.0)
+            if resp.status_code != 200:
+                logger.warning(f"[ExtractorFMP] HTTP {resp.status_code}")
+                return {}
+            data = resp.json()
+            if not isinstance(data, list): return {}
+            res = {}
+            for item in data:
+                sym = item.get("symbol", "").upper()
+                if not sym: continue
+                precio = item.get("price") or 0
+                div_anual = item.get("lastDiv") or 0
+                res[sym] = {
+                    "regularMarketPrice": precio,
+                    "previousClose": item.get("previousClose"),
+                    "marketCap": item.get("marketCap"),
+                    "shortName": item.get("name", sym),
+                    "trailingPE": item.get("pe"),
+                    "dividendYield": (div_anual / precio) if precio and div_anual else None,
+                    "_fuente": "FMP"
+                }
+            return res
+        except Exception as e:
+            logger.warning(f"[ExtractorFMP] Error: {e}")
             return {}
-        data = resp.json()
-        if not isinstance(data, list):
-            logger.warning(f"[FMP] Respuesta inesperada: {str(data)[:200]}")
-            return {}
-        resultado = {}
-        for item in data:
-            sym = item.get("symbol", "").upper()
-            if not sym: continue
-            precio = item.get("price") or 0
-            div_anual = item.get("lastDiv") or 0
-            resultado[sym] = {
-                "regularMarketPrice":    precio,
-                "previousClose":         item.get("previousClose"),
-                "marketCap":             item.get("marketCap"),
-                "shortName":             item.get("name", sym),
-                "trailingPE":            item.get("pe"),
-                "forwardPE":             item.get("pe"),
-                "dividendYield":         (div_anual / precio) if precio and div_anual else None,
-                "dividendRate":          div_anual,
-                "beta":                  None,
-                "totalAssets":           item.get("marketCap"),
-                "yield":                 (div_anual / precio) if precio and div_anual else None,
-                "_fuente":               "FMP",
-            }
-        return resultado
-    except asyncio.TimeoutError:
-        return {}
-    except Exception as e:
-        logger.warning(f"[FMP] Error batch: {type(e).__name__}: {e}")
-        return {}
+
+class ExtractorAlphaVantage(ExtractorBase):
+    async def fetch_batch(self, tickers: list[str]) -> dict:
+        # AV no soporta multiples symbols gratis en batch, se hace concurrente 1 a 1 de forma silenciosa
+        if not self.key or not tickers: return {}
+        async def fetch_one(t):
+            try:
+                url_q = f"https://www.alphavantage.co/query?function=GLOBAL_QUOTE&symbol={t}&apikey={self.key}"
+                url_o = f"https://www.alphavantage.co/query?function=OVERVIEW&symbol={t}&apikey={self.key}"
+                rq, ro = await asyncio.gather(
+                    http_client.get(url_q, timeout=8.0),
+                    http_client.get(url_o, timeout=8.0)
+                )
+                if rq.status_code != 200 or ro.status_code != 200: return t, {}
+                dq = rq.json().get("Global Quote", {})
+                do = ro.json()
+                if not dq: return t, {}
+                precio = float(dq.get("05. price", 0))
+                return t.upper(), {
+                    "regularMarketPrice": precio,
+                    "previousClose": float(dq.get("08. previous close", 0)),
+                    "marketCap": float(do.get("MarketCapitalization", 0)) if do.get("MarketCapitalization") and do.get("MarketCapitalization") != "None" else None,
+                    "trailingPE": float(do.get("PERatio", 0)) if do.get("PERatio") and do.get("PERatio") != "None" else None,
+                    "dividendYield": float(do.get("DividendYield", 0)) if do.get("DividendYield") and do.get("DividendYield") != "None" else None,
+                    "_fuente": "AlphaVantage"
+                }
+            except Exception:
+                return t, {}
+        import asyncio
+        resultados = await asyncio.gather(*(fetch_one(t) for t in tickers))
+        return {t: info for t, info in resultados if info}
+
+class ExtractorYahooDegradado(ExtractorBase):
+    async def fetch_batch(self, tickers: list[str]) -> dict:
+        # Fallback supremo: raspar precios usando la API V8 (Chart) con TLS Spoofing sin Crumbs. Ignora PER y Div.
+        if not tickers: return {}
+        async def fetch_one(t):
+            try:
+                url = f"https://query2.finance.yahoo.com/v8/finance/chart/{t}?interval=1d&range=1d"
+                import asyncio
+                resp = await asyncio.wait_for(asyncio.to_thread(lambda: _YF_SESSION.get(url)), timeout=10.0)
+                if resp.status_code != 200: return t, {}
+                data = resp.json().get("chart", {}).get("result", [])
+                if not data: return t, {}
+                meta = data[0].get("meta", {})
+                return t.upper(), {
+                    "regularMarketPrice": meta.get("regularMarketPrice"),
+                    "previousClose": meta.get("chartPreviousClose"),
+                    "_fuente": "YahooV8_Degradado"
+                }
+            except Exception:
+                return t, {}
+        import asyncio
+        resultados = await asyncio.gather(*(fetch_one(t) for t in tickers))
+        return {t: info for t, info in resultados if info}
+
 
 async def _obtener_info_bulk(tickers: list[str], clase: str) -> dict:
     cached = await db.obtener_yf_cache_bulk(tickers)
     faltantes = [t for t in tickers if t.upper() not in cached]
-    logger.info(f"[BULK] {clase} | Total:{len(tickers)} En-cache:{len(cached)} A-descargar:{len(faltantes)}")
+    logger.info(f"[ROUTER] {clase} | Total:{len(tickers)} En-cache:{len(cached)} A-descargar:{len(faltantes)}")
 
     if faltantes:
-        # FMP Free Tier restringe la cantidad de tickers simultáneos en /quote.
-        # Micro-lotes de 3 aseguran 0 fallos 403 a costa de mayor consumo (13 reqs por busqueda top).
+        # Instanciar el Strategy Router dinamicamente de las variables de entorno
+        extractores = []
+        if FMP_API_KEYS:
+            for k in FMP_API_KEYS.split(","):
+                if k.strip(): extractores.append(ExtractorFMP(k))
+        if ALPHAVANTAGE_API_KEYS:
+            for k in ALPHAVANTAGE_API_KEYS.split(","):
+                if k.strip(): extractores.append(ExtractorAlphaVantage(k))
+        
+        # Supervivencia suprema al final del abismo
+        extractores.append(ExtractorYahooDegradado("none"))
+
         chunk_size = 3
         nuevos_datos = {}
         
         for i in range(0, len(faltantes), chunk_size):
             lote = faltantes[i:i+chunk_size]
-            logger.info(f"[FMP BULK] Descargando lote de {len(lote)} tickers...")
+            logger.info(f"[ROUTER] Descargando lote de {len(lote)} tickers...")
             
             res = {}
-            for _ in range(2):
-                res = await _fetch_fmp_batch(lote)
-                if res: break
-                import asyncio
-                await asyncio.sleep(2)
+            extractor_usado = None
+            
+            # Intento en cascada
+            for ext in extractores:
+                tipo = type(ext).__name__
+                logger.info(f"[ROUTER] -> Intentando fuente: {tipo}...")
                 
+                # FMP tiene ban por 403 HTTP si tiras array largo. Limitamos batch o usamos retry simple.
+                for _ in range(2 if "FMP" in tipo else 1): 
+                    res = await ext.fetch_batch(lote)
+                    if res: break
+                    import asyncio
+                    await asyncio.sleep(1.5)
+                    
+                if res:
+                    logger.info(f"[ROUTER] -> ¡Éxito con {tipo}!")
+                    extractor_usado = ext
+                    break
+                else:
+                    logger.warning(f"[ROUTER] -> {tipo} falló o retornó vacío. Pasando al siguiente extractor...")
+            
             if not res:
-                logger.critical(f"[FAIL-FAST] FMP bloqueado (Límite 250 diario alcanzado) en Lote {i//chunk_size+1}. Abortando masiva.")
+                logger.critical(f"[FAIL-FAST] Todas las fuentes de respaldo (incluyendo degradadas) fallaron en Lote {i//chunk_size+1}. Red cortocircuitada.")
                 return {"_RATE_LIMIT_HIT": True}
                 
-            _METRICAS_MINIMAS = {"regularMarketPrice", "trailingPE", "marketCap"}
+            _METRICAS_MINIMAS = {"regularMarketPrice"} # El minimo existencial
             for t, info in res.items():
                 if not info: continue
-                claves_presentes = set(info.keys()) & _METRICAS_MINIMAS
-                # FMP a veces no da trailingPE para algunas empresas menores, lo relajamos un poco
-                if "regularMarketPrice" not in claves_presentes:
-                    continue
+                if not info.get("regularMarketPrice"): continue
                 nuevos_datos[t] = info
                 cached[t] = info
                 
-            await asyncio.sleep(0.5) # Jitter para FMP rate limits
+            import asyncio
+            await asyncio.sleep(0.5)
         
-        logger.info(f"[FMP BULK] Resultado final: {len(nuevos_datos)}/{len(faltantes)} tickers.")
+        logger.info(f"[ROUTER] Resultado final: {len(nuevos_datos)}/{len(faltantes)} tickers.")
         if nuevos_datos:
             await db.guardar_yf_cache_bulk(nuevos_datos, clase)
 
-    logger.info(f"[FMP BULK] Cache disponible: {len(cached)} tickers")
+    logger.info(f"[ROUTER] Cache disponible: {len(cached)} tickers")
 
     # ── FALLBACK ESTÁTICO DE EMERGENCIA ──────────────────────────────────────────
     # Si Yahoo Finance ha bloqueado la IP y no hay ningún ticker válido,

@@ -17,7 +17,6 @@ from contextlib import asynccontextmanager
 import httpx
 import stripe
 import uvicorn
-import yfinance as yf
 from google import genai
 from google.genai import types
 from dotenv import load_dotenv
@@ -515,40 +514,34 @@ async def generador_informe_goldman(ticker: str, sector: str, datos: dict, perfi
 
 # --- 2. HERRAMIENTAS MATEMÁTICAS LOCALES ---
 async def fabricante_de_graficos(ticker: str, periodo: str = "3mo") -> tuple[bytes | None, float]:
-    """Genera gráfico via Yahoo Finance + QuickChart. Retry interno 2x con backoff para evitar ban."""
-    hist = None
-    for intento in range(3):  # hasta 3 intentos con backoff (0s, 1s, 3s)
-        try:
-            hist = await asyncio.wait_for(
-                asyncio.to_thread(lambda: yf.Ticker(ticker, session=_YF_SESSION).history(period=periodo)),
-                timeout=10.0
-            )
-            hist = hist.dropna(subset=['Close'])
-            if not hist.empty and len(hist) >= 2:
-                break  # datos válidos obtenidos
-            logger.warning(f"[YF] Datos vacíos para {ticker} (intento {intento+1}/3)")
-        except asyncio.TimeoutError:
-            logger.warning(f"[YF] Timeout descargando {ticker} (intento {intento+1}/3)")
-            hist = None
-        except Exception as e:
-            logger.warning(f"[YF] Error descargando {ticker} (intento {intento+1}/3): {e}")
-            if "Rate limited" in str(e) or "429" in str(e):
-                await asyncio.sleep(5)
-            hist = None
-        
-        if hist is not None and not hist.empty and len(hist) >= 2:
-            break
+    """Genera gráfico via Yahoo V8 RAW API + QuickChart sin requerir yfinance."""
+    import datetime
+    labels = []
+    prices = []
+    try:
+        url = f"https://query2.finance.yahoo.com/v8/finance/chart/{ticker}?interval=1d&range={periodo}"
+        resp = await asyncio.wait_for(
+            asyncio.to_thread(lambda: _YF_SESSION.get(url)),
+            timeout=10.0
+        )
+        if resp.status_code == 200:
+            data = resp.json()
+            res = data.get("chart", {}).get("result", [])
+            if res:
+                timestamps = res[0].get("timestamp", [])
+                quotes = res[0].get("indicators", {}).get("quote", [{}])
+                if quotes:
+                    closes = quotes[0].get("close", [])
+                    # Filtra nulos
+                    for t_stamp, c_price in zip(timestamps, closes):
+                        if c_price is not None:
+                            labels.append(datetime.datetime.fromtimestamp(t_stamp).strftime('%Y-%m-%d'))
+                            prices.append(round(float(c_price), 2))
+    except Exception as e:
+        logger.warning(f"[YF V8 GRAPH] Error {ticker}: {e}")
 
-        if intento < 2:
-            import random
-            base_sleep = [0.5, 1.5, 3.0][intento]
-            await asyncio.sleep(base_sleep + random.uniform(0.1, 1.0))
-
-    if hist is None or hist.empty or len(hist) < 2:
+    if len(prices) < 2:
         return None, 0.0
-
-    labels = hist.index.strftime('%Y-%m-%d').tolist()
-    prices = [round(float(p), 2) for p in hist['Close'].tolist()]
 
     p_inicial = prices[0]
     p_final   = prices[-1]
@@ -917,68 +910,38 @@ async def _obtener_info_bulk(tickers: list[str], clase: str) -> dict:
     logger.info(f"[BULK] {clase} | Total:{len(tickers)} En-cache:{len(cached)} A-descargar:{len(faltantes)}")
 
     if faltantes:
-        async def fetch_yf(t: str):
-            """Descarga info de yfinance usando el emulador JA3 (curl_cffi) y Circuit Breaker."""
-            try:
-                import random
-                # Jitter asíncrono preservando rango solicitado
-                await asyncio.sleep(random.uniform(2.0, 5.0))
-                
-                info = await asyncio.wait_for(
-                    asyncio.to_thread(lambda: yf.Ticker(t, session=_YF_SESSION).info),
-                    timeout=15.0
-                )
-                claves_validas = {k for k, v in info.items() if v is not None and k != 'trailingPegRatio'}
-                logger.info(f"[YF FETCH JA3] {t} -> {len(claves_validas)} claves válidas")
-                if len(claves_validas) < 3:
-                    logger.warning(f"[YF JA3] Bloqueo silencioso para {t}, fallback a fast_info...")
-                    fi = await asyncio.wait_for(
-                        asyncio.to_thread(lambda: dict(yf.Ticker(t, session=_YF_SESSION).fast_info)),
-                        timeout=10.0
-                    )
-                    if fi: info = fi
-                return t.upper(), info
-            except Exception as e:
-                logger.warning(f"[CIRCUIT BREAKER PASIVO] JA3 Fallido para {t}. Excepción: {type(e).__name__} - {e}")
-                return t.upper(), {}
-
-        resultados = []
-        import random
-        for i in range(0, len(faltantes), 2):
-            lote = faltantes[i:i+2]
-            logger.info(f"[YF BULK] Lote {i//2+1}: descargando {lote}")
-            res_lote = await asyncio.gather(*(fetch_yf(t) for t in lote))
-            resultados.extend(res_lote)
-            
-            # Global Kill Switch - TAREA 1
-            if all(not info for ticker, info in res_lote):
-                logger.critical(f"[GLOBAL KILL SWITCH] WAF Bloqueado o nulo sistemático en Lote {i//2+1}. Abortando descarga masiva restante.")
-                return {"_RATE_LIMIT_HIT": True} # Propagación de estado - TAREA 2
-
-            if i + 2 < len(faltantes):
-                await asyncio.sleep(random.uniform(1.5, 3.0))
-
+        chunk_size = 100
         nuevos_datos = {}
-        _METRICAS_MINIMAS = {"regularMarketPrice", "currentPrice", "previousClose",
-                             "trailingPE", "dividendYield", "marketCap",
-                             "lastPrice", "regularMarketOpen"}
-        for t, info in resultados:
-            if not info:
-                logger.warning(f"[YF CACHE] {t}: dict vacío, ignorado.")
-                continue
-            claves_presentes = set(info.keys()) & _METRICAS_MINIMAS
-            if not claves_presentes:
-                logger.warning(f"[YF CACHE] {t}: sin métricas mínimas -> RECHAZADO. Claves recibidas: {list(info.keys())[:10]}")
-                continue
-            logger.info(f"[YF CACHE] {t}: aceptado con métricas: {claves_presentes}")
-            nuevos_datos[t] = info
-            cached[t] = info
-
-        logger.info(f"[YF BULK] Resultado final: {len(nuevos_datos)}/{len(faltantes)} tickers con datos válidos")
+        for i in range(0, len(faltantes), chunk_size):
+            lote = faltantes[i:i+chunk_size]
+            logger.info(f"[FMP BULK] Descargando lote de {len(lote)} tickers...")
+            
+            # Reintento básico FMP
+            res = {}
+            for _ in range(2):
+                res = await _fetch_fmp_batch(lote)
+                if res: break
+                import asyncio
+                await asyncio.sleep(2)
+                
+            if not res:
+                logger.critical(f"[FAIL-FAST] FMP bloqueado o caída masiva en Lote {i//chunk_size+1}. Abortando.")
+                return {"_RATE_LIMIT_HIT": True}
+                
+            _METRICAS_MINIMAS = {"regularMarketPrice", "trailingPE", "marketCap"}
+            for t, info in res.items():
+                if not info: continue
+                claves_presentes = set(info.keys()) & _METRICAS_MINIMAS
+                if not claves_presentes:
+                    continue
+                nuevos_datos[t] = info
+                cached[t] = info
+        
+        logger.info(f"[FMP BULK] Resultado final: {len(nuevos_datos)}/{len(faltantes)} tickers con datos válidos")
         if nuevos_datos:
             await db.guardar_yf_cache_bulk(nuevos_datos, clase)
 
-    logger.info(f"[YF BULK] Cache total disponible: {len(cached)} tickers")
+    logger.info(f"[FMP BULK] Cache total disponible: {len(cached)} tickers")
 
     # ── FALLBACK ESTÁTICO DE EMERGENCIA ──────────────────────────────────────────
     # Si Yahoo Finance ha bloqueado la IP y no hay ningún ticker válido,
@@ -1149,7 +1112,7 @@ async def _pipeline_hibrido_interno(
             datos_bulk = await _obtener_info_bulk(tickers, "ACCION")
             if datos_bulk.get("_RATE_LIMIT_HIT"):
                 # TODO: IP de Render en lista negra de Yahoo. El WAF bloquea JA3 en el Lote 1. Migrar motor de extracción fundamental a API oficial REST (ej. Financial Modeling Prep o AlphaVantage)
-                return "⚠️ <b>Degradación de Servicio Temporal</b>\nYahoo Finance ha bloqueado temporalmente la IP por motivos de Rate Limit masivo. Por favor, espere.", None, None, None
+                return "⚠️ <b>Degradación de Servicio Temporal</b>\nLa cuota de la API (FMP) o del motor de inferencia se ha agotado o bloqueado masivamente. Por favor, espere.", None, None, None
 
             # Log por ticker: qué datos reales tiene y si pasa el checker
             for t in tickers:
@@ -1168,7 +1131,7 @@ async def _pipeline_hibrido_interno(
         datos_bulk = await _obtener_info_bulk(tickers, "REIT")
         if datos_bulk.get("_RATE_LIMIT_HIT"):
             # TODO: IP de Render en lista negra de Yahoo. El WAF bloquea JA3 en el Lote 1. Migrar motor de extracción fundamental a API oficial REST (ej. Financial Modeling Prep o AlphaVantage)
-            return "⚠️ <b>Degradación de Servicio Temporal</b>\nYahoo Finance ha bloqueado temporalmente la IP por motivos de Rate Limit masivo. Por favor, espere.", None, None, None
+            return "⚠️ <b>Degradación de Servicio Temporal</b>\nLa cuota de la API (FMP) o del motor de inferencia se ha agotado o bloqueado masivamente. Por favor, espere.", None, None, None
         resultados = [_chequear_fundamentales_reit(t, datos_bulk.get(t, {}), filtros_dinamicos_raw) for t in tickers]
         pre_ganadores = [r for r in resultados if r is not None]
         logger.info(f"[REIT] pre_ganadores={len(pre_ganadores)}/{len(tickers)} -> {[g['ticker'] for g in pre_ganadores]}")
@@ -1177,7 +1140,7 @@ async def _pipeline_hibrido_interno(
         datos_bulk = await _obtener_info_bulk(tickers, "ETF")
         if datos_bulk.get("_RATE_LIMIT_HIT"):
             # TODO: IP de Render en lista negra de Yahoo. El WAF bloquea JA3 en el Lote 1. Migrar motor de extracción fundamental a API oficial REST (ej. Financial Modeling Prep o AlphaVantage)
-            return "⚠️ <b>Degradación de Servicio Temporal</b>\nYahoo Finance ha bloqueado temporalmente la IP por motivos de Rate Limit masivo. Por favor, espere.", None, None, None
+            return "⚠️ <b>Degradación de Servicio Temporal</b>\nLa cuota de la API (FMP) o del motor de inferencia se ha agotado o bloqueado masivamente. Por favor, espere.", None, None, None
         resultados = [_chequear_fundamentales_etf(t, datos_bulk.get(t, {}), filtros_dinamicos_raw) for t in tickers]
         pre_ganadores = [r for r in resultados if r is not None]
         logger.info(f"[ETF] pre_ganadores={len(pre_ganadores)}/{len(tickers)} -> {[g['ticker'] for g in pre_ganadores]}")
@@ -1186,7 +1149,7 @@ async def _pipeline_hibrido_interno(
         datos_bulk = await _obtener_info_bulk(tickers, "CRIPTO")
         if datos_bulk.get("_RATE_LIMIT_HIT"):
             # TODO: IP de Render en lista negra de Yahoo. El WAF bloquea JA3 en el Lote 1. Migrar motor de extracción fundamental a API oficial REST (ej. Financial Modeling Prep o AlphaVantage)
-            return "⚠️ <b>Degradación de Servicio Temporal</b>\nYahoo Finance ha bloqueado temporalmente la IP por motivos de Rate Limit masivo. Por favor, espere.", None, None, None
+            return "⚠️ <b>Degradación de Servicio Temporal</b>\nLa cuota de la API (FMP) o del motor de inferencia se ha agotado o bloqueado masivamente. Por favor, espere.", None, None, None
         resultados = [_chequear_fundamentales_cripto(t, datos_bulk.get(t, {}), filtros_dinamicos_raw) for t in tickers]
         pre_ganadores = [r for r in resultados if r is not None]
         logger.info(f"[CRIPTO] pre_ganadores={len(pre_ganadores)}/{len(tickers)} -> {[g['ticker'] for g in pre_ganadores]}")
@@ -1195,7 +1158,7 @@ async def _pipeline_hibrido_interno(
         datos_bulk = await _obtener_info_bulk(tickers, "BONO")
         if datos_bulk.get("_RATE_LIMIT_HIT"):
             # TODO: IP de Render en lista negra de Yahoo. El WAF bloquea JA3 en el Lote 1. Migrar motor de extracción fundamental a API oficial REST (ej. Financial Modeling Prep o AlphaVantage)
-            return "⚠️ <b>Degradación de Servicio Temporal</b>\nYahoo Finance ha bloqueado temporalmente la IP por motivos de Rate Limit masivo. Por favor, espere.", None, None, None
+            return "⚠️ <b>Degradación de Servicio Temporal</b>\nLa cuota de la API (FMP) o del motor de inferencia se ha agotado o bloqueado masivamente. Por favor, espere.", None, None, None
         resultados = [_chequear_fundamentales_bono(t, datos_bulk.get(t, {}), filtros_dinamicos_raw) for t in tickers]
         pre_ganadores = [r for r in resultados if r is not None]
         logger.info(f"[BONO] pre_ganadores={len(pre_ganadores)}/{len(tickers)} -> {[g['ticker'] for g in pre_ganadores]}")
@@ -1234,26 +1197,40 @@ async def _pipeline_hibrido_interno(
     # Pre-fetch concurrente: obtenemos el rendimiento de todos los candidatos a la vez
     # usando solo yfinance (sin generar imágenes). Coste: N llamadas YF en paralelo.
     async def _fetch_rend_solo(gan: dict) -> tuple[dict, float]:
-        """Obtiene el rendimiento histórico sin generar la imagen del gráfico."""
+        """Obtiene el rendimiento histórico usando RAW Yahoo V8 API."""
         try:
             import random
             await asyncio.sleep(random.uniform(0.1, 1.5))
-            hist = await asyncio.wait_for(
-                asyncio.to_thread(
-                    lambda: yf.Ticker(gan["ticker"], session=_YF_SESSION).history(period=temporalidad)
-                ),
+            url = f"https://query2.finance.yahoo.com/v8/finance/chart/{gan['ticker']}?interval=1d&range={temporalidad}"
+            resp = await asyncio.wait_for(
+                asyncio.to_thread(lambda: _YF_SESSION.get(url)),
                 timeout=10.0
             )
-            hist = hist.dropna(subset=["Close"])
-            if hist.empty or len(hist) < 2:
+            if resp.status_code != 200:
+                logger.warning(f"[REND PREFETCH] {gan['ticker']}: HTTP {resp.status_code}")
+                return gan, 0.0
+            
+            data = resp.json()
+            res = data.get("chart", {}).get("result", [])
+            if not res:
+                return gan, 0.0
+                
+            quotes = res[0].get("indicators", {}).get("quote", [{}])
+            if not quotes:
+                return gan, 0.0
+                
+            closes = [c for c in quotes[0].get("close", []) if c is not None]
+            if len(closes) < 2:
                 logger.warning(f"[REND PREFETCH] {gan['ticker']}: hist vacío en {temporalidad}")
                 return gan, 0.0
-            p0, p1 = float(hist["Close"].iloc[0]), float(hist["Close"].iloc[-1])
+                
+            p0, p1 = float(closes[0]), float(closes[-1])
             rend = 0.0 if p0 == 0 else ((p1 - p0) / p0) * 100
-            logger.info(f"[REND PREFETCH] {gan['ticker']}: {rend:+.2f}% ({temporalidad}) | umbral={rendimiento_objetivo}% op={rendimiento_op.__name__ if hasattr(rendimiento_op,'__name__') else rendimiento_op}")
+            str_op = getattr(rendimiento_op, '__name__', str(rendimiento_op))
+            logger.info(f"[REND PREFETCH V8] {gan['ticker']}: {rend:+.2f}% ({temporalidad}) | umbral={rendimiento_objetivo}% op={str_op}")
             return gan, rend
         except asyncio.TimeoutError:
-            logger.warning(f"[REND PREFETCH] {gan['ticker']}: TIMEOUT en history()")
+            logger.warning(f"[REND PREFETCH] {gan['ticker']}: TIMEOUT en API V8")
             return gan, 0.0
         except Exception as e:
             logger.warning(f"[REND PREFETCH] {gan['ticker']}: ERROR {type(e).__name__}: {e}")
@@ -1366,7 +1343,7 @@ async def _pipeline_por_tabla(
         datos_bulk = await _obtener_info_bulk(tickers, "ACCION")
         if datos_bulk.get("_RATE_LIMIT_HIT"):
             # TODO: IP de Render en lista negra de Yahoo. El WAF bloquea JA3 en el Lote 1. Migrar motor de extracción fundamental a API oficial REST (ej. Financial Modeling Prep o AlphaVantage)
-            return "⚠️ <b>Degradación de Servicio Temporal</b>\nYahoo Finance ha bloqueado temporalmente la IP por motivos de Rate Limit masivo. Por favor, espere.", None, None, None
+            return "⚠️ <b>Degradación de Servicio Temporal</b>\nLa cuota de la API (FMP) o del motor de inferencia se ha agotado o bloqueado masivamente. Por favor, espere.", None, None, None
         resultados = [_chequear_fundamentales_accion(t, datos_bulk.get(t, {}), filtros_a) for t in tickers]
         try:
             ganadores = [r for r in resultados if r is not None]
@@ -1381,7 +1358,7 @@ async def _pipeline_por_tabla(
         datos_bulk = await _obtener_info_bulk(tickers, "REIT")
         if datos_bulk.get("_RATE_LIMIT_HIT"):
             # TODO: IP de Render en lista negra de Yahoo. El WAF bloquea JA3 en el Lote 1. Migrar motor de extracción fundamental a API oficial REST (ej. Financial Modeling Prep o AlphaVantage)
-            return "⚠️ <b>Degradación de Servicio Temporal</b>\nYahoo Finance ha bloqueado temporalmente la IP por motivos de Rate Limit masivo. Por favor, espere.", None, None, None
+            return "⚠️ <b>Degradación de Servicio Temporal</b>\nLa cuota de la API (FMP) o del motor de inferencia se ha agotado o bloqueado masivamente. Por favor, espere.", None, None, None
         resultados = [_chequear_fundamentales_reit(t, datos_bulk.get(t, {}), fe) for t in tickers]
         try:
             ganadores = [r for r in resultados if r is not None]
@@ -1396,7 +1373,7 @@ async def _pipeline_por_tabla(
         datos_bulk = await _obtener_info_bulk(tickers, "ETF")
         if datos_bulk.get("_RATE_LIMIT_HIT"):
             # TODO: IP de Render en lista negra de Yahoo. El WAF bloquea JA3 en el Lote 1. Migrar motor de extracción fundamental a API oficial REST (ej. Financial Modeling Prep o AlphaVantage)
-            return "⚠️ <b>Degradación de Servicio Temporal</b>\nYahoo Finance ha bloqueado temporalmente la IP por motivos de Rate Limit masivo. Por favor, espere.", None, None, None
+            return "⚠️ <b>Degradación de Servicio Temporal</b>\nLa cuota de la API (FMP) o del motor de inferencia se ha agotado o bloqueado masivamente. Por favor, espere.", None, None, None
         resultados = [_chequear_fundamentales_etf(t, datos_bulk.get(t, {}), fe) for t in tickers]
         try:
             ganadores = [r for r in resultados if r is not None]
@@ -1409,7 +1386,7 @@ async def _pipeline_por_tabla(
         datos_bulk = await _obtener_info_bulk(tickers, "CRIPTO")
         if datos_bulk.get("_RATE_LIMIT_HIT"):
             # TODO: IP de Render en lista negra de Yahoo. El WAF bloquea JA3 en el Lote 1. Migrar motor de extracción fundamental a API oficial REST (ej. Financial Modeling Prep o AlphaVantage)
-            return "⚠️ <b>Degradación de Servicio Temporal</b>\nYahoo Finance ha bloqueado temporalmente la IP por motivos de Rate Limit masivo. Por favor, espere.", None, None, None
+            return "⚠️ <b>Degradación de Servicio Temporal</b>\nLa cuota de la API (FMP) o del motor de inferencia se ha agotado o bloqueado masivamente. Por favor, espere.", None, None, None
         resultados = [_chequear_fundamentales_cripto(t, datos_bulk.get(t, {}), fe) for t in tickers]
         try:
             ganadores = [r for r in resultados if r is not None]
@@ -1422,7 +1399,7 @@ async def _pipeline_por_tabla(
         datos_bulk = await _obtener_info_bulk(tickers, "BONO")
         if datos_bulk.get("_RATE_LIMIT_HIT"):
             # TODO: IP de Render en lista negra de Yahoo. El WAF bloquea JA3 en el Lote 1. Migrar motor de extracción fundamental a API oficial REST (ej. Financial Modeling Prep o AlphaVantage)
-            return "⚠️ <b>Degradación de Servicio Temporal</b>\nYahoo Finance ha bloqueado temporalmente la IP por motivos de Rate Limit masivo. Por favor, espere.", None, None, None
+            return "⚠️ <b>Degradación de Servicio Temporal</b>\nLa cuota de la API (FMP) o del motor de inferencia se ha agotado o bloqueado masivamente. Por favor, espere.", None, None, None
         resultados = [_chequear_fundamentales_bono(t, datos_bulk.get(t, {}), fe) for t in tickers]
         try:
             ganadores = [r for r in resultados if r is not None]
@@ -2621,26 +2598,6 @@ from curl_cffi import requests as requests_cffi
 # Uvicorn es el dueño del bucle de eventos. El bot de Telegram arranca y para
 # dentro del lifespan para compartir ese mismo bucle sin conflictos.
 
-class YFStealthSessionAdapter:
-    """Wrapper para hacer compatible curl_cffi con el parser de cookies de yfinance"""
-    def __init__(self, proxy_url=None):
-        self.cffi_session = requests_cffi.Session(impersonate="chrome120")
-        if proxy_url:
-            worker = proxy_url.rstrip("/")
-            self.cffi_session.proxies = {"http": worker, "https": worker}
-        self.headers = self.cffi_session.headers
-        self.cookies = requests.cookies.RequestsCookieJar()
-
-    def get(self, url, **kwargs):
-        kwargs.pop('proxies', None) 
-        kwargs.setdefault('timeout', 15.0)
-        response = self.cffi_session.get(url, **kwargs)
-        jar = requests.cookies.RequestsCookieJar()
-        for name, value in self.cffi_session.cookies.items():
-            jar.set(name, value)
-            self.cookies.set(name, value)
-        response.cookies = jar
-        return response
 
 
 @asynccontextmanager
@@ -2649,7 +2606,11 @@ async def lifespan(app: FastAPI):
 
     # P1: Emulador JA3/TLS Stealth Session (curl_cffi)
     proxy_url = CF_WORKER_PROXY.split(",")[0].strip() if CF_WORKER_PROXY else None
-    _YF_SESSION = YFStealthSessionAdapter(proxy_url=proxy_url)
+    _YF_SESSION = requests_cffi.Session(impersonate="chrome120")
+    if proxy_url:
+        w = proxy_url.rstrip("/")
+        _YF_SESSION.proxies = {"http": w, "https": w}
+    _YF_SESSION.timeout = 10.0
 
 
     # P4: Render free tier (512 MB / 0.5 vCPU) — semáforos conservadores

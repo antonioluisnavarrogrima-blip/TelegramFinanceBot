@@ -10,7 +10,6 @@ httpx==0.28.1
 pydantic==2.10.6
 
 # --- Datos y Finanzas ---
-yfinance==0.2.52
 asyncpg==0.29.0
 curl-cffi==0.7.3
 stripe==11.5.0

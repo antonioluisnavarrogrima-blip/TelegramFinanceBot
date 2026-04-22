@@ -1146,6 +1146,7 @@ async def _pipeline_hibrido_interno(
                         p_final = float(hist[0].get('close', 0))
                         if p_inicial > 0:
                             gan['rendimiento_hist'] = round(((p_final - p_inicial)/p_inicial)*100, 2)
+            return gan, gan.get('rendimiento_hist', 0.0)
         except Exception as e:
             logger.warning(f"[REND PREFETCH] {gan['ticker']}: ERROR {type(e).__name__}: {e}")
             return gan, 0.0

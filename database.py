@@ -766,9 +766,9 @@ async def obtener_yf_cache_bulk(tickers: list[str], require_fundamentals: bool =
 
     Args:
         require_fundamentals: Si True, se excluyen del resultado los registros
-            provenientes de YahooV8_Degradado (precio sin PER/Dividendo).
-            Esto fuerza una descarga fresca para clases como ACCION/REIT que
-            necesitan esos datos para el filtrado fundamental.
+            sin fundamentales (precio sin PER/Dividendo), forzando descarga fresca.
+            Actualmente YahooV11 siempre devuelve datos completos, pero el parámetro
+            se mantiene por compatibilidad con datos legados en caché.
     """
     if not tickers: return {}
     pool = _get_pool()
@@ -792,10 +792,9 @@ async def obtener_yf_cache_bulk(tickers: list[str], require_fundamentals: bool =
             if age > ttl:
                 continue  # Entrada expirada, ignorar
             data = json.loads(row["data"]) if isinstance(row["data"], str) else dict(row["data"])
-            # FIX-2: si la clase requiere fundamentales y el dato solo tiene precio (Yahoo degradado),
-            # lo tratamos como cache miss para forzar una descarga con mejores fuentes.
-            if require_fundamentals and data.get("_fuente") == "YahooV8_Degradado":
-                logger.debug(f"[YF-CACHE] SKIP degradado (require_fundamentals=True): {ticker}")
+            # Excluir datos legados sin fundamentales (datos pre-YahooV11 o degradados).
+            if require_fundamentals and data.get("_fuente") in ("YahooV8_Degradado", "FMP", "AlphaVantage") and not data.get("trailingPE") and not data.get("dividendYield"):
+                logger.debug(f"[YF-CACHE] SKIP sin fundamentales (require_fundamentals=True): {ticker}")
                 continue
             resultados[ticker] = data
         return resultados
@@ -806,29 +805,16 @@ async def obtener_yf_cache_bulk(tickers: list[str], require_fundamentals: bool =
 
 async def guardar_yf_cache_bulk(datos: dict[str, dict], clase: str):
     """
-    Guarda datos de tickers en el caché.
-
-    FIX-3: Los registros provenientes de YahooV8_Degradado (sin fundamentales) se
-    guardan con un updated_at desplazado hacia atrás para que el TTL efectivo sea
-    de solo 15 minutos. Así, la próxima llamada intentará obtener datos reales
-    (FMP/AlphaVantage) sin esperar las 24h del TTL normal.
+    Guarda datos de tickers en el caché con TTL estándar.
+    YahooV11 siempre devuelve fundamentales completos, por lo que no se
+    necesita diferenciación de TTL por calidad de datos.
     """
     if not datos: return
     pool = _get_pool()
     ahora = time.time()
-    
-    _TTL_DEGRADADO = 900  # 15 minutos efectivos para datos sin fundamentales
-    
-    records = []
-    for t, d in datos.items():
-        if d.get("_fuente") == "YahooV8_Degradado":
-            # Desplazamos updated_at al pasado para que expire en 15 min
-            ttl_clase = _YF_CACHE_TTL.get(clase.upper(), _TTL_DEFAULT)
-            ts = ahora - (ttl_clase - _TTL_DEGRADADO)
-        else:
-            ts = ahora
-        records.append((t.upper(), clase.upper(), json.dumps(d), ts))
-    
+
+    records = [(t.upper(), clase.upper(), json.dumps(d), ahora) for t, d in datos.items()]
+
     try:
         async with pool.acquire() as conn:
             await conn.executemany(

@@ -827,140 +827,132 @@ def _chequear_fundamentales_bono(ticker: str, info: dict, filtros_extra: list) -
     except Exception as e: logger.debug(f"[YF] Error {ticker} (Bono): {e}")
 
 
-class ExtractorBase:
-    def __init__(self, key: str):
-        self.key = key.strip()
-    async def fetch_batch(self, tickers: list[str]) -> dict:
-        raise NotImplementedError
+class ExtractorYahooFundamentals:
+    """
+    Extractor único basado en Yahoo Finance V11 quoteSummary.
+    Devuelve los MISMOS datos que muestra la web de Yahoo Finance:
+    PER (trailingPE), dividendYield, dividendRate, beta, marketCap, ROE, etc.
+    Usa la sesión curl_cffi (_YF_SESSION) con TLS Chrome-spoofing para evitar bloqueos.
+    """
 
-class ExtractorFMP(ExtractorBase):
-    def __init__(self, key: str):
-        super().__init__(key)
-        # FIX-1: clave marcada como muerta tras un 403 — no se vuelve a intentar en el mismo ciclo
-        self._dead = False
+    # Módulos de quoteSummary que necesitamos (los mismos que usa yfinance internamente)
+    _MODULES = "summaryDetail,defaultKeyStatistics,financialData,price,assetProfile"
 
     async def fetch_batch(self, tickers: list[str]) -> dict:
-        # Si la clave ya falló con 403 en este ciclo, saltamos sin hacer ninguna petición HTTP
-        if self._dead:
-            logger.debug(f"[ExtractorFMP] Clave muerta ({self.key[:8]}...), saltando.")
-            return {}
-        if not self.key or not tickers: return {}
-        simbolos = ",".join(t.upper() for t in tickers)
-        url = f"https://financialmodelingprep.com/api/v3/quote/{simbolos}?apikey={self.key}"
-        try:
-            resp = await http_client.get(url, timeout=12.0)
-            if resp.status_code == 403:
-                # 403 = clave revocada/expirada/rate-limit permanente → no reintentar nunca más
-                self._dead = True
-                logger.warning(
-                    f"[ExtractorFMP] HTTP 403 — clave marcada como MUERTA: {self.key[:8]}... "
-                    f"No se reintentará en este ciclo de ejecución."
-                )
-                return {}
-            if resp.status_code != 200:
-                logger.warning(f"[ExtractorFMP] HTTP {resp.status_code}")
-                return {}
-            data = resp.json()
-            if not isinstance(data, list): return {}
-            res = {}
-            for item in data:
-                sym = item.get("symbol", "").upper()
-                if not sym: continue
-                precio = item.get("price") or 0
-                div_anual = item.get("lastDiv") or 0
-                res[sym] = {
-                    "regularMarketPrice": precio,
-                    "previousClose": item.get("previousClose"),
-                    "marketCap": item.get("marketCap"),
-                    "shortName": item.get("name", sym),
-                    "trailingPE": item.get("pe"),
-                    "dividendYield": (div_anual / precio) if precio and div_anual else None,
-                    "_fuente": "FMP"
-                }
-            return res
-        except Exception as e:
-            logger.warning(f"[ExtractorFMP] Error: {e}")
+        """Descarga fundamentales de cada ticker de forma concurrente."""
+        if not tickers:
             return {}
 
-class ExtractorAlphaVantage(ExtractorBase):
-    async def fetch_batch(self, tickers: list[str]) -> dict:
-        # AV no soporta multiples symbols gratis en batch, se hace concurrente 1 a 1 de forma silenciosa
-        if not self.key or not tickers: return {}
-        async def fetch_one(t):
+        async def fetch_one(t: str) -> tuple[str, dict]:
             try:
-                url_q = f"https://www.alphavantage.co/query?function=GLOBAL_QUOTE&symbol={t}&apikey={self.key}"
-                url_o = f"https://www.alphavantage.co/query?function=OVERVIEW&symbol={t}&apikey={self.key}"
-                rq, ro = await asyncio.gather(
-                    http_client.get(url_q, timeout=8.0),
-                    http_client.get(url_o, timeout=8.0)
+                url = (
+                    f"https://query1.finance.yahoo.com/v11/finance/quoteSummary/{t.upper()}"
+                    f"?modules={self._MODULES}&crumb="
                 )
-                if rq.status_code != 200 or ro.status_code != 200: return t, {}
-                dq = rq.json().get("Global Quote", {})
-                do = ro.json()
-                if not dq: return t, {}
-                precio = float(dq.get("05. price", 0))
-                return t.upper(), {
-                    "regularMarketPrice": precio,
-                    "previousClose": float(dq.get("08. previous close", 0)),
-                    "marketCap": float(do.get("MarketCapitalization", 0)) if do.get("MarketCapitalization") and do.get("MarketCapitalization") != "None" else None,
-                    "trailingPE": float(do.get("PERatio", 0)) if do.get("PERatio") and do.get("PERatio") != "None" else None,
-                    "dividendYield": float(do.get("DividendYield", 0)) if do.get("DividendYield") and do.get("DividendYield") != "None" else None,
-                    "_fuente": "AlphaVantage"
-                }
-            except Exception:
-                return t, {}
-        import asyncio
-        resultados = await asyncio.gather(*(fetch_one(t) for t in tickers))
-        return {t: info for t, info in resultados if info}
+                resp = await asyncio.wait_for(
+                    asyncio.to_thread(lambda: _YF_SESSION.get(url)),
+                    timeout=12.0
+                )
+                if resp.status_code != 200:
+                    logger.debug(f"[YahooV11] HTTP {resp.status_code} para {t}")
+                    return t, {}
 
-class ExtractorYahooDegradado(ExtractorBase):
-    async def fetch_batch(self, tickers: list[str]) -> dict:
-        # Fallback supremo: raspar precios usando la API V8 (Chart) con TLS Spoofing sin Crumbs. Ignora PER y Div.
-        if not tickers: return {}
-        async def fetch_one(t):
-            try:
-                url = f"https://query2.finance.yahoo.com/v8/finance/chart/{t}?interval=1d&range=1d"
-                import asyncio
-                resp = await asyncio.wait_for(asyncio.to_thread(lambda: _YF_SESSION.get(url)), timeout=10.0)
-                if resp.status_code != 200: return t, {}
-                data = resp.json().get("chart", {}).get("result", [])
-                if not data: return t, {}
-                meta = data[0].get("meta", {})
+                body = resp.json()
+                result = body.get("quoteSummary", {}).get("result") or []
+                if not result:
+                    logger.debug(f"[YahooV11] Sin resultado para {t}")
+                    return t, {}
+
+                data = result[0]
+                sd  = data.get("summaryDetail", {})
+                ks  = data.get("defaultKeyStatistics", {})
+                fd  = data.get("financialData", {})
+                pr  = data.get("price", {})
+                ap  = data.get("assetProfile", {})
+
+                def _raw(d, key):
+                    """Extrae el valor numérico crudo de un campo YF (puede ser {raw, fmt} o escalar)."""
+                    v = d.get(key)
+                    if isinstance(v, dict):
+                        return v.get("raw")
+                    return v
+
+                precio          = _raw(pr, "regularMarketPrice") or _raw(sd, "regularMarketPrice")
+                prev_close      = _raw(pr, "regularMarketPreviousClose")
+                market_cap      = _raw(pr, "marketCap")
+                trailing_pe     = _raw(sd, "trailingPE")
+                forward_pe      = _raw(sd, "forwardPE")
+                div_yield       = _raw(sd, "dividendYield")   # ya en decimal (ej. 0.032)
+                div_rate        = _raw(sd, "dividendRate")    # absoluto en USD/año
+                beta            = _raw(sd, "beta")
+                price_to_book   = _raw(ks, "priceToBook")
+                roe             = _raw(fd, "returnOnEquity")  # decimal
+                roa             = _raw(fd, "returnOnAssets")
+                profit_margins  = _raw(fd, "profitMargins")
+                op_margins      = _raw(fd, "operatingMargins")
+                rev_growth      = _raw(fd, "revenueGrowth")
+                earn_growth     = _raw(fd, "earningsGrowth")
+                debt_equity     = _raw(fd, "debtToEquity")
+                total_assets    = _raw(ks, "totalAssets")     # para ETFs/Bonos
+                price_to_sales  = _raw(ks, "priceToSalesTrailing12Months")
+                ebitda          = _raw(fd, "ebitda")
+                sector          = ap.get("sector") or pr.get("sector")
+                short_name      = _raw(pr, "shortName") or t.upper()
+                yf_yield        = _raw(sd, "yield")           # campo 'yield' para ETFs
+
+                if not precio:
+                    return t, {}
+
                 return t.upper(), {
-                    "regularMarketPrice": meta.get("regularMarketPrice"),
-                    "previousClose": meta.get("chartPreviousClose"),
-                    "_fuente": "YahooV8_Degradado"
+                    "regularMarketPrice":          precio,
+                    "previousClose":               prev_close,
+                    "marketCap":                   market_cap,
+                    "shortName":                   short_name,
+                    "sector":                      sector,
+                    "trailingPE":                  trailing_pe,
+                    "forwardPE":                   forward_pe,
+                    "dividendYield":               div_yield,
+                    "dividendRate":                div_rate,
+                    "yield":                       yf_yield,
+                    "beta":                        beta,
+                    "priceToBook":                 price_to_book,
+                    "returnOnEquity":              roe,
+                    "returnOnAssets":              roa,
+                    "profitMargins":               profit_margins,
+                    "operatingMargins":            op_margins,
+                    "revenueGrowth":               rev_growth,
+                    "earningsGrowth":              earn_growth,
+                    "debtToEquity":                debt_equity,
+                    "totalAssets":                 total_assets,
+                    "priceToSalesTrailing12Months": price_to_sales,
+                    "ebitda":                      ebitda,
+                    "_fuente":                     "YahooV11",
                 }
-            except Exception:
+            except asyncio.TimeoutError:
+                logger.warning(f"[YahooV11] Timeout para {t}")
                 return t, {}
-        import asyncio
+            except Exception as e:
+                logger.debug(f"[YahooV11] Error {t}: {e}")
+                return t, {}
+
         resultados = await asyncio.gather(*(fetch_one(t) for t in tickers))
-        return {t: info for t, info in resultados if info}
+        return {ticker: info for ticker, info in resultados if info}
 
 
 # Clases de activo que REQUIEREN fundamentales (PER, dividendo...) para el filtrado
 _CLASES_CON_FUNDAMENTALES = {"ACCION", "REIT", "ETF", "BONO"}
 
 async def _obtener_info_bulk(tickers: list[str], clase: str) -> dict:
-    # FIX-2: para clases que necesitan fundamentales, excluimos del caché los registros
-    # de YahooV8_Degradado (que solo tienen precio) para forzar una descarga fresca.
+    # Yahoo V11 siempre devuelve fundamentales reales; excluimos del caché solo los
+    # registros de fuentes anteriores que carezcan de datos fundamentales.
     require_fundamentals = clase.upper() in _CLASES_CON_FUNDAMENTALES
     cached = await db.obtener_yf_cache_bulk(tickers, require_fundamentals=require_fundamentals)
     faltantes = [t for t in tickers if t.upper() not in cached]
     logger.info(f"[ROUTER] {clase} | Total:{len(tickers)} En-cache:{len(cached)} A-descargar:{len(faltantes)}")
 
     if faltantes:
-        # Instanciar el Strategy Router dinamicamente de las variables de entorno
-        extractores = []
-        if FMP_API_KEYS:
-            for k in FMP_API_KEYS.split(","):
-                if k.strip(): extractores.append(ExtractorFMP(k))
-        if ALPHAVANTAGE_API_KEYS:
-            for k in ALPHAVANTAGE_API_KEYS.split(","):
-                if k.strip(): extractores.append(ExtractorAlphaVantage(k))
-        
-        # Supervivencia suprema al final del abismo
-        extractores.append(ExtractorYahooDegradado("none"))
+        # Fuente única: Yahoo Finance V11 — mismos datos que la web de Yahoo Finance
+        extractores = [ExtractorYahooFundamentals()]
 
         chunk_size = 3
         nuevos_datos = {}
@@ -972,27 +964,23 @@ async def _obtener_info_bulk(tickers: list[str], clase: str) -> dict:
             res = {}
             extractor_usado = None
             
-            # Intento en cascada
+            # Intento único con Yahoo V11 (con 1 reintento si devuelve vacío)
             for ext in extractores:
                 tipo = type(ext).__name__
                 logger.info(f"[ROUTER] -> Intentando fuente: {tipo}...")
-                
-                # FIX-1: FMP ya no necesita los 2 reintentos si la clave está muerta (_dead=True),
-                # ya que fetch_batch retorna {} instantáneamente. El loop es inofensivo pero
-                # lo reducimos a 1 intento para no desperdiciar el sleep de 1.5s.
-                max_intentos_ext = 1 if (hasattr(ext, '_dead') and ext._dead) else (2 if "FMP" in tipo else 1)
+
+                max_intentos_ext = 2
                 for _ in range(max_intentos_ext):
                     res = await ext.fetch_batch(lote)
                     if res: break
-                    import asyncio
                     await asyncio.sleep(1.5)
-                    
+
                 if res:
-                    logger.info(f"[ROUTER] -> ¡Éxito con {tipo}!")
+                    logger.info(f"[ROUTER] -> Éxito con {tipo}!")
                     extractor_usado = ext
                     break
                 else:
-                    logger.warning(f"[ROUTER] -> {tipo} falló o retornó vacío. Pasando al siguiente extractor...")
+                    logger.warning(f"[ROUTER] -> {tipo} falló o retornó vacío.")
             
             if not res:
                 logger.critical(f"[FAIL-FAST] Todas las fuentes de respaldo (incluyendo degradadas) fallaron en Lote {i//chunk_size+1}. Red cortocircuitada.")
@@ -1002,20 +990,12 @@ async def _obtener_info_bulk(tickers: list[str], clase: str) -> dict:
                 if not info: continue
                 if not info.get("regularMarketPrice"): continue
                 nuevos_datos[t] = info
-                # FIX-2: Para clases con fundamentales, los datos degradados NO se meten en el
-                # caché en memoria del request actual, evitando que pasen el checker sin PER/DIV.
-                # Solo se usan si no hay otra alternativa (candidatos válidos por precio).
-                if require_fundamentals and info.get("_fuente") == "YahooV8_Degradado":
-                    logger.debug(f"[ROUTER] {t}: dato degradado excluido del cache en memoria para {clase}.")
-                else:
-                    cached[t] = info
-                
-            import asyncio
-            await asyncio.sleep(0.5)
+                cached[t] = info  # YahooV11 siempre tiene fundamentales completos
+
+            await asyncio.sleep(0.3)
         
         logger.info(f"[ROUTER] Resultado final: {len(nuevos_datos)}/{len(faltantes)} tickers.")
-        # FIX-3: Guardamos en BD todos los datos nuevos; la BD aplica TTL corto (15 min)
-        # a los registros degradados para que expiren pronto y se reintente con mejores fuentes.
+        # Guardamos en BD con TTL estándar (1h) ya que los datos son de calidad completa.
         if nuevos_datos:
             await db.guardar_yf_cache_bulk(nuevos_datos, clase)
 

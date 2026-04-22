@@ -838,7 +838,9 @@ class ExtractorYahooFundamentals:
     # Caché de crumb a nivel de clase (compartido entre instancias y requests)
     _crumb: str | None = None
     _crumb_ts: float = 0.0
-    _CRUMB_TTL = 3600  # 1 hora
+    _crumb_last_attempt: float = 0.0  # ts del último intento (exitoso o no)
+    _CRUMB_TTL = 3600          # crumb válido durante 1 hora
+    _CRUMB_RETRY_COOLDOWN = 60.0  # esperar 60s tras un fallo antes de reintentar
     _crumb_lock: asyncio.Lock | None = None  # inicializado lazily dentro del event loop
 
     # Módulos de quoteSummary que necesitamos (los mismos que usa yfinance internamente)
@@ -850,15 +852,29 @@ class ExtractorYahooFundamentals:
         Yahoo V11 requiere este token para responder con datos.
         Se obtiene visitando primero finance.yahoo.com (para cookies) y luego
         llamando al endpoint /v1/test/getcrumb.
+        Incluye cooldown de 60s tras un 429 para no saturar el endpoint.
         """
         if cls._crumb_lock is None:
             cls._crumb_lock = asyncio.Lock()
 
         async with cls._crumb_lock:
             ahora = time.time()
+
+            # 1. Crumb válido en caché → devolver directamente
             if cls._crumb and (ahora - cls._crumb_ts) < cls._CRUMB_TTL:
                 return cls._crumb
 
+            # 2. Intento reciente fallido → respetar cooldown (evita bucle de 429)
+            tiempo_desde_ultimo = ahora - cls._crumb_last_attempt
+            if cls._crumb_last_attempt > 0 and tiempo_desde_ultimo < cls._CRUMB_RETRY_COOLDOWN:
+                espera_restante = int(cls._CRUMB_RETRY_COOLDOWN - tiempo_desde_ultimo)
+                logger.warning(
+                    f"[YahooV11] Crumb en cooldown — próximo intento en {espera_restante}s. "
+                    f"Usando dataset estático hasta entonces."
+                )
+                return None
+
+            cls._crumb_last_attempt = ahora
             logger.info("[YahooV11] Obteniendo crumb token de Yahoo Finance...")
             try:
                 # Paso 1: visitar Yahoo Finance para capturar cookies de sesión
@@ -868,6 +884,8 @@ class ExtractorYahooFundamentals:
                     )),
                     timeout=15.0
                 )
+                # Pausa breve para que las cookies se asienten y evitar 429 inmediato
+                await asyncio.sleep(1.5)
                 # Paso 2: obtener el crumb con las cookies ya establecidas
                 resp = await asyncio.wait_for(
                     asyncio.to_thread(lambda: _YF_SESSION.get(
@@ -878,10 +896,18 @@ class ExtractorYahooFundamentals:
                 if resp.status_code == 200 and resp.text and resp.text.strip():
                     cls._crumb = resp.text.strip()
                     cls._crumb_ts = time.time()
-                    logger.info(f"[YahooV11] Crumb obtenido: {cls._crumb[:10]}...")
+                    logger.info(f"[YahooV11] Crumb obtenido correctamente: {cls._crumb[:10]}...")
                     return cls._crumb
+                elif resp.status_code == 429:
+                    # Cooldown ya activado por _crumb_last_attempt — simplemente loguear
+                    logger.warning(
+                        f"[YahooV11] Crumb endpoint 429 (rate limited). "
+                        f"Cooldown de {int(cls._CRUMB_RETRY_COOLDOWN)}s activado."
+                    )
                 else:
-                    logger.warning(f"[YahooV11] Crumb endpoint HTTP {resp.status_code}: '{resp.text[:80]}'")
+                    logger.warning(
+                        f"[YahooV11] Crumb endpoint HTTP {resp.status_code}: '{resp.text[:80]}'"
+                    )
             except Exception as e:
                 logger.warning(f"[YahooV11] Error obteniendo crumb: {e}")
 
@@ -2746,6 +2772,21 @@ async def lifespan(app: FastAPI):
     await db.inicializar_pool()
     await db.inicializar_db()
     await db.precargar_semillas_basicas()    # Asegura operatividad inmediata v4.3
+
+    # Pre-calentar el crumb de Yahoo Finance antes de que llegue tráfico de usuarios.
+    # Esto evita el 429 causado por múltiples requests concurrentes al crumb endpoint.
+    logger.info("[LIFESPAN] Pre-calentando crumb de Yahoo Finance...")
+    try:
+        crumb_startup = await ExtractorYahooFundamentals._obtener_crumb()
+        if crumb_startup:
+            logger.info("[LIFESPAN] Crumb de Yahoo listo para uso.")
+        else:
+            logger.warning(
+                "[LIFESPAN] No se pudo obtener el crumb de Yahoo en el arranque. "
+                "El bot usará el dataset estático hasta que el crumb esté disponible."
+            )
+    except Exception as _e:
+        logger.warning(f"[LIFESPAN] Error pre-calentando crumb: {_e}")
 
     logger.info("[LIFESPAN] Inicializando bot de Telegram...")
     await telegram_app.initialize()

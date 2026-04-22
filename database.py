@@ -760,7 +760,16 @@ async def marcar_evento_procesado(event_id: str):
 
 
 
-async def obtener_yf_cache_bulk(tickers: list[str]) -> dict:
+async def obtener_yf_cache_bulk(tickers: list[str], require_fundamentals: bool = False) -> dict:
+    """
+    Retorna datos cacheados válidos para los tickers solicitados.
+
+    Args:
+        require_fundamentals: Si True, se excluyen del resultado los registros
+            provenientes de YahooV8_Degradado (precio sin PER/Dividendo).
+            Esto fuerza una descarga fresca para clases como ACCION/REIT que
+            necesitan esos datos para el filtrado fundamental.
+    """
     if not tickers: return {}
     pool = _get_pool()
     ahora = time.time()
@@ -780,8 +789,15 @@ async def obtener_yf_cache_bulk(tickers: list[str]) -> dict:
             clase = row["clase"] or "ACCION"
             ttl = _YF_CACHE_TTL.get(clase, _TTL_DEFAULT)
             age = ahora - row["updated_at"]
-            if age <= ttl:
-                resultados[ticker] = json.loads(row["data"]) if isinstance(row["data"], str) else dict(row["data"])
+            if age > ttl:
+                continue  # Entrada expirada, ignorar
+            data = json.loads(row["data"]) if isinstance(row["data"], str) else dict(row["data"])
+            # FIX-2: si la clase requiere fundamentales y el dato solo tiene precio (Yahoo degradado),
+            # lo tratamos como cache miss para forzar una descarga con mejores fuentes.
+            if require_fundamentals and data.get("_fuente") == "YahooV8_Degradado":
+                logger.debug(f"[YF-CACHE] SKIP degradado (require_fundamentals=True): {ticker}")
+                continue
+            resultados[ticker] = data
         return resultados
     except Exception as e:
         import logging
@@ -789,10 +805,30 @@ async def obtener_yf_cache_bulk(tickers: list[str]) -> dict:
         return {}
 
 async def guardar_yf_cache_bulk(datos: dict[str, dict], clase: str):
+    """
+    Guarda datos de tickers en el caché.
+
+    FIX-3: Los registros provenientes de YahooV8_Degradado (sin fundamentales) se
+    guardan con un updated_at desplazado hacia atrás para que el TTL efectivo sea
+    de solo 15 minutos. Así, la próxima llamada intentará obtener datos reales
+    (FMP/AlphaVantage) sin esperar las 24h del TTL normal.
+    """
     if not datos: return
     pool = _get_pool()
     ahora = time.time()
-    records = [(t.upper(), clase.upper(), json.dumps(d), ahora) for t, d in datos.items()]
+    
+    _TTL_DEGRADADO = 900  # 15 minutos efectivos para datos sin fundamentales
+    
+    records = []
+    for t, d in datos.items():
+        if d.get("_fuente") == "YahooV8_Degradado":
+            # Desplazamos updated_at al pasado para que expire en 15 min
+            ttl_clase = _YF_CACHE_TTL.get(clase.upper(), _TTL_DEFAULT)
+            ts = ahora - (ttl_clase - _TTL_DEGRADADO)
+        else:
+            ts = ahora
+        records.append((t.upper(), clase.upper(), json.dumps(d), ts))
+    
     try:
         async with pool.acquire() as conn:
             await conn.executemany(

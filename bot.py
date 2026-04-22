@@ -834,12 +834,29 @@ class ExtractorBase:
         raise NotImplementedError
 
 class ExtractorFMP(ExtractorBase):
+    def __init__(self, key: str):
+        super().__init__(key)
+        # FIX-1: clave marcada como muerta tras un 403 — no se vuelve a intentar en el mismo ciclo
+        self._dead = False
+
     async def fetch_batch(self, tickers: list[str]) -> dict:
+        # Si la clave ya falló con 403 en este ciclo, saltamos sin hacer ninguna petición HTTP
+        if self._dead:
+            logger.debug(f"[ExtractorFMP] Clave muerta ({self.key[:8]}...), saltando.")
+            return {}
         if not self.key or not tickers: return {}
         simbolos = ",".join(t.upper() for t in tickers)
         url = f"https://financialmodelingprep.com/api/v3/quote/{simbolos}?apikey={self.key}"
         try:
             resp = await http_client.get(url, timeout=12.0)
+            if resp.status_code == 403:
+                # 403 = clave revocada/expirada/rate-limit permanente → no reintentar nunca más
+                self._dead = True
+                logger.warning(
+                    f"[ExtractorFMP] HTTP 403 — clave marcada como MUERTA: {self.key[:8]}... "
+                    f"No se reintentará en este ciclo de ejecución."
+                )
+                return {}
             if resp.status_code != 200:
                 logger.warning(f"[ExtractorFMP] HTTP {resp.status_code}")
                 return {}
@@ -921,8 +938,14 @@ class ExtractorYahooDegradado(ExtractorBase):
         return {t: info for t, info in resultados if info}
 
 
+# Clases de activo que REQUIEREN fundamentales (PER, dividendo...) para el filtrado
+_CLASES_CON_FUNDAMENTALES = {"ACCION", "REIT", "ETF", "BONO"}
+
 async def _obtener_info_bulk(tickers: list[str], clase: str) -> dict:
-    cached = await db.obtener_yf_cache_bulk(tickers)
+    # FIX-2: para clases que necesitan fundamentales, excluimos del caché los registros
+    # de YahooV8_Degradado (que solo tienen precio) para forzar una descarga fresca.
+    require_fundamentals = clase.upper() in _CLASES_CON_FUNDAMENTALES
+    cached = await db.obtener_yf_cache_bulk(tickers, require_fundamentals=require_fundamentals)
     faltantes = [t for t in tickers if t.upper() not in cached]
     logger.info(f"[ROUTER] {clase} | Total:{len(tickers)} En-cache:{len(cached)} A-descargar:{len(faltantes)}")
 
@@ -954,8 +977,11 @@ async def _obtener_info_bulk(tickers: list[str], clase: str) -> dict:
                 tipo = type(ext).__name__
                 logger.info(f"[ROUTER] -> Intentando fuente: {tipo}...")
                 
-                # FMP tiene ban por 403 HTTP si tiras array largo. Limitamos batch o usamos retry simple.
-                for _ in range(2 if "FMP" in tipo else 1): 
+                # FIX-1: FMP ya no necesita los 2 reintentos si la clave está muerta (_dead=True),
+                # ya que fetch_batch retorna {} instantáneamente. El loop es inofensivo pero
+                # lo reducimos a 1 intento para no desperdiciar el sleep de 1.5s.
+                max_intentos_ext = 1 if (hasattr(ext, '_dead') and ext._dead) else (2 if "FMP" in tipo else 1)
+                for _ in range(max_intentos_ext):
                     res = await ext.fetch_batch(lote)
                     if res: break
                     import asyncio
@@ -972,17 +998,24 @@ async def _obtener_info_bulk(tickers: list[str], clase: str) -> dict:
                 logger.critical(f"[FAIL-FAST] Todas las fuentes de respaldo (incluyendo degradadas) fallaron en Lote {i//chunk_size+1}. Red cortocircuitada.")
                 return {"_RATE_LIMIT_HIT": True}
                 
-            _METRICAS_MINIMAS = {"regularMarketPrice"} # El minimo existencial
             for t, info in res.items():
                 if not info: continue
                 if not info.get("regularMarketPrice"): continue
                 nuevos_datos[t] = info
-                cached[t] = info
+                # FIX-2: Para clases con fundamentales, los datos degradados NO se meten en el
+                # caché en memoria del request actual, evitando que pasen el checker sin PER/DIV.
+                # Solo se usan si no hay otra alternativa (candidatos válidos por precio).
+                if require_fundamentals and info.get("_fuente") == "YahooV8_Degradado":
+                    logger.debug(f"[ROUTER] {t}: dato degradado excluido del cache en memoria para {clase}.")
+                else:
+                    cached[t] = info
                 
             import asyncio
             await asyncio.sleep(0.5)
         
         logger.info(f"[ROUTER] Resultado final: {len(nuevos_datos)}/{len(faltantes)} tickers.")
+        # FIX-3: Guardamos en BD todos los datos nuevos; la BD aplica TTL corto (15 min)
+        # a los registros degradados para que expiren pronto y se reintente con mejores fuentes.
         if nuevos_datos:
             await db.guardar_yf_cache_bulk(nuevos_datos, clase)
 

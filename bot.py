@@ -835,24 +835,88 @@ class ExtractorYahooFundamentals:
     Usa la sesión curl_cffi (_YF_SESSION) con TLS Chrome-spoofing para evitar bloqueos.
     """
 
+    # Caché de crumb a nivel de clase (compartido entre instancias y requests)
+    _crumb: str | None = None
+    _crumb_ts: float = 0.0
+    _CRUMB_TTL = 3600  # 1 hora
+    _crumb_lock: asyncio.Lock | None = None  # inicializado lazily dentro del event loop
+
     # Módulos de quoteSummary que necesitamos (los mismos que usa yfinance internamente)
     _MODULES = "summaryDetail,defaultKeyStatistics,financialData,price,assetProfile"
 
+    @classmethod
+    async def _obtener_crumb(cls) -> str | None:
+        """Obtiene (y cachéa) el crumb token de Yahoo Finance.
+        Yahoo V11 requiere este token para responder con datos.
+        Se obtiene visitando primero finance.yahoo.com (para cookies) y luego
+        llamando al endpoint /v1/test/getcrumb.
+        """
+        if cls._crumb_lock is None:
+            cls._crumb_lock = asyncio.Lock()
+
+        async with cls._crumb_lock:
+            ahora = time.time()
+            if cls._crumb and (ahora - cls._crumb_ts) < cls._CRUMB_TTL:
+                return cls._crumb
+
+            logger.info("[YahooV11] Obteniendo crumb token de Yahoo Finance...")
+            try:
+                # Paso 1: visitar Yahoo Finance para capturar cookies de sesión
+                await asyncio.wait_for(
+                    asyncio.to_thread(lambda: _YF_SESSION.get(
+                        "https://finance.yahoo.com", timeout=10
+                    )),
+                    timeout=15.0
+                )
+                # Paso 2: obtener el crumb con las cookies ya establecidas
+                resp = await asyncio.wait_for(
+                    asyncio.to_thread(lambda: _YF_SESSION.get(
+                        "https://query2.finance.yahoo.com/v1/test/getcrumb", timeout=10
+                    )),
+                    timeout=15.0
+                )
+                if resp.status_code == 200 and resp.text and resp.text.strip():
+                    cls._crumb = resp.text.strip()
+                    cls._crumb_ts = time.time()
+                    logger.info(f"[YahooV11] Crumb obtenido: {cls._crumb[:10]}...")
+                    return cls._crumb
+                else:
+                    logger.warning(f"[YahooV11] Crumb endpoint HTTP {resp.status_code}: '{resp.text[:80]}'")
+            except Exception as e:
+                logger.warning(f"[YahooV11] Error obteniendo crumb: {e}")
+
+        return None
+
     async def fetch_batch(self, tickers: list[str]) -> dict:
-        """Descarga fundamentales de cada ticker de forma concurrente."""
+        """Descarga fundamentales de cada ticker de forma concurrente con crumb auth."""
         if not tickers:
             return {}
 
-        async def fetch_one(t: str) -> tuple[str, dict]:
+        crumb = await self._obtener_crumb()
+        if not crumb:
+            logger.error("[YahooV11] Sin crumb — no se puede llamar a V11. Abortando lote.")
+            return {}
+
+        modules = self._MODULES
+
+        async def fetch_one(t: str, _crumb: str = crumb, _mods: str = modules) -> tuple[str, dict]:
+            """_crumb y _mods como default args para evitar cierre sobre variables externas."""
             try:
                 url = (
                     f"https://query1.finance.yahoo.com/v11/finance/quoteSummary/{t.upper()}"
-                    f"?modules={self._MODULES}&crumb="
+                    f"?modules={_mods}&crumb={_crumb}"
                 )
                 resp = await asyncio.wait_for(
-                    asyncio.to_thread(lambda: _YF_SESSION.get(url)),
-                    timeout=12.0
+                    asyncio.to_thread(lambda u=url: _YF_SESSION.get(u, timeout=12)),
+                    timeout=15.0
                 )
+
+                # Crumb expirado: invalidar caché para próxima llamada
+                if resp.status_code == 401:
+                    logger.warning(f"[YahooV11] 401 para {t} — crumb expirado, se refrescará.")
+                    ExtractorYahooFundamentals._crumb = None
+                    return t, {}
+
                 if resp.status_code != 200:
                     logger.debug(f"[YahooV11] HTTP {resp.status_code} para {t}")
                     return t, {}
@@ -860,7 +924,8 @@ class ExtractorYahooFundamentals:
                 body = resp.json()
                 result = body.get("quoteSummary", {}).get("result") or []
                 if not result:
-                    logger.debug(f"[YahooV11] Sin resultado para {t}")
+                    err = body.get("quoteSummary", {}).get("error") or {}
+                    logger.debug(f"[YahooV11] Sin resultado para {t}: {err}")
                     return t, {}
 
                 data = result[0]

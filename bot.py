@@ -522,7 +522,7 @@ async def fabricante_de_graficos(ticker: str, periodo: str = "3mo") -> tuple[byt
     labels = []
     prices = []
     try:
-        keys = [k.strip() for k in FMP_API_KEYS.split(',')] if FMP_API_KEYS else []
+        keys = [k.strip() for k in FMP_API_KEYS.split(',') if k.strip()] if FMP_API_KEYS else []
         if not keys:
             logger.warning("[CHART] Sin FMP_API_KEY, omitiendo grafico.")
             return None, 0.0
@@ -534,18 +534,21 @@ async def fabricante_de_graficos(ticker: str, periodo: str = "3mo") -> tuple[byt
                 data = resp.json()
                 hist = data.get("historical", [])
                 break
+            else:
+                logger.warning(f"[CHART] FMP Key fallida: {resp.status_code} - {resp.text[:100]}")
         else:
-            logger.warning(f"[CHART] Error FMP GRAPH para {ticker}: Fallaron todas las keys.")
+            logger.warning(f"[CHART] Error FMP GRAPH para {ticker}: Fallaron todas las keys ({len(keys)} intentadas).")
             return None, 0.0
-            limit = 63
-            if '1mo' in periodo: limit = 21
-            elif '6mo' in periodo: limit = 126
-            elif '1y' in periodo: limit = 252
-            hist = hist[:limit]
-            hist.reverse()
-            for item in hist:
-                labels.append(item.get('date', ''))
-                prices.append(round(float(item.get('close', 0)), 2))
+        
+        limit = 63
+        if '1mo' in periodo: limit = 21
+        elif '6mo' in periodo: limit = 126
+        elif '1y' in periodo: limit = 252
+        hist = hist[:limit]
+        hist.reverse()
+        for item in hist:
+            labels.append(item.get('date', ''))
+            prices.append(round(float(item.get('close', 0)), 2))
     except Exception as e:
         pass
     if len(prices) < 2:
@@ -1141,7 +1144,7 @@ async def _pipeline_hibrido_interno(
         try:
             import random
             await asyncio.sleep(random.uniform(0.1, 1.5))
-            keys = [k.strip() for k in FMP_API_KEYS.split(',')] if FMP_API_KEYS else []
+            keys = [k.strip() for k in FMP_API_KEYS.split(',') if k.strip()] if FMP_API_KEYS else []
             if keys:
                 for fmp_key in keys:
                     url = f"https://financialmodelingprep.com/api/v3/historical-price-full/{gan['ticker']}?apikey={fmp_key}"
@@ -1149,6 +1152,8 @@ async def _pipeline_hibrido_interno(
                     if resp.status_code == 200:
                         hist = resp.json().get('historical', [])
                         break
+                    else:
+                        logger.warning(f"[REND] FMP Key fallida para {gan['ticker']}: HTTP {resp.status_code} - {resp.text[:100]}")
                 else:
                     return gan, 0.0
                 

@@ -157,8 +157,10 @@ METRICAS_PORCENTUALES = {
     "crecimiento_beneficios", "roe", "roa", "margen_beneficio", "margen_operativo"
 }
 
+# Fuentes de datos
 FUENTES_DATOS = {
-    "yahoo":       {"nombre": "Yahoo Finance",  "url": "https://finance.yahoo.com/quote/{ticker}"},
+    "yahoo":       {"nombre": "Financial Modeling Prep",  "url": "https://site.financialmodelingprep.com/financial-summary/{ticker}"},
+    "alphavantage": {"nombre": "Alpha Vantage", "url": "https://www.alphavantage.co/query?function=OVERVIEW&symbol={ticker}"},
     "tradingview": {"nombre": "TradingView",    "url": "https://www.tradingview.com/symbols/{ticker}"},
     "investing":   {"nombre": "Investing.com",  "url": "https://www.investing.com/search/?q={ticker}"},
     "google":      {"nombre": "Google Finance", "url": "https://www.google.com/finance/quote/{ticker}"},
@@ -520,12 +522,21 @@ async def fabricante_de_graficos(ticker: str, periodo: str = "3mo") -> tuple[byt
     labels = []
     prices = []
     try:
-        fmp_key = FMP_API_KEYS.split(',')[0].strip() if FMP_API_KEYS else ''
-        if not fmp_key: return None, 0.0
-        url = f"https://financialmodelingprep.com/api/v3/historical-price-full/{ticker}?apikey={fmp_key}"
-        resp = await http_client.get(url, timeout=10.0)
-        if resp.status_code == 200:
-            hist = resp.json().get('historical', [])
+        keys = [k.strip() for k in FMP_API_KEYS.split(',')] if FMP_API_KEYS else []
+        if not keys:
+            logger.warning("[CHART] Sin FMP_API_KEY, omitiendo grafico.")
+            return None, 0.0
+
+        for fmp_key in keys:
+            url = f"https://financialmodelingprep.com/api/v3/historical-price-full/{ticker}?apikey={fmp_key}"
+            resp = await http_client.get(url, timeout=10.0)
+            if resp.status_code == 200:
+                data = resp.json()
+                hist = data.get("historical", [])
+                break
+        else:
+            logger.warning(f"[CHART] Error FMP GRAPH para {ticker}: Fallaron todas las keys.")
+            return None, 0.0
             limit = 63
             if '1mo' in periodo: limit = 21
             elif '6mo' in periodo: limit = 126
@@ -1130,22 +1141,27 @@ async def _pipeline_hibrido_interno(
         try:
             import random
             await asyncio.sleep(random.uniform(0.1, 1.5))
-            fmp_key = FMP_API_KEYS.split(',')[0].strip() if FMP_API_KEYS else ''
-            if fmp_key:
-                url = f"https://financialmodelingprep.com/api/v3/historical-price-full/{gan['ticker']}?apikey={fmp_key}"
-                resp = await http_client.get(url, timeout=10.0)
-                if resp.status_code == 200:
-                    hist = resp.json().get('historical', [])
-                    limit = 63
-                    if '1mo' in temporalidad: limit = 21
-                    elif '6mo' in temporalidad: limit = 126
-                    elif '1y' in temporalidad: limit = 252
-                    hist = hist[:limit]
-                    if len(hist) >= 2:
-                        p_inicial = float(hist[-1].get('close', 0))
-                        p_final = float(hist[0].get('close', 0))
-                        if p_inicial > 0:
-                            gan['rendimiento_hist'] = round(((p_final - p_inicial)/p_inicial)*100, 2)
+            keys = [k.strip() for k in FMP_API_KEYS.split(',')] if FMP_API_KEYS else []
+            if keys:
+                for fmp_key in keys:
+                    url = f"https://financialmodelingprep.com/api/v3/historical-price-full/{gan['ticker']}?apikey={fmp_key}"
+                    resp = await http_client.get(url, timeout=10.0)
+                    if resp.status_code == 200:
+                        hist = resp.json().get('historical', [])
+                        break
+                else:
+                    return gan, 0.0
+                
+                limit = 63
+                if '1mo' in temporalidad: limit = 21
+                elif '6mo' in temporalidad: limit = 126
+                elif '1y' in temporalidad: limit = 252
+                hist = hist[:limit]
+                if len(hist) >= 2:
+                    p_inicial = float(hist[-1].get('close', 0))
+                    p_final = float(hist[0].get('close', 0))
+                    if p_inicial > 0:
+                        gan['rendimiento_hist'] = round(((p_final - p_inicial)/p_inicial)*100, 2)
             return gan, gan.get('rendimiento_hist', 0.0)
         except Exception as e:
             logger.warning(f"[REND PREFETCH] {gan['ticker']}: ERROR {type(e).__name__}: {e}")

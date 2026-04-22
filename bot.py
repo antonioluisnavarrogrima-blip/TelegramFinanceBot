@@ -230,7 +230,7 @@ _REGEX_URL = re.compile(
 _INTENT_CACHE = {}
 
 # ── DATASET ESTÁTICO DE EMERGENCIA ──────────────────────────────────────────────
-# Se activa cuando Yahoo Finance bloquea la IP de Render (devuelve 0 tickers válidos).
+# Se activa cuando Financial Modeling Prep bloquea la IP de Render (devuelve 0 tickers válidos).
 # Datos aproximados actualizados a Q1 2026. Permiten responder a consultas genéricas
 # incluso con YF totalmente bloqueado. Goldman Sachs genera el informe sobre estos datos.
 _DATOS_ESTATICOS: dict[str, dict[str, dict]] = {
@@ -515,35 +515,30 @@ async def generador_informe_goldman(ticker: str, sector: str, datos: dict, perfi
 
 # --- 2. HERRAMIENTAS MATEMÁTICAS LOCALES ---
 async def fabricante_de_graficos(ticker: str, periodo: str = "3mo") -> tuple[bytes | None, float]:
-    """Genera gráfico via Yahoo V8 RAW API + QuickChart sin requerir yfinance."""
+    global _QUICKCHART_SEMA, http_client
     import datetime
     labels = []
     prices = []
     try:
-        url = f"https://query2.finance.yahoo.com/v8/finance/chart/{ticker}?interval=1d&range={periodo}"
-        resp = await asyncio.wait_for(
-            asyncio.to_thread(lambda: _YF_SESSION.get(url)),
-            timeout=10.0
-        )
+        fmp_key = FMP_API_KEYS.split(',')[0].strip() if FMP_API_KEYS else ''
+        if not fmp_key: return None, 0.0
+        url = f"https://financialmodelingprep.com/api/v3/historical-price-full/{ticker}?apikey={fmp_key}"
+        resp = await http_client.get(url, timeout=10.0)
         if resp.status_code == 200:
-            data = resp.json()
-            res = data.get("chart", {}).get("result", [])
-            if res:
-                timestamps = res[0].get("timestamp", [])
-                quotes = res[0].get("indicators", {}).get("quote", [{}])
-                if quotes:
-                    closes = quotes[0].get("close", [])
-                    # Filtra nulos
-                    for t_stamp, c_price in zip(timestamps, closes):
-                        if c_price is not None:
-                            labels.append(datetime.datetime.fromtimestamp(t_stamp).strftime('%Y-%m-%d'))
-                            prices.append(round(float(c_price), 2))
+            hist = resp.json().get('historical', [])
+            limit = 63
+            if '1mo' in periodo: limit = 21
+            elif '6mo' in periodo: limit = 126
+            elif '1y' in periodo: limit = 252
+            hist = hist[:limit]
+            hist.reverse()
+            for item in hist:
+                labels.append(item.get('date', ''))
+                prices.append(round(float(item.get('close', 0)), 2))
     except Exception as e:
-        logger.warning(f"[YF V8 GRAPH] Error {ticker}: {e}")
-
+        pass
     if len(prices) < 2:
         return None, 0.0
-
     p_inicial = prices[0]
     p_final   = prices[-1]
     rendimiento = 0.0 if p_inicial == 0 else ((p_final - p_inicial) / p_inicial) * 100
@@ -571,7 +566,6 @@ async def fabricante_de_graficos(ticker: str, periodo: str = "3mo") -> tuple[byt
         "width": 600, "height": 300, "format": "webp"
     }
 
-    global _QUICKCHART_SEMA, http_client
     kwargs = {"json": qc_payload, "timeout": 8.0}
 
     try:
@@ -827,293 +821,84 @@ def _chequear_fundamentales_bono(ticker: str, info: dict, filtros_extra: list) -
     except Exception as e: logger.debug(f"[YF] Error {ticker} (Bono): {e}")
 
 
-class ExtractorYahooFundamentals:
-    """
-    Extractor único basado en Yahoo Finance V11 quoteSummary.
-    Devuelve los MISMOS datos que muestra la web de Yahoo Finance:
-    PER (trailingPE), dividendYield, dividendRate, beta, marketCap, ROE, etc.
-    Usa la sesión curl_cffi (_YF_SESSION) con TLS Chrome-spoofing para evitar bloqueos.
-    """
+class ExtractorBase:
+    def __init__(self, key: str):
+        self.key = key.strip()
+    async def fetch_batch(self, tickers: list[str]) -> dict:
+        raise NotImplementedError
 
-    # Caché de crumb a nivel de clase (compartido entre instancias y requests)
-    _crumb: str | None = None
-    _crumb_ts: float = 0.0
-    _crumb_last_attempt: float = 0.0  # ts del último intento (exitoso o no)
-    _CRUMB_TTL = 3600          # crumb válido durante 1 hora
-    _CRUMB_RETRY_COOLDOWN = 60.0  # esperar 60s tras un fallo antes de reintentar
-    _crumb_lock: asyncio.Lock | None = None  # inicializado lazily dentro del event loop
-
-    # Módulos de quoteSummary que necesitamos (los mismos que usa yfinance internamente)
-    _MODULES = "summaryDetail,defaultKeyStatistics,financialData,price,assetProfile"
-
-    @classmethod
-    async def _obtener_crumb(cls) -> str | None:
-        """Obtiene (y cachéa) el crumb token de Yahoo Finance.
-        Yahoo V11 requiere este token para responder con datos.
-        Se obtiene visitando primero finance.yahoo.com (para cookies) y luego
-        llamando al endpoint /v1/test/getcrumb.
-        Incluye cooldown de 60s tras un 429 para no saturar el endpoint.
-        """
-        if cls._crumb_lock is None:
-            cls._crumb_lock = asyncio.Lock()
-
-        async with cls._crumb_lock:
-            ahora = time.time()
-
-            # 1. Crumb válido en caché → devolver directamente
-            if cls._crumb and (ahora - cls._crumb_ts) < cls._CRUMB_TTL:
-                return cls._crumb
-
-            # 2. Intento reciente fallido → respetar cooldown (evita bucle de 429)
-            tiempo_desde_ultimo = ahora - cls._crumb_last_attempt
-            if cls._crumb_last_attempt > 0 and tiempo_desde_ultimo < cls._CRUMB_RETRY_COOLDOWN:
-                espera_restante = int(cls._CRUMB_RETRY_COOLDOWN - tiempo_desde_ultimo)
-                logger.warning(
-                    f"[YahooV11] Crumb en cooldown — próximo intento en {espera_restante}s. "
-                    f"Usando dataset estático hasta entonces."
-                )
-                return None
-
-            cls._crumb_last_attempt = ahora
-            logger.info("[YahooV11] Obteniendo crumb token de Yahoo Finance...")
-            try:
-                # Paso 1: visitar Yahoo Finance para capturar cookies de sesión
-                await asyncio.wait_for(
-                    asyncio.to_thread(lambda: _YF_SESSION.get(
-                        "https://finance.yahoo.com", timeout=10
-                    )),
-                    timeout=15.0
-                )
-                # Pausa breve para que las cookies se asienten y evitar 429 inmediato
-                await asyncio.sleep(1.5)
-                # Paso 2: obtener el crumb con las cookies ya establecidas
-                resp = await asyncio.wait_for(
-                    asyncio.to_thread(lambda: _YF_SESSION.get(
-                        "https://query2.finance.yahoo.com/v1/test/getcrumb", timeout=10
-                    )),
-                    timeout=15.0
-                )
-                if resp.status_code == 200 and resp.text and resp.text.strip():
-                    cls._crumb = resp.text.strip()
-                    cls._crumb_ts = time.time()
-                    logger.info(f"[YahooV11] Crumb obtenido correctamente: {cls._crumb[:10]}...")
-                    return cls._crumb
-                elif resp.status_code == 429:
-                    # Cooldown ya activado por _crumb_last_attempt — simplemente loguear
-                    logger.warning(
-                        f"[YahooV11] Crumb endpoint 429 (rate limited). "
-                        f"Cooldown de {int(cls._CRUMB_RETRY_COOLDOWN)}s activado."
-                    )
-                else:
-                    logger.warning(
-                        f"[YahooV11] Crumb endpoint HTTP {resp.status_code}: '{resp.text[:80]}'"
-                    )
-            except Exception as e:
-                logger.warning(f"[YahooV11] Error obteniendo crumb: {e}")
-
-        return None
+class ExtractorFMP(ExtractorBase):
+    """Extractor basado en Financial Modeling Prep (FMP)."""
+    def __init__(self, key: str):
+        super().__init__(key)
+        self._dead = False
 
     async def fetch_batch(self, tickers: list[str]) -> dict:
-        """Descarga fundamentales de cada ticker de forma concurrente con crumb auth."""
-        if not tickers:
-            return {}
-
-        crumb = await self._obtener_crumb()
-        if not crumb:
-            logger.error("[YahooV11] Sin crumb — no se puede llamar a V11. Abortando lote.")
-            return {}
-
-        modules = self._MODULES
-
-        async def fetch_one(t: str, _crumb: str = crumb, _mods: str = modules) -> tuple[str, dict]:
-            """_crumb y _mods como default args para evitar cierre sobre variables externas."""
-            try:
-                url = (
-                    f"https://query1.finance.yahoo.com/v11/finance/quoteSummary/{t.upper()}"
-                    f"?modules={_mods}&crumb={_crumb}"
-                )
-                resp = await asyncio.wait_for(
-                    asyncio.to_thread(lambda u=url: _YF_SESSION.get(u, timeout=12)),
-                    timeout=15.0
-                )
-
-                # Crumb expirado: invalidar caché para próxima llamada
-                if resp.status_code == 401:
-                    logger.warning(f"[YahooV11] 401 para {t} — crumb expirado, se refrescará.")
-                    ExtractorYahooFundamentals._crumb = None
-                    return t, {}
-
-                if resp.status_code != 200:
-                    logger.debug(f"[YahooV11] HTTP {resp.status_code} para {t}")
-                    return t, {}
-
-                body = resp.json()
-                result = body.get("quoteSummary", {}).get("result") or []
-                if not result:
-                    err = body.get("quoteSummary", {}).get("error") or {}
-                    logger.debug(f"[YahooV11] Sin resultado para {t}: {err}")
-                    return t, {}
-
-                data = result[0]
-                sd  = data.get("summaryDetail", {})
-                ks  = data.get("defaultKeyStatistics", {})
-                fd  = data.get("financialData", {})
-                pr  = data.get("price", {})
-                ap  = data.get("assetProfile", {})
-
-                def _raw(d, key):
-                    """Extrae el valor numérico crudo de un campo YF (puede ser {raw, fmt} o escalar)."""
-                    v = d.get(key)
-                    if isinstance(v, dict):
-                        return v.get("raw")
-                    return v
-
-                precio          = _raw(pr, "regularMarketPrice") or _raw(sd, "regularMarketPrice")
-                prev_close      = _raw(pr, "regularMarketPreviousClose")
-                market_cap      = _raw(pr, "marketCap")
-                trailing_pe     = _raw(sd, "trailingPE")
-                forward_pe      = _raw(sd, "forwardPE")
-                div_yield       = _raw(sd, "dividendYield")   # ya en decimal (ej. 0.032)
-                div_rate        = _raw(sd, "dividendRate")    # absoluto en USD/año
-                beta            = _raw(sd, "beta")
-                price_to_book   = _raw(ks, "priceToBook")
-                roe             = _raw(fd, "returnOnEquity")  # decimal
-                roa             = _raw(fd, "returnOnAssets")
-                profit_margins  = _raw(fd, "profitMargins")
-                op_margins      = _raw(fd, "operatingMargins")
-                rev_growth      = _raw(fd, "revenueGrowth")
-                earn_growth     = _raw(fd, "earningsGrowth")
-                debt_equity     = _raw(fd, "debtToEquity")
-                total_assets    = _raw(ks, "totalAssets")     # para ETFs/Bonos
-                price_to_sales  = _raw(ks, "priceToSalesTrailing12Months")
-                ebitda          = _raw(fd, "ebitda")
-                sector          = ap.get("sector") or pr.get("sector")
-                short_name      = _raw(pr, "shortName") or t.upper()
-                yf_yield        = _raw(sd, "yield")           # campo 'yield' para ETFs
-
-                if not precio:
-                    return t, {}
-
-                return t.upper(), {
-                    "regularMarketPrice":          precio,
-                    "previousClose":               prev_close,
-                    "marketCap":                   market_cap,
-                    "shortName":                   short_name,
-                    "sector":                      sector,
-                    "trailingPE":                  trailing_pe,
-                    "forwardPE":                   forward_pe,
-                    "dividendYield":               div_yield,
-                    "dividendRate":                div_rate,
-                    "yield":                       yf_yield,
-                    "beta":                        beta,
-                    "priceToBook":                 price_to_book,
-                    "returnOnEquity":              roe,
-                    "returnOnAssets":              roa,
-                    "profitMargins":               profit_margins,
-                    "operatingMargins":            op_margins,
-                    "revenueGrowth":               rev_growth,
-                    "earningsGrowth":              earn_growth,
-                    "debtToEquity":                debt_equity,
-                    "totalAssets":                 total_assets,
-                    "priceToSalesTrailing12Months": price_to_sales,
-                    "ebitda":                      ebitda,
-                    "_fuente":                     "YahooV11",
+        if self._dead: return {}
+        if not self.key or not tickers: return {}
+        simbolos = ",".join(t.upper() for t in tickers)
+        url = f"https://financialmodelingprep.com/api/v3/quote/{simbolos}?apikey={self.key}"
+        try:
+            resp = await http_client.get(url, timeout=12.0)
+            if resp.status_code == 403:
+                self._dead = True
+                return {}
+            if resp.status_code != 200: return {}
+            data = resp.json()
+            if not isinstance(data, list): return {}
+            res = {}
+            for item in data:
+                sym = item.get('symbol', '').upper()
+                if not sym: continue
+                precio = item.get('price') or 0
+                div_anual = item.get('lastDiv') or 0
+                res[sym] = {
+                    'regularMarketPrice': precio,
+                    'previousClose': item.get('previousClose'),
+                    'marketCap': item.get('marketCap'),
+                    'shortName': item.get('name', sym),
+                    'trailingPE': item.get('pe'),
+                    'dividendYield': (div_anual/precio) if precio and div_anual else None,
+                    'dividendRate': div_anual,
+                    '_fuente': 'FMP',
                 }
-            except asyncio.TimeoutError:
-                logger.warning(f"[YahooV11] Timeout para {t}")
-                return t, {}
-            except Exception as e:
-                logger.debug(f"[YahooV11] Error {t}: {e}")
-                return t, {}
-
-        resultados = await asyncio.gather(*(fetch_one(t) for t in tickers))
-        return {ticker: info for ticker, info in resultados if info}
-
+            return res
+        except Exception as e:
+            return {}
 
 # Clases de activo que REQUIEREN fundamentales (PER, dividendo...) para el filtrado
 _CLASES_CON_FUNDAMENTALES = {"ACCION", "REIT", "ETF", "BONO"}
 
 async def _obtener_info_bulk(tickers: list[str], clase: str) -> dict:
-    # Yahoo V11 siempre devuelve fundamentales reales; excluimos del caché solo los
-    # registros de fuentes anteriores que carezcan de datos fundamentales.
     require_fundamentals = clase.upper() in _CLASES_CON_FUNDAMENTALES
     cached = await db.obtener_yf_cache_bulk(tickers, require_fundamentals=require_fundamentals)
     faltantes = [t for t in tickers if t.upper() not in cached]
-    logger.info(f"[ROUTER] {clase} | Total:{len(tickers)} En-cache:{len(cached)} A-descargar:{len(faltantes)}")
-
     if faltantes:
-        # Fuente única: Yahoo Finance V11 — mismos datos que la web de Yahoo Finance
-        extractores = [ExtractorYahooFundamentals()]
-
-        chunk_size = 3
+        extractores = [ExtractorFMP(k) for k in FMP_API_KEYS.split(',')] if FMP_API_KEYS else []
         nuevos_datos = {}
-        
-        for i in range(0, len(faltantes), chunk_size):
-            lote = faltantes[i:i+chunk_size]
-            logger.info(f"[ROUTER] Descargando lote de {len(lote)} tickers...")
-            
+        for i_chunk in range(0, len(faltantes), 3):
+            lote = faltantes[i_chunk:i_chunk+3]
             res = {}
-            extractor_usado = None
-            
-            # Intento único con Yahoo V11 (con 1 reintento si devuelve vacío)
             for ext in extractores:
-                tipo = type(ext).__name__
-                logger.info(f"[ROUTER] -> Intentando fuente: {tipo}...")
-
-                max_intentos_ext = 2
+                max_intentos_ext = 1 if (hasattr(ext, '_dead') and ext._dead) else 2
                 for _ in range(max_intentos_ext):
                     res = await ext.fetch_batch(lote)
                     if res: break
                     await asyncio.sleep(1.5)
-
-                if res:
-                    logger.info(f"[ROUTER] -> Éxito con {tipo}!")
-                    extractor_usado = ext
-                    break
-                else:
-                    logger.warning(f"[ROUTER] -> {tipo} falló o retornó vacío.")
-            
-            if not res:
-                logger.critical(f"[FAIL-FAST] Todas las fuentes de respaldo (incluyendo degradadas) fallaron en Lote {i//chunk_size+1}. Red cortocircuitada.")
-                return {"_RATE_LIMIT_HIT": True}
-                
+                if res: break
+            if not res: continue
             for t, info in res.items():
-                if not info: continue
-                if not info.get("regularMarketPrice"): continue
-                nuevos_datos[t] = info
-                cached[t] = info  # YahooV11 siempre tiene fundamentales completos
-
+                if info and info.get('regularMarketPrice'):
+                    nuevos_datos[t] = info
+                    cached[t] = info
             await asyncio.sleep(0.3)
-        
-        logger.info(f"[ROUTER] Resultado final: {len(nuevos_datos)}/{len(faltantes)} tickers.")
-        # Guardamos en BD con TTL estándar (1h) ya que los datos son de calidad completa.
         if nuevos_datos:
             await db.guardar_yf_cache_bulk(nuevos_datos, clase)
-
-    logger.info(f"[ROUTER] Cache disponible: {len(cached)} tickers")
-
-    # ── FALLBACK ESTÁTICO DE EMERGENCIA ──────────────────────────────────────────
-    # Si Yahoo Finance ha bloqueado la IP y no hay ningún ticker válido,
-    # inyectamos el dataset estático para que el bot siempre pueda responder.
     if not cached:
         dataset_clase = _DATOS_ESTATICOS.get(clase, {})
-        if dataset_clase:
-            logger.warning(
-                f"[FALLBACK ESTÁTICO] YF retornó 0 tickers válidos para {clase}. "
-                f"Usando dataset estático con {len(dataset_clase)} activos."
-            )
-            # Solo devolvemos los tickers que fueron pedidos (salvo que no haya solapamiento)
-            tickers_upper = {t.upper() for t in tickers}
-            interseccion = {k: v for k, v in dataset_clase.items() if k in tickers_upper}
-            if interseccion:
-                cached = interseccion
-            else:
-                # Los tickers de semillas no coinciden con el estático -> usar todos
-                cached = dict(dataset_clase)
-                logger.warning(f"[FALLBACK ESTÁTICO] Sin solapamiento con semillas {list(tickers_upper)[:5]}... usando toda la clase {clase}.")
-        else:
-            logger.error(f"[FALLBACK ESTÁTICO] Tampoco hay dataset estático para {clase}.")
-
+        tickers_upper = {t.upper() for t in tickers}
+        interseccion = {k: v for k, v in dataset_clase.items() if k in tickers_upper}
+        cached = interseccion if interseccion else dict(dataset_clase)
     return cached
 
 async def pipeline_hibrido(solicitud: str, msg_espera=None, fuente_datos: str = "yahoo"):
@@ -1260,8 +1045,7 @@ async def _pipeline_hibrido_interno(
             }
             datos_bulk = await _obtener_info_bulk(tickers, "ACCION")
             if datos_bulk.get("_RATE_LIMIT_HIT"):
-                # TODO: IP de Render en lista negra de Yahoo. El WAF bloquea JA3 en el Lote 1. Migrar motor de extracción fundamental a API oficial REST (ej. Financial Modeling Prep o AlphaVantage)
-                return "⚠️ <b>Degradación de Servicio Temporal</b>\nLa cuota de la API (FMP) o del motor de inferencia se ha agotado o bloqueado masivamente. Por favor, espere.", None, None, None
+                return "⚠️ Servicio de datos temporalmente no disponible. Por favor, espere.", None, None, None
 
             # Log por ticker: qué datos reales tiene y si pasa el checker
             for t in tickers:
@@ -1279,8 +1063,7 @@ async def _pipeline_hibrido_interno(
     elif clase_activo == "REIT":
         datos_bulk = await _obtener_info_bulk(tickers, "REIT")
         if datos_bulk.get("_RATE_LIMIT_HIT"):
-            # TODO: IP de Render en lista negra de Yahoo. El WAF bloquea JA3 en el Lote 1. Migrar motor de extracción fundamental a API oficial REST (ej. Financial Modeling Prep o AlphaVantage)
-            return "⚠️ <b>Degradación de Servicio Temporal</b>\nLa cuota de la API (FMP) o del motor de inferencia se ha agotado o bloqueado masivamente. Por favor, espere.", None, None, None
+            return "⚠️ Servicio de datos temporalmente no disponible. Por favor, espere.", None, None, None
         resultados = [_chequear_fundamentales_reit(t, datos_bulk.get(t, {}), filtros_dinamicos_raw) for t in tickers]
         pre_ganadores = [r for r in resultados if r is not None]
         logger.info(f"[REIT] pre_ganadores={len(pre_ganadores)}/{len(tickers)} -> {[g['ticker'] for g in pre_ganadores]}")
@@ -1288,8 +1071,7 @@ async def _pipeline_hibrido_interno(
     elif clase_activo == "ETF":
         datos_bulk = await _obtener_info_bulk(tickers, "ETF")
         if datos_bulk.get("_RATE_LIMIT_HIT"):
-            # TODO: IP de Render en lista negra de Yahoo. El WAF bloquea JA3 en el Lote 1. Migrar motor de extracción fundamental a API oficial REST (ej. Financial Modeling Prep o AlphaVantage)
-            return "⚠️ <b>Degradación de Servicio Temporal</b>\nLa cuota de la API (FMP) o del motor de inferencia se ha agotado o bloqueado masivamente. Por favor, espere.", None, None, None
+            return "⚠️ Servicio de datos temporalmente no disponible. Por favor, espere.", None, None, None
         resultados = [_chequear_fundamentales_etf(t, datos_bulk.get(t, {}), filtros_dinamicos_raw) for t in tickers]
         pre_ganadores = [r for r in resultados if r is not None]
         logger.info(f"[ETF] pre_ganadores={len(pre_ganadores)}/{len(tickers)} -> {[g['ticker'] for g in pre_ganadores]}")
@@ -1297,8 +1079,7 @@ async def _pipeline_hibrido_interno(
     elif clase_activo == "CRIPTO":
         datos_bulk = await _obtener_info_bulk(tickers, "CRIPTO")
         if datos_bulk.get("_RATE_LIMIT_HIT"):
-            # TODO: IP de Render en lista negra de Yahoo. El WAF bloquea JA3 en el Lote 1. Migrar motor de extracción fundamental a API oficial REST (ej. Financial Modeling Prep o AlphaVantage)
-            return "⚠️ <b>Degradación de Servicio Temporal</b>\nLa cuota de la API (FMP) o del motor de inferencia se ha agotado o bloqueado masivamente. Por favor, espere.", None, None, None
+            return "⚠️ Servicio de datos temporalmente no disponible. Por favor, espere.", None, None, None
         resultados = [_chequear_fundamentales_cripto(t, datos_bulk.get(t, {}), filtros_dinamicos_raw) for t in tickers]
         pre_ganadores = [r for r in resultados if r is not None]
         logger.info(f"[CRIPTO] pre_ganadores={len(pre_ganadores)}/{len(tickers)} -> {[g['ticker'] for g in pre_ganadores]}")
@@ -1306,8 +1087,7 @@ async def _pipeline_hibrido_interno(
     elif clase_activo == "BONO":
         datos_bulk = await _obtener_info_bulk(tickers, "BONO")
         if datos_bulk.get("_RATE_LIMIT_HIT"):
-            # TODO: IP de Render en lista negra de Yahoo. El WAF bloquea JA3 en el Lote 1. Migrar motor de extracción fundamental a API oficial REST (ej. Financial Modeling Prep o AlphaVantage)
-            return "⚠️ <b>Degradación de Servicio Temporal</b>\nLa cuota de la API (FMP) o del motor de inferencia se ha agotado o bloqueado masivamente. Por favor, espere.", None, None, None
+            return "⚠️ Servicio de datos temporalmente no disponible. Por favor, espere.", None, None, None
         resultados = [_chequear_fundamentales_bono(t, datos_bulk.get(t, {}), filtros_dinamicos_raw) for t in tickers]
         pre_ganadores = [r for r in resultados if r is not None]
         logger.info(f"[BONO] pre_ganadores={len(pre_ganadores)}/{len(tickers)} -> {[g['ticker'] for g in pre_ganadores]}")
@@ -1350,37 +1130,22 @@ async def _pipeline_hibrido_interno(
         try:
             import random
             await asyncio.sleep(random.uniform(0.1, 1.5))
-            url = f"https://query2.finance.yahoo.com/v8/finance/chart/{gan['ticker']}?interval=1d&range={temporalidad}"
-            resp = await asyncio.wait_for(
-                asyncio.to_thread(lambda: _YF_SESSION.get(url)),
-                timeout=10.0
-            )
-            if resp.status_code != 200:
-                logger.warning(f"[REND PREFETCH] {gan['ticker']}: HTTP {resp.status_code}")
-                return gan, 0.0
-            
-            data = resp.json()
-            res = data.get("chart", {}).get("result", [])
-            if not res:
-                return gan, 0.0
-                
-            quotes = res[0].get("indicators", {}).get("quote", [{}])
-            if not quotes:
-                return gan, 0.0
-                
-            closes = [c for c in quotes[0].get("close", []) if c is not None]
-            if len(closes) < 2:
-                logger.warning(f"[REND PREFETCH] {gan['ticker']}: hist vacío en {temporalidad}")
-                return gan, 0.0
-                
-            p0, p1 = float(closes[0]), float(closes[-1])
-            rend = 0.0 if p0 == 0 else ((p1 - p0) / p0) * 100
-            str_op = getattr(rendimiento_op, '__name__', str(rendimiento_op))
-            logger.info(f"[REND PREFETCH V8] {gan['ticker']}: {rend:+.2f}% ({temporalidad}) | umbral={rendimiento_objetivo}% op={str_op}")
-            return gan, rend
-        except asyncio.TimeoutError:
-            logger.warning(f"[REND PREFETCH] {gan['ticker']}: TIMEOUT en API V8")
-            return gan, 0.0
+            fmp_key = FMP_API_KEYS.split(',')[0].strip() if FMP_API_KEYS else ''
+            if fmp_key:
+                url = f"https://financialmodelingprep.com/api/v3/historical-price-full/{gan['ticker']}?apikey={fmp_key}"
+                resp = await http_client.get(url, timeout=10.0)
+                if resp.status_code == 200:
+                    hist = resp.json().get('historical', [])
+                    limit = 63
+                    if '1mo' in temporalidad: limit = 21
+                    elif '6mo' in temporalidad: limit = 126
+                    elif '1y' in temporalidad: limit = 252
+                    hist = hist[:limit]
+                    if len(hist) >= 2:
+                        p_inicial = float(hist[-1].get('close', 0))
+                        p_final = float(hist[0].get('close', 0))
+                        if p_inicial > 0:
+                            gan['rendimiento_hist'] = round(((p_final - p_inicial)/p_inicial)*100, 2)
         except Exception as e:
             logger.warning(f"[REND PREFETCH] {gan['ticker']}: ERROR {type(e).__name__}: {e}")
             return gan, 0.0
@@ -1473,7 +1238,7 @@ async def _pipeline_por_tabla(
 
     if msg_espera:
         try:
-            await msg_espera.edit_text(f"\ud83d\udd0d Escaneando {len(tickers)} activos {clase_activo} en Yahoo Finance...")
+            await msg_espera.edit_text(f"\ud83d\udd0d Escaneando {len(tickers)} activos {clase_activo} en Financial Modeling Prep...")
         except Exception:
             pass
 
@@ -1491,8 +1256,7 @@ async def _pipeline_por_tabla(
         }
         datos_bulk = await _obtener_info_bulk(tickers, "ACCION")
         if datos_bulk.get("_RATE_LIMIT_HIT"):
-            # TODO: IP de Render en lista negra de Yahoo. El WAF bloquea JA3 en el Lote 1. Migrar motor de extracción fundamental a API oficial REST (ej. Financial Modeling Prep o AlphaVantage)
-            return "⚠️ <b>Degradación de Servicio Temporal</b>\nLa cuota de la API (FMP) o del motor de inferencia se ha agotado o bloqueado masivamente. Por favor, espere.", None, None, None
+            return "⚠️ Servicio de datos temporalmente no disponible. Por favor, espere.", None, None, None
         resultados = [_chequear_fundamentales_accion(t, datos_bulk.get(t, {}), filtros_a) for t in tickers]
         try:
             ganadores = [r for r in resultados if r is not None]
@@ -1506,8 +1270,7 @@ async def _pipeline_por_tabla(
               {"metrica": "p_ffo",           "operador": "<=", "valor": p_ffo_max}]
         datos_bulk = await _obtener_info_bulk(tickers, "REIT")
         if datos_bulk.get("_RATE_LIMIT_HIT"):
-            # TODO: IP de Render en lista negra de Yahoo. El WAF bloquea JA3 en el Lote 1. Migrar motor de extracción fundamental a API oficial REST (ej. Financial Modeling Prep o AlphaVantage)
-            return "⚠️ <b>Degradación de Servicio Temporal</b>\nLa cuota de la API (FMP) o del motor de inferencia se ha agotado o bloqueado masivamente. Por favor, espere.", None, None, None
+            return "⚠️ Servicio de datos temporalmente no disponible. Por favor, espere.", None, None, None
         resultados = [_chequear_fundamentales_reit(t, datos_bulk.get(t, {}), fe) for t in tickers]
         try:
             ganadores = [r for r in resultados if r is not None]
@@ -1521,8 +1284,7 @@ async def _pipeline_por_tabla(
               {"metrica": "aum", "operador": ">=", "valor": aum_min}]
         datos_bulk = await _obtener_info_bulk(tickers, "ETF")
         if datos_bulk.get("_RATE_LIMIT_HIT"):
-            # TODO: IP de Render en lista negra de Yahoo. El WAF bloquea JA3 en el Lote 1. Migrar motor de extracción fundamental a API oficial REST (ej. Financial Modeling Prep o AlphaVantage)
-            return "⚠️ <b>Degradación de Servicio Temporal</b>\nLa cuota de la API (FMP) o del motor de inferencia se ha agotado o bloqueado masivamente. Por favor, espere.", None, None, None
+            return "⚠️ Servicio de datos temporalmente no disponible. Por favor, espere.", None, None, None
         resultados = [_chequear_fundamentales_etf(t, datos_bulk.get(t, {}), fe) for t in tickers]
         try:
             ganadores = [r for r in resultados if r is not None]
@@ -1534,8 +1296,7 @@ async def _pipeline_por_tabla(
         fe = [{"metrica": "market_cap", "operador": ">=", "valor": mcap_min}]
         datos_bulk = await _obtener_info_bulk(tickers, "CRIPTO")
         if datos_bulk.get("_RATE_LIMIT_HIT"):
-            # TODO: IP de Render en lista negra de Yahoo. El WAF bloquea JA3 en el Lote 1. Migrar motor de extracción fundamental a API oficial REST (ej. Financial Modeling Prep o AlphaVantage)
-            return "⚠️ <b>Degradación de Servicio Temporal</b>\nLa cuota de la API (FMP) o del motor de inferencia se ha agotado o bloqueado masivamente. Por favor, espere.", None, None, None
+            return "⚠️ Servicio de datos temporalmente no disponible. Por favor, espere.", None, None, None
         resultados = [_chequear_fundamentales_cripto(t, datos_bulk.get(t, {}), fe) for t in tickers]
         try:
             ganadores = [r for r in resultados if r is not None]
@@ -1547,8 +1308,7 @@ async def _pipeline_por_tabla(
         fe = [{"metrica": "dividend_yield", "operador": ">=", "valor": ytm_min}]
         datos_bulk = await _obtener_info_bulk(tickers, "BONO")
         if datos_bulk.get("_RATE_LIMIT_HIT"):
-            # TODO: IP de Render en lista negra de Yahoo. El WAF bloquea JA3 en el Lote 1. Migrar motor de extracción fundamental a API oficial REST (ej. Financial Modeling Prep o AlphaVantage)
-            return "⚠️ <b>Degradación de Servicio Temporal</b>\nLa cuota de la API (FMP) o del motor de inferencia se ha agotado o bloqueado masivamente. Por favor, espere.", None, None, None
+            return "⚠️ Servicio de datos temporalmente no disponible. Por favor, espere.", None, None, None
         resultados = [_chequear_fundamentales_bono(t, datos_bulk.get(t, {}), fe) for t in tickers]
         try:
             ganadores = [r for r in resultados if r is not None]
@@ -1596,7 +1356,7 @@ def _formatear_resultado_tabla(datos: dict, clase_activo: str) -> str:
         f"{emoji} <b>Ticker:</b> {ticker}",
         f"\ud83d\uddc2 <b>Clase:</b> {clase_activo}",
         f"",
-        f"\ud83d\udcc8 <b>M\u00e9tricas verificadas (Yahoo Finance):</b>",
+        f"\ud83d\udcc8 <b>M\u00e9tricas verificadas (Financial Modeling Prep):</b>",
     ]
     if clase_activo == "ACCION":
         if datos.get("per") not in (None, "N/A"):
@@ -1982,7 +1742,7 @@ async def manejador_botones(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text(
             "\ud83d\udcca <b>AN\u00c1LISIS POR TABLA</b>\n\n"
             "Selecciona el tipo de activo a cribar.\n"
-            "<i>No se usa IA \u2014 solo datos reales de Yahoo Finance en tiempo real.</i>",
+            "<i>No se usa IA \u2014 solo datos reales de Financial Modeling Prep en tiempo real.</i>",
             reply_markup=InlineKeyboardMarkup(botones),
             parse_mode="HTML"
         )
@@ -2103,7 +1863,7 @@ async def manejador_botones(update: Update, context: ContextTypes.DEFAULT_TYPE):
             [InlineKeyboardButton("⬅️ Volver", callback_data="volver_menu")]
         ]
         await query.edit_message_text(
-            text=f"Seleccionado: <b>{clase_elegida}</b>\n\n¿Qué <b>perfil de exigencia</b> matemática deben cumplir tus tickers en Yahoo Finance?",
+            text=f"Seleccionado: <b>{clase_elegida}</b>\n\n¿Qué <b>perfil de exigencia</b> matemática deben cumplir tus tickers en Financial Modeling Prep?",
             reply_markup=InlineKeyboardMarkup(botones),
             parse_mode="HTML"
         )
@@ -2530,7 +2290,7 @@ async def conversacion_inversor(update: Update, context: ContextTypes.DEFAULT_TY
         clase_elegida  = context.user_data.get('manual_clase',  'ACCION')
         perfil_elegido = context.user_data.get('manual_perfil', 'Balanceado')
         msg_espera = await update.message.reply_text(
-            f"⏳ Validando {len(tickers_validos)} ticker(s) en Yahoo Finance sin IA..."
+            f"⏳ Validando {len(tickers_validos)} ticker(s) en Financial Modeling Prep sin IA..."
         )
         # Guardar como última búsqueda para alertas
         await db.upsert_usuario(tid, ultima_busqueda=" ".join(tickers_validos))
@@ -2773,21 +2533,7 @@ async def lifespan(app: FastAPI):
     await db.inicializar_db()
     await db.precargar_semillas_basicas()    # Asegura operatividad inmediata v4.3
 
-    # Pre-calentar el crumb de Yahoo Finance antes de que llegue tráfico de usuarios.
-    # Esto evita el 429 causado por múltiples requests concurrentes al crumb endpoint.
-    logger.info("[LIFESPAN] Pre-calentando crumb de Yahoo Finance...")
-    try:
-        crumb_startup = await ExtractorYahooFundamentals._obtener_crumb()
-        if crumb_startup:
-            logger.info("[LIFESPAN] Crumb de Yahoo listo para uso.")
-        else:
-            logger.warning(
-                "[LIFESPAN] No se pudo obtener el crumb de Yahoo en el arranque. "
-                "El bot usará el dataset estático hasta que el crumb esté disponible."
-            )
-    except Exception as _e:
-        logger.warning(f"[LIFESPAN] Error pre-calentando crumb: {_e}")
-
+    # Pre-calentar el crumb de Financial Modeling Prep antes de que llegue tráfico de usuarios.
     logger.info("[LIFESPAN] Inicializando bot de Telegram...")
     await telegram_app.initialize()
     comandos = [

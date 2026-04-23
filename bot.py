@@ -538,7 +538,7 @@ async def fabricante_de_graficos(ticker: str, periodo: str = "3mo") -> tuple[byt
             else:
                 logger.warning(f"[CHART] FMP Key fallida: {resp.status_code} - {resp.text[:100]}")
         
-        # Fallback a Alpha Vantage si FMP falla (FMP Free Tier bloquea historical)
+        # Fallback 1 a Alpha Vantage si FMP falla
         if not hist:
             av_keys = [k.strip() for k in ALPHAVANTAGE_API_KEYS.split(',') if k.strip()] if ALPHAVANTAGE_API_KEYS else []
             for av_key in av_keys:
@@ -554,8 +554,32 @@ async def fabricante_de_graficos(ticker: str, periodo: str = "3mo") -> tuple[byt
                 else:
                     logger.warning(f"[CHART] AV Key fallida: {resp.status_code} - {resp.text[:100]}")
 
+        # Fallback 2 a Yahoo V8 (by-pass Cloudflare WAF usando curl_cffi)
         if not hist:
-            logger.warning(f"[CHART] Error GRAPH para {ticker}: Fallaron FMP y AV.")
+            from curl_cffi.requests import AsyncSession
+            range_str = "3mo"
+            if limit <= 25: range_str = "1mo"
+            elif limit <= 130: range_str = "6mo"
+            elif limit <= 260: range_str = "1y"
+            y_url = f"https://query2.finance.yahoo.com/v8/finance/chart/{ticker}?range={range_str}&interval=1d"
+            try:
+                async with AsyncSession(impersonate="chrome110") as session:
+                    resp = await session.get(y_url, timeout=10.0)
+                    if resp.status_code == 200:
+                        result = resp.json().get("chart", {}).get("result", [])
+                        if result:
+                            timestamps = result[0].get("timestamp", [])
+                            closes = result[0].get("indicators", {}).get("quote", [{}])[0].get("close", [])
+                            for t, c in zip(timestamps, closes):
+                                if c is not None:
+                                    dt = datetime.datetime.fromtimestamp(t).strftime('%Y-%m-%d')
+                                    hist.append({"date": dt, "close": c})
+                            hist.reverse() # Invertir para que sea descendente como FMP
+            except Exception as e:
+                logger.warning(f"[CHART] Yahoo Fallback falló para {ticker}: {e}")
+
+        if not hist:
+            logger.warning(f"[CHART] Error GRAPH para {ticker}: Fallaron FMP, AV y Yahoo.")
             return None, 0.0
         if '1mo' in periodo: limit = 21
         elif '6mo' in periodo: limit = 126
@@ -1176,7 +1200,7 @@ async def _pipeline_hibrido_interno(
                 else:
                     logger.warning(f"[REND] FMP Key fallida para {gan['ticker']}: HTTP {resp.status_code} - {resp.text[:100]}")
             
-            # Fallback a Alpha Vantage
+            # Fallback 1 a Alpha Vantage
             if not hist:
                 av_keys = [k.strip() for k in ALPHAVANTAGE_API_KEYS.split(',') if k.strip()] if ALPHAVANTAGE_API_KEYS else []
                 for av_key in av_keys:
@@ -1192,6 +1216,28 @@ async def _pipeline_hibrido_interno(
                     else:
                         logger.warning(f"[REND] AV Key fallida para {gan['ticker']}: HTTP {resp.status_code} - {resp.text[:100]}")
             
+            # Fallback 2 a Yahoo V8 (by-pass WAF)
+            if not hist:
+                from curl_cffi.requests import AsyncSession
+                range_str = "3mo"
+                if limit <= 25: range_str = "1mo"
+                elif limit <= 130: range_str = "6mo"
+                elif limit <= 260: range_str = "1y"
+                y_url = f"https://query2.finance.yahoo.com/v8/finance/chart/{gan['ticker']}?range={range_str}&interval=1d"
+                try:
+                    async with AsyncSession(impersonate="chrome110") as session:
+                        resp = await session.get(y_url, timeout=10.0)
+                        if resp.status_code == 200:
+                            result = resp.json().get("chart", {}).get("result", [])
+                            if result:
+                                closes = result[0].get("indicators", {}).get("quote", [{}])[0].get("close", [])
+                                for c in closes:
+                                    if c is not None:
+                                        hist.append({"close": c})
+                                hist.reverse() # Invertir a descendente
+                except Exception as e:
+                    logger.warning(f"[REND] Yahoo Fallback falló para {gan['ticker']}: {e}")
+
             if not hist:
                 return gan, 0.0
                 hist = hist[:limit]

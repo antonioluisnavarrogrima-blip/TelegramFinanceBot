@@ -80,7 +80,7 @@ TELEGRAM_WEBHOOK_SECRET  = os.getenv("TELEGRAM_WEBHOOK_SECRET", "")
 CRON_SECRET              = os.getenv("CRON_SECRET", "")
 RENDER_EXTERNAL_URL      = os.getenv("RENDER_EXTERNAL_URL", "").rstrip("/")
 CREDITOS_POR_COMPRA      = _obtener_int_env("CREDITOS_POR_COMPRA", 10)
-STRIPE_PAYMENT_URL       = os.getenv("STRIPE_PAYMENT_URL", "")
+STRIPE_PAYMENT_LINK       = os.getenv("STRIPE_PAYMENT_LINK", "")
 FMP_API_KEYS               = os.getenv("FMP_API_KEYS", os.getenv("FMP_API_KEY", ""))
 ALPHAVANTAGE_API_KEYS      = os.getenv("ALPHAVANTAGE_API_KEYS", "")
 RAPIDAPI_KEY               = os.getenv("RAPIDAPI_KEY", "")
@@ -1519,7 +1519,7 @@ def _formatear_resultado_tabla(datos: dict, clase_activo: str) -> str:
         f"{emoji} <b>Ticker:</b> {ticker}",
         f"\ud83d\uddc2 <b>Clase:</b> {clase_activo}",
         f"",
-        f"\ud83d\udcc8 <b>M\u00e9tricas verificadas (Financial Modeling Prep):</b>",
+        f"\ud83d\udcc8 <b>M\u00e9tricas verificadas:</b>",
     ]
     if clase_activo == "ACCION":
         if datos.get("per") not in (None, "N/A"):
@@ -1745,27 +1745,22 @@ async def comando_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def comando_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     tid = update.effective_user.id
     creditos = await db.obtener_creditos(tid)
-    # Fix: leer strikes reales desde la BD en vez de user_data (en memoria)
     usuario = await db.obtener_usuario(tid)
     strikes = usuario["strikes"] if usuario else 0
     teclado = InlineKeyboardMarkup([
-        [InlineKeyboardButton(f"⚠️ Ver mis Strikes ({strikes})", callback_data="ver_strikes")],
-        [InlineKeyboardButton("🔗 Configurar mi Broker (URL)", callback_data="pedir_url")],
-        [InlineKeyboardButton("🌐 Fuente de Validación", callback_data="pedir_fuente")],
-        [InlineKeyboardButton("⌨️ Bypass (Manual)", callback_data="manual_input"),
-         InlineKeyboardButton("📊 Análisis Tabla", callback_data="tabla_input")],
-        [InlineKeyboardButton("💰 Dividendos VIP", callback_data="btn1click_divs"),
-         InlineKeyboardButton("🚀 Growth Tech", callback_data="btn1click_growth")],
-        [InlineKeyboardButton("🛡️ Blue Chips Seguras", callback_data="btn1click_blue"),
-         InlineKeyboardButton("📉 Buscachollos", callback_data="btn1click_value")],
-        [InlineKeyboardButton("🔔 Configurar Alerta (6h)", callback_data="alerta_6")],
-        [InlineKeyboardButton("🔔 Configurar Alerta (12h)", callback_data="alerta_12")],
-        [InlineKeyboardButton("🛑 Detener Alertas", callback_data="alerta_stop")]
+        [InlineKeyboardButton("⚙️ Cambiar Fuente de Datos", callback_data="pedir_fuente"),
+         InlineKeyboardButton("🛒 Configurar Broker", callback_data="pedir_url")],
+        [InlineKeyboardButton("💰 Mejores Dividendos", callback_data="btn1click_divs"),
+         InlineKeyboardButton("🚀 Mejores Tecnológicas", callback_data="btn1click_growth")],
+        [InlineKeyboardButton("🏛️ Empresas Más Seguras", callback_data="btn1click_blue"),
+         InlineKeyboardButton("💎 Acciones Infravaloradas", callback_data="btn1click_value")],
+        [InlineKeyboardButton(f"⚠️ Mi Estado de Penalizaciones ({strikes})", callback_data="ver_strikes")]
     ])
     await update.message.reply_text(
-        f"⚙️ <b>PANEL DE CONTROL CUANTITATIVO</b>\n\n"
+        f"⚙️ <b>Tu Panel de Inversiones</b>\n\n"
         f"💳 Créditos disponibles: <b>{creditos}</b>\n\n"
-        "Configura tus enlaces al Broker, cambia las fuentes de datos, o activa el <b>Motor Inteligente de Alertas</b> para automatizar la búsqueda de tu nicho favorito.",
+        "Gestiona tu configuración, tus fuentes de datos y encuentra oportunidades con un solo clic.\n"
+        "<i>Los análisis son ultrarrápidos y se basan en datos reales del mercado.</i>",
         reply_markup=teclado,
         parse_mode="HTML"
     )
@@ -1854,8 +1849,14 @@ async def manejador_botones(update: Update, context: ContextTypes.DEFAULT_TYPE):
             else:
                 await query.edit_message_text(texto, reply_markup=teclado, parse_mode="HTML")
         except Exception as e:
-            logger.error(f"[MACRO] Error: {e}")
-            await query.edit_message_text(texto[:4096], parse_mode=None)
+            logger.error(f"[MACRO] Error enviando imagen: {e}")
+            try:
+                # Quitar formato HTML por si acaso
+                texto_limpio = texto.replace('<b>', '').replace('</b>', '').replace('<i>', '').replace('</i>', '')
+                if len(texto_limpio) > 4000: texto_limpio = texto_limpio[:4000]
+                await query.edit_message_text(texto_limpio, parse_mode=None)
+            except Exception as ex:
+                logger.error(f"Fallback macro también falló: {ex}")
         return
 
     # --- Ver Strikes ---
@@ -1869,11 +1870,11 @@ async def manejador_botones(update: Update, context: ContextTypes.DEFAULT_TYPE):
         teclado_volver = InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Volver al Panel", callback_data="volver_menu")]])
         await query.edit_message_text(
             text=(
-                f"⚠️ <b>Estado de Moderación</b>\n\n"
-                f"Strikes acumulados: <b>{strikes}</b>\n"
-                f"Nivel de ban: <b>{ban_level}</b>\n"
-                f"Cooldown activo: <b>{str_tiempo}</b>\n\n"
-                "<i>Realiza una consulta financiera válida para resetear a 0.</i>"
+                f"⚠️ <b>Tus Penalizaciones</b>\n\n"
+                f"Penalizaciones por intentos imposibles: <b>{strikes}</b>\n"
+                f"Nivel de restricción: <b>{ban_level}</b>\n"
+                f"Tiempo de espera activo: <b>{str_tiempo}</b>\n\n"
+                "<i>Realiza una consulta financiera válida para resetear tus penalizaciones a 0.</i>"
             ),
             reply_markup=teclado_volver,
             parse_mode="HTML"
@@ -1886,7 +1887,7 @@ async def manejador_botones(update: Update, context: ContextTypes.DEFAULT_TYPE):
         creditos_tab = await db.obtener_creditos(chat_id)
         if creditos_tab <= 0:
             teclado_pago = InlineKeyboardMarkup([
-                [InlineKeyboardButton("💳 Recargar Créditos", url=f"{STRIPE_PAYMENT_URL}?client_reference_id={chat_id}")]
+                [InlineKeyboardButton("💳 Recargar Créditos", url=f"{STRIPE_PAYMENT_LINK}?client_reference_id={chat_id}")]
             ])
             await query.edit_message_text(
                 "💳 <b>Saldo agotado.</b>\nNecesitas créditos para usar el Análisis por Tabla.",
@@ -2097,7 +2098,7 @@ async def manejador_botones(update: Update, context: ContextTypes.DEFAULT_TYPE):
         creditos = await db.obtener_creditos(chat_id)
         if creditos <= 0:
             teclado_pago = InlineKeyboardMarkup([
-                [InlineKeyboardButton("💳 Recargar Créditos", url=f"{STRIPE_PAYMENT_URL}?client_reference_id={chat_id}")]
+                [InlineKeyboardButton("💳 Recargar Créditos", url=f"{STRIPE_PAYMENT_LINK}?client_reference_id={chat_id}")]
             ])
             await query.edit_message_text(
                 text="💳 <b>Saldo agotado.</b>\nRecarga tus créditos para continuar.",
@@ -2172,7 +2173,7 @@ async def manejador_botones(update: Update, context: ContextTypes.DEFAULT_TYPE):
         creditos = await db.obtener_creditos(chat_id)
         if creditos <= 0:
             teclado_pago = InlineKeyboardMarkup([
-                [InlineKeyboardButton("💳 Recargar Créditos", url=f"{STRIPE_PAYMENT_URL}?client_reference_id={chat_id}")]
+                [InlineKeyboardButton("💳 Recargar Créditos", url=f"{STRIPE_PAYMENT_LINK}?client_reference_id={chat_id}")]
             ])
             await query.edit_message_text(
                 "💳 <b>Saldo agotado.</b>\nRecarga para ver la mejor alternativa.",
@@ -2351,7 +2352,7 @@ async def manejador_botones(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 if intentos >= 3:
                     creditos_act = await db.obtener_creditos(chat_id)
                     if creditos_act <= 0:
-                        teclado_pago = InlineKeyboardMarkup([[InlineKeyboardButton("💳 Recargar Créditos", url=f"{STRIPE_PAYMENT_URL}?client_reference_id={chat_id}")]])
+                        teclado_pago = InlineKeyboardMarkup([[InlineKeyboardButton("💳 Recargar Créditos", url=f"{STRIPE_PAYMENT_LINK}?client_reference_id={chat_id}")]])
                         await msg_espera.edit_text("💳 <b>Saldo agotado.</b> Has superado el límite de intentos fallidos gratuitos de hoy.", parse_mode="HTML", reply_markup=teclado_pago)
                         return
                     await db.restar_credito(chat_id)
@@ -2549,7 +2550,7 @@ async def conversacion_inversor(update: Update, context: ContextTypes.DEFAULT_TY
                 teclado_desbloqueo = InlineKeyboardMarkup([
                     [InlineKeyboardButton(
                         "💳 Desbloquear ahora",
-                        url=f"{STRIPE_PAYMENT_URL}?client_reference_id={tid}"
+                        url=f"{STRIPE_PAYMENT_LINK}?client_reference_id={tid}"
                     )]
                 ])
                 await update.message.reply_text(msg_ban, reply_markup=teclado_desbloqueo)
@@ -2654,7 +2655,7 @@ async def conversacion_inversor(update: Update, context: ContextTypes.DEFAULT_TY
     creditos = await db.obtener_creditos(tid)
     if creditos <= 0:
         teclado_pago = InlineKeyboardMarkup([
-            [InlineKeyboardButton("💳 Recargar Créditos", url=f"{STRIPE_PAYMENT_URL}?client_reference_id={tid}")]
+            [InlineKeyboardButton("💳 Recargar Créditos", url=f"{STRIPE_PAYMENT_LINK}?client_reference_id={tid}")]
         ])
         await update.message.reply_text(
             "💳 <b>Saldo agotado.</b>\n"
@@ -2697,7 +2698,7 @@ async def conversacion_inversor(update: Update, context: ContextTypes.DEFAULT_TY
             if intentos >= 3:
                 creditos_act = await db.obtener_creditos(tid)
                 if creditos_act <= 0:
-                    teclado_pago = InlineKeyboardMarkup([[InlineKeyboardButton("💳 Recargar Créditos", url=f"{STRIPE_PAYMENT_URL}?client_reference_id={tid}")]])
+                    teclado_pago = InlineKeyboardMarkup([[InlineKeyboardButton("💳 Recargar Créditos", url=f"{STRIPE_PAYMENT_LINK}?client_reference_id={tid}")]])
                     await msg_espera.edit_text("💳 <b>Saldo agotado.</b> Has superado el límite de intentos fallidos gratuitos de hoy.", parse_mode="HTML", reply_markup=teclado_pago)
                     return
                 await db.restar_credito(tid)
@@ -2851,16 +2852,23 @@ telegram_app.add_handler(CommandHandler("alertas", comando_alertas))
 async def comando_comprar(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Genera un enlace de pago de Stripe personalizado con el telegram_id del usuario."""
     user_id  = update.effective_user.id
+    if not STRIPE_PAYMENT_LINK:
+        await update.message.reply_text(
+            "💳 <b>Sistema de pagos en configuración.</b>\nPronto podrás recargar créditos, disculpa las molestias.",
+            parse_mode="HTML"
+        )
+        return
+        
     creditos = await db.obtener_creditos(user_id)
-    url_pago = f"{STRIPE_PAYMENT_URL}?client_reference_id={user_id}"
+    url_pago = f"{STRIPE_PAYMENT_LINK}?client_reference_id={user_id}"
     teclado  = InlineKeyboardMarkup([[
         InlineKeyboardButton(f"💳 Comprar {CREDITOS_POR_COMPRA} créditos →", url=url_pago)
     ]])
     await update.message.reply_text(
-        f"💎 <b>Terminal de Recarga Segura</b>\n\n"
-        f"📊 Saldo actual: <b>{creditos}</b> análisis Quant.\n\n"
-        "Descubre activos ganadores en segundos y ahorra horas de criba manual frente a miles de gráficos.\n\n"
-        f"⚡ <b>Cada paquete añade {CREDITOS_POR_COMPRA} créditos automáticamente tras completar el pago (Apple Pay / Google Pay / Tarjeta).</b>",
+        f"💎 <b>Recarga de Créditos</b>\n\n"
+        f"Tienes <b>{creditos}</b> análisis disponibles.\n\n"
+        "Cada paquete añade créditos automáticamente a tu cuenta para que puedas seguir escaneando todo el mercado con un solo clic.\n\n"
+        f"⚡ <b>+{CREDITOS_POR_COMPRA} créditos (Apple Pay / Google Pay / Tarjeta).</b>",
         parse_mode="HTML",
         reply_markup=teclado
     )

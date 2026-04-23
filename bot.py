@@ -83,6 +83,7 @@ CREDITOS_POR_COMPRA      = _obtener_int_env("CREDITOS_POR_COMPRA", 10)
 STRIPE_PAYMENT_URL       = os.getenv("STRIPE_PAYMENT_URL", "")
 FMP_API_KEYS               = os.getenv("FMP_API_KEYS", os.getenv("FMP_API_KEY", ""))
 ALPHAVANTAGE_API_KEYS      = os.getenv("ALPHAVANTAGE_API_KEYS", "")
+RAPIDAPI_KEY               = os.getenv("RAPIDAPI_KEY", "")
 CF_WORKER_PROXY            = os.getenv("CF_WORKER_PROXY", "")
 
 OPS = {
@@ -538,7 +539,29 @@ async def fabricante_de_graficos(ticker: str, periodo: str = "3mo") -> tuple[byt
             else:
                 logger.warning(f"[CHART] FMP Key fallida: {resp.status_code} - {resp.text[:100]}")
         
-        # Fallback 1 a Alpha Vantage si FMP falla
+        # Fallback 1 a RapidAPI (yh-finance) si está configurado
+        if not hist and RAPIDAPI_KEY:
+            range_str = "3mo"
+            if limit <= 25: range_str = "1mo"
+            elif limit <= 130: range_str = "6mo"
+            elif limit <= 260: range_str = "1y"
+            url = f"https://yh-finance.p.rapidapi.com/stock/v3/get-chart?symbol={ticker}&interval=1d&range={range_str}"
+            headers = {"x-rapidapi-key": RAPIDAPI_KEY, "x-rapidapi-host": "yh-finance.p.rapidapi.com"}
+            resp = await http_client.get(url, headers=headers, timeout=10.0)
+            if resp.status_code == 200:
+                result = resp.json().get("chart", {}).get("result", [])
+                if result:
+                    timestamps = result[0].get("timestamp", [])
+                    closes = result[0].get("indicators", {}).get("quote", [{}])[0].get("close", [])
+                    for t, c in zip(timestamps, closes):
+                        if c is not None:
+                            dt = datetime.datetime.fromtimestamp(t).strftime('%Y-%m-%d')
+                            hist.append({"date": dt, "close": c})
+                    hist.reverse() # Invertir para que sea descendente
+            else:
+                logger.warning(f"[CHART] RapidAPI fallida: {resp.status_code} - {resp.text[:100]}")
+
+        # Fallback 2 a Alpha Vantage si FMP y RapidAPI fallan
         if not hist:
             av_keys = [k.strip() for k in ALPHAVANTAGE_API_KEYS.split(',') if k.strip()] if ALPHAVANTAGE_API_KEYS else []
             for av_key in av_keys:
@@ -554,7 +577,7 @@ async def fabricante_de_graficos(ticker: str, periodo: str = "3mo") -> tuple[byt
                 else:
                     logger.warning(f"[CHART] AV Key fallida: {resp.status_code} - {resp.text[:100]}")
 
-        # Fallback 2 a Yahoo V8 (by-pass Cloudflare WAF usando curl_cffi)
+        # Fallback 3 a Yahoo V8 (by-pass Cloudflare WAF usando curl_cffi)
         if not hist:
             from curl_cffi.requests import AsyncSession
             range_str = "3mo"
@@ -1200,7 +1223,27 @@ async def _pipeline_hibrido_interno(
                 else:
                     logger.warning(f"[REND] FMP Key fallida para {gan['ticker']}: HTTP {resp.status_code} - {resp.text[:100]}")
             
-            # Fallback 1 a Alpha Vantage
+            # Fallback 1 a RapidAPI (yh-finance)
+            if not hist and RAPIDAPI_KEY:
+                range_str = "3mo"
+                if limit <= 25: range_str = "1mo"
+                elif limit <= 130: range_str = "6mo"
+                elif limit <= 260: range_str = "1y"
+                url = f"https://yh-finance.p.rapidapi.com/stock/v3/get-chart?symbol={gan['ticker']}&interval=1d&range={range_str}"
+                headers = {"x-rapidapi-key": RAPIDAPI_KEY, "x-rapidapi-host": "yh-finance.p.rapidapi.com"}
+                resp = await http_client.get(url, headers=headers, timeout=10.0)
+                if resp.status_code == 200:
+                    result = resp.json().get("chart", {}).get("result", [])
+                    if result:
+                        closes = result[0].get("indicators", {}).get("quote", [{}])[0].get("close", [])
+                        for c in closes:
+                            if c is not None:
+                                hist.append({"close": c})
+                        hist.reverse() # Invertir a descendente
+                else:
+                    logger.warning(f"[REND] RapidAPI fallida para {gan['ticker']}: {resp.status_code}")
+
+            # Fallback 2 a Alpha Vantage
             if not hist:
                 av_keys = [k.strip() for k in ALPHAVANTAGE_API_KEYS.split(',') if k.strip()] if ALPHAVANTAGE_API_KEYS else []
                 for av_key in av_keys:
@@ -1216,7 +1259,7 @@ async def _pipeline_hibrido_interno(
                     else:
                         logger.warning(f"[REND] AV Key fallida para {gan['ticker']}: HTTP {resp.status_code} - {resp.text[:100]}")
             
-            # Fallback 2 a Yahoo V8 (by-pass WAF)
+            # Fallback 3 a Yahoo V8 (by-pass WAF)
             if not hist:
                 from curl_cffi.requests import AsyncSession
                 range_str = "3mo"

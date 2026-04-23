@@ -522,25 +522,41 @@ async def fabricante_de_graficos(ticker: str, periodo: str = "3mo") -> tuple[byt
     labels = []
     prices = []
     try:
-        keys = [k.strip() for k in FMP_API_KEYS.split(',') if k.strip()] if FMP_API_KEYS else []
-        if not keys:
-            logger.warning("[CHART] Sin FMP_API_KEY, omitiendo grafico.")
-            return None, 0.0
+        limit = 63
+        if '1mo' in periodo: limit = 21
+        elif '6mo' in periodo: limit = 126
+        elif '1y' in periodo: limit = 252
 
+        hist = []
+        keys = [k.strip() for k in FMP_API_KEYS.split(',') if k.strip()] if FMP_API_KEYS else []
         for fmp_key in keys:
             url = f"https://financialmodelingprep.com/api/v3/historical-price-full/{ticker}?apikey={fmp_key}"
             resp = await http_client.get(url, timeout=10.0)
             if resp.status_code == 200:
-                data = resp.json()
-                hist = data.get("historical", [])
-                break
+                hist = resp.json().get("historical", [])
+                if hist: break
             else:
                 logger.warning(f"[CHART] FMP Key fallida: {resp.status_code} - {resp.text[:100]}")
-        else:
-            logger.warning(f"[CHART] Error FMP GRAPH para {ticker}: Fallaron todas las keys ({len(keys)} intentadas).")
-            return None, 0.0
         
-        limit = 63
+        # Fallback a Alpha Vantage si FMP falla (FMP Free Tier bloquea historical)
+        if not hist:
+            av_keys = [k.strip() for k in ALPHAVANTAGE_API_KEYS.split(',') if k.strip()] if ALPHAVANTAGE_API_KEYS else []
+            for av_key in av_keys:
+                outputsize = "full" if limit > 100 else "compact"
+                url = f"https://www.alphavantage.co/query?function=TIME_SERIES_DAILY&symbol={ticker}&apikey={av_key}&outputsize={outputsize}"
+                resp = await http_client.get(url, timeout=10.0)
+                if resp.status_code == 200:
+                    ts = resp.json().get("Time Series (Daily)", {})
+                    if ts:
+                        for date, vals in ts.items():
+                            hist.append({"date": date, "close": vals.get("4. close", 0)})
+                        break
+                else:
+                    logger.warning(f"[CHART] AV Key fallida: {resp.status_code} - {resp.text[:100]}")
+
+        if not hist:
+            logger.warning(f"[CHART] Error GRAPH para {ticker}: Fallaron FMP y AV.")
+            return None, 0.0
         if '1mo' in periodo: limit = 21
         elif '6mo' in periodo: limit = 126
         elif '1y' in periodo: limit = 252
@@ -1144,23 +1160,40 @@ async def _pipeline_hibrido_interno(
         try:
             import random
             await asyncio.sleep(random.uniform(0.1, 1.5))
+            limit = 63
+            if '1mo' in temporalidad: limit = 21
+            elif '6mo' in temporalidad: limit = 126
+            elif '1y' in temporalidad: limit = 252
+
+            hist = []
             keys = [k.strip() for k in FMP_API_KEYS.split(',') if k.strip()] if FMP_API_KEYS else []
-            if keys:
-                for fmp_key in keys:
-                    url = f"https://financialmodelingprep.com/api/v3/historical-price-full/{gan['ticker']}?apikey={fmp_key}"
+            for fmp_key in keys:
+                url = f"https://financialmodelingprep.com/api/v3/historical-price-full/{gan['ticker']}?apikey={fmp_key}"
+                resp = await http_client.get(url, timeout=10.0)
+                if resp.status_code == 200:
+                    hist = resp.json().get('historical', [])
+                    if hist: break
+                else:
+                    logger.warning(f"[REND] FMP Key fallida para {gan['ticker']}: HTTP {resp.status_code} - {resp.text[:100]}")
+            
+            # Fallback a Alpha Vantage
+            if not hist:
+                av_keys = [k.strip() for k in ALPHAVANTAGE_API_KEYS.split(',') if k.strip()] if ALPHAVANTAGE_API_KEYS else []
+                for av_key in av_keys:
+                    outputsize = "full" if limit > 100 else "compact"
+                    url = f"https://www.alphavantage.co/query?function=TIME_SERIES_DAILY&symbol={gan['ticker']}&apikey={av_key}&outputsize={outputsize}"
                     resp = await http_client.get(url, timeout=10.0)
                     if resp.status_code == 200:
-                        hist = resp.json().get('historical', [])
-                        break
+                        ts = resp.json().get("Time Series (Daily)", {})
+                        if ts:
+                            for date, vals in ts.items():
+                                hist.append({"close": vals.get("4. close", 0)})
+                            break
                     else:
-                        logger.warning(f"[REND] FMP Key fallida para {gan['ticker']}: HTTP {resp.status_code} - {resp.text[:100]}")
-                else:
-                    return gan, 0.0
-                
-                limit = 63
-                if '1mo' in temporalidad: limit = 21
-                elif '6mo' in temporalidad: limit = 126
-                elif '1y' in temporalidad: limit = 252
+                        logger.warning(f"[REND] AV Key fallida para {gan['ticker']}: HTTP {resp.status_code} - {resp.text[:100]}")
+            
+            if not hist:
+                return gan, 0.0
                 hist = hist[:limit]
                 if len(hist) >= 2:
                     p_inicial = float(hist[-1].get('close', 0))

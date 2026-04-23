@@ -114,6 +114,9 @@ async def inicializar_db():
             ("cron_procesando",    "ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS cron_procesando BOOLEAN NOT NULL DEFAULT FALSE"),
             ("cron_fallos",        "ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS cron_fallos INTEGER NOT NULL DEFAULT 0"),
             ("cron_bloqueado_ts",  "ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS cron_bloqueado_ts FLOAT"),
+            ("intentos_imposibles", "ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS intentos_imposibles INTEGER NOT NULL DEFAULT 0"),
+            ("fecha_imposibles",   "ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS fecha_imposibles TEXT"),
+            ("dias_abuso_imposibles","ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS dias_abuso_imposibles INTEGER NOT NULL DEFAULT 0"),
         ]
         for _col, ddl in columnas_extra:
             try:
@@ -343,6 +346,33 @@ async def sumar_strike(tid: int):
                 'UPDATE usuarios SET "banLevel" = $1 WHERE id = $2', nuevo_ban, tid
             )
 
+async def registrar_intento_imposible(tid: int, fecha_hoy: str) -> tuple[int, int]:
+    """Registra un intento imposible. Resetea el contador si cambió el día.
+    Devuelve (intentos_hoy, dias_abuso)."""
+    pool = _get_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow("SELECT intentos_imposibles, fecha_imposibles, dias_abuso_imposibles FROM usuarios WHERE id = $1", tid)
+        if not row:
+            return 0, 0
+            
+        intentos = row["intentos_imposibles"]
+        fecha = row["fecha_imposibles"]
+        dias_abuso = row["dias_abuso_imposibles"]
+
+        if fecha != fecha_hoy:
+            intentos = 1
+        else:
+            intentos += 1
+
+        # Si hoy alcanzó exactamente 3 intentos imposibles, sumamos 1 día de abuso
+        if intentos == 3:
+            dias_abuso += 1
+            
+        await conn.execute(
+            "UPDATE usuarios SET intentos_imposibles = $1, fecha_imposibles = $2, dias_abuso_imposibles = $3 WHERE id = $4",
+            intentos, fecha_hoy, dias_abuso, tid
+        )
+        return intentos, dias_abuso
 
 async def resetear_strikes(tid: int):
     pool = _get_pool()

@@ -2213,37 +2213,6 @@ async def manejador_botones(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text(text="❌ No hay búsqueda previa registrada. Escríbeme tu consulta de inversión.")
             return
 
-        # 🛡️ Anti-Abuso: máximo 2 reintentos gratuitos por sesión de mensaje
-        reintentos_usados = context.user_data.get("reintentos_gratis", 0)
-        if reintentos_usados >= 2:
-            creditos_ret = await db.obtener_creditos(chat_id)
-            if creditos_ret <= 0:
-                teclado_pago = InlineKeyboardMarkup([
-                    [InlineKeyboardButton("💳 Recargar Créditos", url=f"{STRIPE_PAYMENT_URL}?client_reference_id={chat_id}")]
-                ])
-                await query.edit_message_text(
-                    "💳 <b>Saldo agotado.</b>\nHas alcanzado el límite de reintentos gratuitos.\nRecarga para continuar.",
-                    parse_mode="HTML", reply_markup=teclado_pago
-                )
-                return
-            # A partir del 3er reintento, cobrar 1 crédito
-            await db.restar_credito(chat_id)
-            cred_r = await db.obtener_creditos(chat_id)
-            logger.info(f"[ANTI-ABUSO] Usuario {chat_id}: reintento #{reintentos_usados+1} cobrado. Quedan {cred_r} créditos.")
-        else:
-            # Verificar solo que existan créditos para los 2 primeros reintentos
-            creditos = await db.obtener_creditos(chat_id)
-            if creditos <= 0:
-                teclado_pago = InlineKeyboardMarkup([
-                    [InlineKeyboardButton("💳 Recargar Créditos", url=f"{STRIPE_PAYMENT_URL}?client_reference_id={chat_id}")]
-                ])
-                await query.edit_message_text(
-                    text="💳 <b>Saldo agotado.</b>\nHas consumido tus análisis Quant.\nRecarga tus créditos para continuar.",
-                    parse_mode="HTML", reply_markup=teclado_pago
-                )
-                return
-
-        context.user_data["reintentos_gratis"] = reintentos_usados + 1
         await query.edit_message_text(text="🔄 Buscando activos alternativos para ti...")
         msg_espera = await query.message.reply_text("⏳ Explorando rincones secundarios del mercado...")
 
@@ -2261,12 +2230,34 @@ async def manejador_botones(update: Update, context: ContextTypes.DEFAULT_TYPE):
                  await msg_espera.edit_text(texto_final)
                  return
                  
+            from datetime import datetime
+            fecha_hoy = datetime.now().strftime("%Y-%m-%d")
+            intentos, dias_abuso = await db.registrar_intento_imposible(chat_id, fecha_hoy)
+
+            msg_aviso = ""
+            if intentos >= 3:
+                creditos_act = await db.obtener_creditos(chat_id)
+                if creditos_act <= 0:
+                    teclado_pago = InlineKeyboardMarkup([[InlineKeyboardButton("💳 Recargar Créditos", url=f"{STRIPE_PAYMENT_URL}?client_reference_id={chat_id}")]])
+                    await msg_espera.edit_text("💳 <b>Saldo agotado.</b> Has superado el límite de intentos fallidos gratuitos de hoy.", parse_mode="HTML", reply_markup=teclado_pago)
+                    return
+                await db.restar_credito(chat_id)
+                
+                if dias_abuso >= 3:
+                    await db.sumar_strike(chat_id)
+                    await db.sumar_strike(chat_id)
+                    await db.sumar_strike(chat_id) # 3 strikes = aumento de banLevel
+                
+                creditos_act = await db.obtener_creditos(chat_id)
+                msg_aviso = f"\n\n⚠️ <b>Límite diario superado.</b> Se te ha cobrado 1 crédito por este reintento imposible (Te quedan {creditos_act})."
+            else:
+                msg_aviso = f"\n\n<i>(Intento imposible {intentos}/2 gratis hoy)</i>"
+                 
             teclado_error = InlineKeyboardMarkup([
                 [InlineKeyboardButton("🔄 Reintentar con otros tickers", callback_data="reintentar")]
             ])
-            # EL FIX: Añadir la hora para que Telegram no bloquee la edición por ser texto duplicado
             hora_actual = time.strftime('%H:%M:%S')
-            texto_error_unico = f"{texto_final}\n\n<i>(Intento fallido a las {hora_actual})</i>"
+            texto_error_unico = f"{texto_final}\n\n<i>(Fallo a las {hora_actual})</i>{msg_aviso}"
             
             try:
                 await msg_espera.edit_text(texto_error_unico, reply_markup=teclado_error, parse_mode="HTML")
@@ -2573,14 +2564,38 @@ async def conversacion_inversor(update: Update, context: ContextTypes.DEFAULT_TY
         solicitud, msg_espera, fuente_datos=fuente
     )
 
-    # Error → mostrar mensaje con botón de reintento (NO cobrar)
+    # Error → mostrar mensaje con botón de reintento (NO cobrar por defecto, a menos que abuse)
     if not url_compra:
         if texto_final and texto_final.startswith("__TROLL__"):
-            # BUG FIX 1: Consulta troll detectada por IA → sumar strike en BD
             await db.sumar_strike(tid)
             texto_troll = texto_final.replace("__TROLL__ ", "", 1)
             await msg_espera.edit_text(texto_troll)
             return
+
+        from datetime import datetime
+        fecha_hoy = datetime.now().strftime("%Y-%m-%d")
+        intentos, dias_abuso = await db.registrar_intento_imposible(tid, fecha_hoy)
+
+        msg_aviso = ""
+        if intentos >= 3:
+            creditos_act = await db.obtener_creditos(tid)
+            if creditos_act <= 0:
+                teclado_pago = InlineKeyboardMarkup([[InlineKeyboardButton("💳 Recargar Créditos", url=f"{STRIPE_PAYMENT_URL}?client_reference_id={tid}")]])
+                await msg_espera.edit_text("💳 <b>Saldo agotado.</b> Has superado el límite de intentos fallidos gratuitos de hoy.", parse_mode="HTML", reply_markup=teclado_pago)
+                return
+            await db.restar_credito(tid)
+            
+            if dias_abuso >= 3:
+                await db.sumar_strike(tid)
+                await db.sumar_strike(tid)
+                await db.sumar_strike(tid) # 3 strikes fuerza un aumento de banLevel
+            
+            creditos_act = await db.obtener_creditos(tid)
+            msg_aviso = f"\n\n⚠️ <b>Límite diario superado.</b> Se te ha cobrado 1 crédito por esta búsqueda imposible (Te quedan {creditos_act})."
+        else:
+            msg_aviso = f"\n\n<i>(Intento imposible {intentos}/2 gratis hoy)</i>"
+
+        texto_con_aviso = texto_final + msg_aviso
 
         if ticker and ticker.startswith("FALLBACK_REQ_"):
             clase_req = ticker.replace("FALLBACK_REQ_", "")
@@ -2588,14 +2603,13 @@ async def conversacion_inversor(update: Update, context: ContextTypes.DEFAULT_TY
                 [InlineKeyboardButton("🔍 ¿Desea ver la alternativa más cercana encontrada?", callback_data=f"best_effort_{clase_req}")],
                 [InlineKeyboardButton("🔄 Reintentar con otros tickers", callback_data="reintentar")]
             ])
-            await msg_espera.edit_text(texto_final, reply_markup=teclado_error)
+            await msg_espera.edit_text(texto_con_aviso, reply_markup=teclado_error, parse_mode="HTML")
             return
 
-        # (si fue un fallo puramente técnico o de mercado, ponemos botón retry)
         teclado_error = InlineKeyboardMarkup([
             [InlineKeyboardButton("🔄 Reintentar con otros tickers", callback_data="reintentar")]
         ])
-        await msg_espera.edit_text(texto_final, reply_markup=teclado_error)
+        await msg_espera.edit_text(texto_con_aviso, reply_markup=teclado_error, parse_mode="HTML")
         return
 
     # Solicitud exitosa: resetear strikes en BD

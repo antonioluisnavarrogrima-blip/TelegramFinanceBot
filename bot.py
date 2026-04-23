@@ -978,7 +978,7 @@ async def _obtener_info_bulk(tickers: list[str], clase: str) -> dict:
         cached = interseccion if interseccion else dict(dataset_clase)
     return cached
 
-async def pipeline_hibrido(solicitud: str, msg_espera=None, fuente_datos: str = "yahoo"):
+async def pipeline_hibrido(solicitud: str, msg_espera=None, fuente_datos: str = "yahoo", tid: int | None = None):
     """Wrapper: ejecuta la fase NLP (barata/Gemini) fuera del semáforo y la fase
     intensiva de I/O (Yahoo/QuickChart) dentro. Así el semáforo no bloquea durante
     los reintentos NLP de 10-20 segundos.
@@ -1008,13 +1008,14 @@ async def pipeline_hibrido(solicitud: str, msg_espera=None, fuente_datos: str = 
 
     # --- FASE 2: I/O intensiva (dentro del semáforo) ---
     async with _PIPELINE_SEMA:
-        return await _pipeline_hibrido_interno(extraccion, solicitud, msg_espera, fuente_datos)
+        return await _pipeline_hibrido_interno(extraccion, solicitud, msg_espera, fuente_datos, tid=tid)
 
 async def _pipeline_hibrido_interno(
     extraccion: dict | None,
     solicitud: str,
     msg_espera=None,
-    fuente_datos: str = "yahoo"
+    fuente_datos: str = "yahoo",
+    tid: int | None = None,
 ) -> tuple[str | None, str | None, str | None, str | None]:
     """Orquesta Filtro Fundamentales → Gráfico → Goldman Sachs.
     La fase NLP ya se ejecutó en pipeline_hibrido() fuera del semáforo.
@@ -1315,6 +1316,12 @@ async def _pipeline_hibrido_interno(
 
     if not candidatos_validos:
         logger.warning(f"[PIPELINE] CERO candidatos_validos. Pre-ganadores tenían rends: {[(t for t,r in [(g['ticker'],r) for g,r in tuples_rend])]}")
+        # Guardar en BD los candidatos que sí encontramos (antes del filtro estricto de rendimiento)
+        if tid and tuples_rend:
+            candidatos_con_rend = [(g, r) for g, r in tuples_rend if r is not None]
+            if candidatos_con_rend:
+                candidatos_con_rend.sort(key=lambda x: x[1], reverse=True)
+                asyncio.ensure_future(db.guardar_best_effort_cache(tid, candidatos_con_rend))
         return (
             f"❌ Filtro Gráfico Fallido.\n"
             f"He analizado las {len(pre_ganadores)} finalistas, pero ninguna cumple "
@@ -2154,6 +2161,11 @@ async def manejador_botones(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text(text="❌ Búsqueda expirada. Escríbeme de nuevo tu consulta.")
             return
 
+        era_tres = await db.anular_intento_imposible(chat_id)
+        if era_tres:
+            # Si se le cobró penalización por llegar a 3 fallos, se la devolvemos
+            await db.actualizar_creditos(chat_id, 1)
+
         creditos = await db.obtener_creditos(chat_id)
         if creditos <= 0:
             teclado_pago = InlineKeyboardMarkup([
@@ -2166,6 +2178,58 @@ async def manejador_botones(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         await db.restar_credito(chat_id)
+        creditos_restantes = await db.obtener_creditos(chat_id)
+
+        # ── RUTA RÁPIDA: usar el caché de candidatos ya procesados ──────────
+        cache = await db.obtener_best_effort_cache(chat_id)
+        if cache:
+            await db.limpiar_best_effort_cache(chat_id)
+            await query.edit_message_text(text="⚡ Recuperando la mejor opción ya analizada...")
+            msg_espera = await query.message.reply_text("⏳ Generando gráfico...")
+
+            mejor = cache[0]  # Ya están ordenados por rendimiento desc
+            ticker = mejor["ticker"]
+            rend   = mejor["rend"]
+            gan    = mejor.get("gan", {})
+
+            # Generar gráfico (sin llamar a APIs de fundamentales)
+            grafico_bytes, _ = await fabricante_de_graficos(ticker, "3mo")
+
+            fuente = await db.obtener_fuente_datos(chat_id)
+            url_compra = FUENTES_DATOS.get(fuente, FUENTES_DATOS["yahoo"])["url"].format(ticker=ticker)
+
+            signo = "+" if rend >= 0 else ""
+            nombre = gan.get("shortName", ticker)
+            texto_final = (
+                f"⚡ <b>Mejor opción disponible: {ticker}</b>\n"
+                f"📈 Rendimiento (3mo): <b>{signo}{round(rend,2)}%</b>\n"
+                f"🏷️ {nombre}\n\n"
+                f"<i>Este activo fue el mejor resultado encontrado durante tu búsqueda. "
+                f"No cumplía exactamente tus filtros originales, pero es la opción más cercana al mercado ahora mismo.</i>\n\n"
+                f"<i>Te quedan {creditos_restantes} créditos.</i>"
+            )
+
+            broker_url = await db.obtener_broker_url(chat_id)
+            botones = []
+            if broker_url:
+                u = broker_url.replace("{ticker}", ticker) if "{ticker}" in broker_url else broker_url
+                botones.append([InlineKeyboardButton("Ejecutar Compra 🛒", url=u)])
+            botones.append([InlineKeyboardButton(f"Ver en {FUENTES_DATOS.get(fuente, FUENTES_DATOS['yahoo'])['nombre']} 📈", url=url_compra)])
+            teclado = InlineKeyboardMarkup(botones)
+
+            try:
+                if grafico_bytes:
+                    with io.BytesIO(grafico_bytes) as buf:
+                        await context.bot.send_photo(chat_id=chat_id, photo=InputFile(buf, filename=f"chart_{ticker}.webp"), caption=texto_final, reply_markup=teclado, parse_mode="HTML")
+                else:
+                    await context.bot.send_message(chat_id=chat_id, text=texto_final, reply_markup=teclado, parse_mode="HTML")
+                try: await msg_espera.delete()
+                except Exception: pass
+            except Exception as e:
+                logger.error(f"Fallo envío best effort (caché): {e}")
+            return
+
+        # ── RUTA LENTA: no había candidatos en caché (filtro fundamental eliminó todo) ──
         await query.edit_message_text(text="🔍 Relajando filtros y calculando la mejor alternativa del mercado...")
         msg_espera = await query.message.reply_text("⏳ Procesando Best Effort Quant...")
 
@@ -2173,7 +2237,7 @@ async def manejador_botones(update: Update, context: ContextTypes.DEFAULT_TYPE):
         busqueda_forzada = busqueda + " __BEST_EFFORT__"
         
         texto_final, grafico_bytes, url_compra, ticker = await pipeline_hibrido(
-            busqueda_forzada, msg_espera=msg_espera, fuente_datos=fuente
+            busqueda_forzada, msg_espera=msg_espera, fuente_datos=fuente, tid=chat_id
         )
 
         if not url_compra:
@@ -2181,7 +2245,6 @@ async def manejador_botones(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await msg_espera.edit_text(texto_final, reply_markup=teclado_error)
             return
 
-        creditos_restantes = await db.obtener_creditos(chat_id)
         texto_final += f"\n\n<i>Te quedan {creditos_restantes} créditos.</i>"
 
         broker_url = await db.obtener_broker_url(chat_id)
@@ -2222,7 +2285,7 @@ async def manejador_botones(update: Update, context: ContextTypes.DEFAULT_TYPE):
         busqueda_forzada = busqueda + " (IMPORTANTE: Esto es un reintento. Dame 10 tickers COMPLETAMENTE DISTINTOS a los habituales. Sé muy flexible con los números)."
         
         texto_final, grafico_bytes, url_compra, ticker = await pipeline_hibrido(
-            busqueda_forzada, msg_espera=msg_espera, fuente_datos=fuente
+            busqueda_forzada, msg_espera=msg_espera, fuente_datos=fuente, tid=chat_id
         )
 
         if not url_compra:
@@ -2561,7 +2624,7 @@ async def conversacion_inversor(update: Update, context: ContextTypes.DEFAULT_TY
 
     fuente = await db.obtener_fuente_datos(tid)
     texto_final, grafico_bytes, url_compra, ticker = await pipeline_hibrido(
-        solicitud, msg_espera, fuente_datos=fuente
+        solicitud, msg_espera, fuente_datos=fuente, tid=tid
     )
 
     # Error → mostrar mensaje con botón de reintento (NO cobrar por defecto, a menos que abuse)

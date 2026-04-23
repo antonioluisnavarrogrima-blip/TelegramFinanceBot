@@ -117,6 +117,7 @@ async def inicializar_db():
             ("intentos_imposibles", "ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS intentos_imposibles INTEGER NOT NULL DEFAULT 0"),
             ("fecha_imposibles",   "ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS fecha_imposibles TEXT"),
             ("dias_abuso_imposibles","ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS dias_abuso_imposibles INTEGER NOT NULL DEFAULT 0"),
+            ("best_effort_cache",   "ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS best_effort_cache JSONB"),
         ]
         for _col, ddl in columnas_extra:
             try:
@@ -373,6 +374,80 @@ async def registrar_intento_imposible(tid: int, fecha_hoy: str) -> tuple[int, in
             intentos, fecha_hoy, dias_abuso, tid
         )
         return intentos, dias_abuso
+
+async def anular_intento_imposible(tid: int) -> bool:
+    """Resta 1 al contador de intentos imposibles.
+    Si el contador estaba en 3 (justo el límite de penalización), resta 1 a dias_abuso y devuelve True para indicar que hay que reembolsar el crédito de penalización.
+    """
+    pool = _get_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow("SELECT intentos_imposibles, dias_abuso_imposibles FROM usuarios WHERE id = $1", tid)
+        if not row:
+            return False
+            
+        intentos = row["intentos_imposibles"]
+        dias_abuso = row["dias_abuso_imposibles"]
+        
+        if intentos <= 0:
+            return False
+            
+        era_tres = (intentos == 3)
+        intentos -= 1
+        
+        if era_tres and dias_abuso > 0:
+            dias_abuso -= 1
+            
+        await conn.execute(
+            "UPDATE usuarios SET intentos_imposibles = $1, dias_abuso_imposibles = $2 WHERE id = $3",
+            intentos, dias_abuso, tid
+        )
+        return era_tres
+
+async def guardar_best_effort_cache(tid: int, candidatos: list):
+    """Guarda en BD la lista de candidatos (tuples: dict_gan, rend) descartados por el filtro de rendimiento.
+    Se serializa como JSON. Se sobreescribe en cada nueva búsqueda imposible.
+    """
+    import json as _json
+    pool = _get_pool()
+    try:
+        # Serializar: [(ticker, rend, {...campos_gan...}), ...]
+        serializable = [
+            {"ticker": g["ticker"], "rend": r, "gan": {k: v for k, v in g.items() if isinstance(v, (str, int, float, bool, type(None)))}}
+            for g, r in candidatos if r is not None
+        ]
+        async with pool.acquire() as conn:
+            await conn.execute(
+                "UPDATE usuarios SET best_effort_cache = $1::jsonb WHERE id = $2",
+                _json.dumps(serializable), tid
+            )
+    except Exception as e:
+        logger.warning(f"[BEST_EFFORT_CACHE] Error guardando: {e}")
+
+async def obtener_best_effort_cache(tid: int) -> list | None:
+    """Recupera el caché de best_effort. Devuelve lista de dicts o None si no hay."""
+    import json as _json
+    pool = _get_pool()
+    try:
+        async with pool.acquire() as conn:
+            row = await conn.fetchrow("SELECT best_effort_cache FROM usuarios WHERE id = $1", tid)
+        if not row or not row["best_effort_cache"]:
+            return None
+        datos = row["best_effort_cache"]
+        if isinstance(datos, str):
+            datos = _json.loads(datos)
+        return datos  # lista de dicts {ticker, rend, gan}
+    except Exception as e:
+        logger.warning(f"[BEST_EFFORT_CACHE] Error leyendo: {e}")
+        return None
+
+async def limpiar_best_effort_cache(tid: int):
+    """Borra el caché tras usarlo, para evitar que expiren datos viejos."""
+    pool = _get_pool()
+    try:
+        async with pool.acquire() as conn:
+            await conn.execute("UPDATE usuarios SET best_effort_cache = NULL WHERE id = $1", tid)
+    except Exception as e:
+        logger.warning(f"[BEST_EFFORT_CACHE] Error limpiando: {e}")
 
 async def resetear_strikes(tid: int):
     pool = _get_pool()

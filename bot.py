@@ -545,8 +545,8 @@ async def fabricante_de_graficos(ticker: str, periodo: str = "3mo") -> tuple[byt
             if limit <= 25: range_str = "1mo"
             elif limit <= 130: range_str = "6mo"
             elif limit <= 260: range_str = "1y"
-            url = f"https://yh-finance.p.rapidapi.com/stock/v3/get-chart?symbol={ticker}&interval=1d&range={range_str}"
-            headers = {"x-rapidapi-key": RAPIDAPI_KEY, "x-rapidapi-host": "yh-finance.p.rapidapi.com"}
+            url = f"https://apidojo-yahoo-finance-v1.p.rapidapi.com/stock/v3/get-chart?symbol={ticker}&interval=1d&range={range_str}"
+            headers = {"x-rapidapi-key": RAPIDAPI_KEY, "x-rapidapi-host": "apidojo-yahoo-finance-v1.p.rapidapi.com"}
             resp = await http_client.get(url, headers=headers, timeout=10.0)
             if resp.status_code == 200:
                 result = resp.json().get("chart", {}).get("result", [])
@@ -1229,8 +1229,8 @@ async def _pipeline_hibrido_interno(
                 if limit <= 25: range_str = "1mo"
                 elif limit <= 130: range_str = "6mo"
                 elif limit <= 260: range_str = "1y"
-                url = f"https://yh-finance.p.rapidapi.com/stock/v3/get-chart?symbol={gan['ticker']}&interval=1d&range={range_str}"
-                headers = {"x-rapidapi-key": RAPIDAPI_KEY, "x-rapidapi-host": "yh-finance.p.rapidapi.com"}
+                url = f"https://apidojo-yahoo-finance-v1.p.rapidapi.com/stock/v3/get-chart?symbol={gan['ticker']}&interval=1d&range={range_str}"
+                headers = {"x-rapidapi-key": RAPIDAPI_KEY, "x-rapidapi-host": "apidojo-yahoo-finance-v1.p.rapidapi.com"}
                 resp = await http_client.get(url, headers=headers, timeout=10.0)
                 if resp.status_code == 200:
                     result = resp.json().get("chart", {}).get("result", [])

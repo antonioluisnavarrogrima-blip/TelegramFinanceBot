@@ -118,6 +118,7 @@ async def inicializar_db():
             ("fecha_imposibles",   "ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS fecha_imposibles TEXT"),
             ("dias_abuso_imposibles","ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS dias_abuso_imposibles INTEGER NOT NULL DEFAULT 0"),
             ("best_effort_cache",   "ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS best_effort_cache JSONB"),
+            ("ultima_extraccion",   "ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS ultima_extraccion JSONB"),
         ]
         for _col, ddl in columnas_extra:
             try:
@@ -142,6 +143,19 @@ async def inicializar_db():
             CREATE TABLE IF NOT EXISTS stripe_eventos (
                 event_id    TEXT PRIMARY KEY,
                 procesado_at FLOAT NOT NULL DEFAULT EXTRACT(EPOCH FROM NOW())
+            )
+        """)
+
+        # ── Tabla de Alertas de Inversión Multi-Alerta ────────────────────────
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS alertas_inversion (
+                id SERIAL PRIMARY KEY,
+                user_id BIGINT REFERENCES usuarios(id) ON DELETE CASCADE,
+                solicitud_raw TEXT NOT NULL,
+                extraccion_json JSONB NOT NULL,
+                hash_firma TEXT NOT NULL,
+                ultimo_envio FLOAT NOT NULL DEFAULT 0,
+                activa BOOLEAN NOT NULL DEFAULT TRUE
             )
         """)
 
@@ -936,3 +950,83 @@ async def guardar_yf_cache_bulk(datos: dict[str, dict], clase: str):
     except Exception as e:
         import logging
         logging.getLogger(__name__).warning(f"[YF-CACHE] Error en bulk SAVE: {e}")
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 8. MULTI-ALERTAS (SMART CRON)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+async def guardar_ultima_extraccion(tid: int, extraccion: dict):
+    pool = _get_pool()
+    async with pool.acquire() as conn:
+        await conn.execute("UPDATE usuarios SET ultima_extraccion = $1::jsonb WHERE id = $2", json.dumps(extraccion), tid)
+
+async def obtener_ultima_extraccion(tid: int) -> dict | None:
+    pool = _get_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow("SELECT ultima_extraccion FROM usuarios WHERE id = $1", tid)
+        if not row or not row["ultima_extraccion"]: return None
+        return json.loads(row["ultima_extraccion"]) if isinstance(row["ultima_extraccion"], str) else row["ultima_extraccion"]
+
+async def crear_alerta_inversion(tid: int, solicitud_raw: str, extraccion_json: dict) -> bool:
+    pool = _get_pool()
+    firma_str = json.dumps(extraccion_json, sort_keys=True)
+    import hashlib
+    hash_firma = hashlib.md5(firma_str.encode('utf-8')).hexdigest()
+    
+    async with pool.acquire() as conn:
+        count = await conn.fetchval("SELECT COUNT(*) FROM alertas_inversion WHERE user_id = $1", tid)
+        if count >= 5: # max 5 alerts per user
+            return False
+            
+        await conn.execute(
+            """
+            INSERT INTO alertas_inversion (user_id, solicitud_raw, extraccion_json, hash_firma)
+            VALUES ($1, $2, $3::jsonb, $4)
+            """,
+            tid, solicitud_raw, json.dumps(extraccion_json), hash_firma
+        )
+        return True
+
+async def listar_alertas_usuario(tid: int) -> list[dict]:
+    pool = _get_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch("SELECT id, solicitud_raw, activa, ultimo_envio FROM alertas_inversion WHERE user_id = $1 ORDER BY id ASC", tid)
+        return [dict(r) for r in rows]
+
+async def eliminar_alerta_inversion(alerta_id: int, tid: int) -> bool:
+    pool = _get_pool()
+    async with pool.acquire() as conn:
+        res = await conn.execute("DELETE FROM alertas_inversion WHERE id = $1 AND user_id = $2", alerta_id, tid)
+        return res != "DELETE 0"
+
+async def obtener_alertas_agrupadas_pendientes(intervalo_segundos: int = 86400) -> list[dict]:
+    pool = _get_pool()
+    ahora = time.time()
+    limite_tiempo = ahora - intervalo_segundos
+    
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT hash_firma, extraccion_json, array_agg(id) as alert_ids, array_agg(user_id) as user_ids, MAX(solicitud_raw) as solicitud_repr
+            FROM alertas_inversion
+            WHERE activa = TRUE AND ultimo_envio < $1
+            GROUP BY hash_firma, extraccion_json
+            """,
+            limite_tiempo
+        )
+        # Extraer JSON de asyncpg (devuelve str o dict dependiendo de la versión)
+        resultado = []
+        for r in rows:
+            d = dict(r)
+            if isinstance(d["extraccion_json"], str):
+                d["extraccion_json"] = json.loads(d["extraccion_json"])
+            resultado.append(d)
+        return resultado
+
+async def marcar_alertas_enviadas(alert_ids: list[int]):
+    if not alert_ids: return
+    pool = _get_pool()
+    ahora = time.time()
+    async with pool.acquire() as conn:
+        await conn.execute("UPDATE alertas_inversion SET ultimo_envio = $1 WHERE id = ANY($2::int[])", ahora, alert_ids)
+

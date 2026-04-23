@@ -1006,6 +1006,9 @@ async def pipeline_hibrido(solicitud: str, msg_espera=None, fuente_datos: str = 
                 return "⚠️ El motor IA está temporalmente saturado. Por favor, espera 1 minuto e inténtalo de nuevo.", None, None, None
         break
 
+    if tid and extraccion and not extraccion.get("_rate_limit"):
+        asyncio.ensure_future(db.guardar_ultima_extraccion(tid, extraccion))
+
     # --- FASE 2: I/O intensiva (dentro del semáforo) ---
     async with _PIPELINE_SEMA:
         return await _pipeline_hibrido_interno(extraccion, solicitud, msg_espera, fuente_datos, tid=tid)
@@ -2215,6 +2218,7 @@ async def manejador_botones(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 u = broker_url.replace("{ticker}", ticker) if "{ticker}" in broker_url else broker_url
                 botones.append([InlineKeyboardButton("Ejecutar Compra 🛒", url=u)])
             botones.append([InlineKeyboardButton(f"Ver en {FUENTES_DATOS.get(fuente, FUENTES_DATOS['yahoo'])['nombre']} 📈", url=url_compra)])
+            botones.append([InlineKeyboardButton(text="🔔 Crear Alerta Diaria (1 crédito/hit)", callback_data="crear_alerta")])
             teclado = InlineKeyboardMarkup(botones)
 
             try:
@@ -2254,6 +2258,7 @@ async def manejador_botones(update: Update, context: ContextTypes.DEFAULT_TYPE):
             botones.append([InlineKeyboardButton(text="Ejecutar Compra 🛒", url=url_broker_final)])
         nombre_fuente = FUENTES_DATOS.get(fuente, FUENTES_DATOS["yahoo"])["nombre"]
         botones.append([InlineKeyboardButton(text=f"Ver en {nombre_fuente} 📈", url=url_compra)])
+        botones.append([InlineKeyboardButton(text="🔔 Crear Alerta Diaria (1 crédito/hit)", callback_data="crear_alerta")])
         teclado = InlineKeyboardMarkup(botones)
 
         try:
@@ -2268,6 +2273,48 @@ async def manejador_botones(update: Update, context: ContextTypes.DEFAULT_TYPE):
             logger.error(f"Fallo envío best effort: {e}")
         return
 
+    # --- Botón Suscribirse a Alerta ---
+    if query.data == "crear_alerta":
+        busqueda = await db.obtener_ultima_busqueda(chat_id)
+        extraccion = await db.obtener_ultima_extraccion(chat_id)
+        if not busqueda or not extraccion:
+            await query.answer("❌ Error: No se pudo recuperar el contexto de la búsqueda (intenta hacer una búsqueda nueva primero).", show_alert=True)
+            return
+            
+        exito = await db.crear_alerta_inversion(chat_id, busqueda, extraccion)
+        if exito:
+            await query.answer("✅ ¡Suscrito! Te notificaremos automáticamente.", show_alert=True)
+            try:
+                # Ocultamos el botón para que no vuelva a pulsar
+                teclado_actual = query.message.reply_markup.inline_keyboard
+                nuevo_teclado = [fila for fila in teclado_actual if not any(getattr(b, 'callback_data', '') == "crear_alerta" for b in fila)]
+                await query.message.edit_reply_markup(reply_markup=InlineKeyboardMarkup(nuevo_teclado))
+            except Exception:
+                pass
+        else:
+            await query.answer("⚠️ Has alcanzado el límite máximo de 5 alertas activas. Bórralas usando /alertas.", show_alert=True)
+        return
+
+    # --- Borrar Alerta ---
+    if query.data.startswith("del_alerta_"):
+        alerta_id = int(query.data.replace("del_alerta_", ""))
+        exito = await db.eliminar_alerta_inversion(alerta_id, chat_id)
+        if exito:
+            await query.answer("🗑️ Alerta eliminada.", show_alert=False)
+            alertas = await db.listar_alertas_usuario(chat_id)
+            if not alertas:
+                await query.edit_message_text("📭 No tienes ninguna alerta activa.")
+                return
+            texto = "📋 <b>Tus Alertas Activas (Ejecución Diaria):</b>\n\n"
+            botones = []
+            for i, a in enumerate(alertas, 1):
+                req_resumen = a['solicitud_raw'][:40] + "..." if len(a['solicitud_raw']) > 40 else a['solicitud_raw']
+                texto += f"<b>{i}.</b> <i>{req_resumen}</i>\n"
+                botones.append([InlineKeyboardButton(f"🗑️ Borrar Alerta {i}", callback_data=f"del_alerta_{a['id']}")])
+            await query.edit_message_text(texto, reply_markup=InlineKeyboardMarkup(botones), parse_mode="HTML")
+        else:
+            await query.answer("❌ Error al borrar.", show_alert=True)
+        return
 
     # --- Botón Reintentar ---
     if query.data == "reintentar":
@@ -2343,6 +2390,7 @@ async def manejador_botones(update: Update, context: ContextTypes.DEFAULT_TYPE):
             botones.append([InlineKeyboardButton(text="Ejecutar Compra en Broker 🛒", url=url_broker_final)])
         nombre_fuente = FUENTES_DATOS.get(fuente, FUENTES_DATOS["yahoo"])["nombre"]
         botones.append([InlineKeyboardButton(text=f"Validar en {nombre_fuente} 📈", url=url_compra)])
+        botones.append([InlineKeyboardButton(text="🔔 Crear Alerta Diaria (1 crédito/hit)", callback_data="crear_alerta")])
         teclado = InlineKeyboardMarkup(botones)
 
         try:
@@ -2696,6 +2744,7 @@ async def conversacion_inversor(update: Update, context: ContextTypes.DEFAULT_TY
         botones.append([InlineKeyboardButton(text="Ejecutar Compra en Broker 🛒", url=url_broker_final)])
     nombre_fuente = FUENTES_DATOS.get(fuente, FUENTES_DATOS["yahoo"])["nombre"]
     botones.append([InlineKeyboardButton(text=f"Validar en {nombre_fuente} 📈", url=url_compra)])
+    botones.append([InlineKeyboardButton(text="🔔 Crear Alerta Diaria (1 crédito/hit)", callback_data="crear_alerta")])
     teclado = InlineKeyboardMarkup(botones)
 
     try:
@@ -2772,6 +2821,29 @@ telegram_app.add_handler(CommandHandler("start", comando_start))
 telegram_app.add_handler(CommandHandler("menu", comando_menu))
 telegram_app.add_handler(CallbackQueryHandler(manejador_botones))
 telegram_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, conversacion_inversor))
+
+
+# ── COMANDO /alertas ──────────────────────────────────────────────────────────
+async def comando_alertas(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    alertas = await db.listar_alertas_usuario(user_id)
+    
+    if not alertas:
+        await update.message.reply_text("📭 No tienes ninguna alerta activa.\n\nPara crear una, haz una búsqueda y pulsa el botón '🔔 Crear Alerta Diaria' en los resultados.")
+        return
+        
+    texto = "📋 <b>Tus Alertas Activas (Ejecución Diaria):</b>\n\n"
+    botones = []
+    
+    for i, a in enumerate(alertas, 1):
+        req_resumen = a['solicitud_raw'][:40] + "..." if len(a['solicitud_raw']) > 40 else a['solicitud_raw']
+        texto += f"<b>{i}.</b> <i>{req_resumen}</i>\n"
+        botones.append([InlineKeyboardButton(f"🗑️ Borrar Alerta {i}", callback_data=f"del_alerta_{a['id']}")])
+        
+    teclado = InlineKeyboardMarkup(botones)
+    await update.message.reply_text(texto, reply_markup=teclado, parse_mode="HTML")
+
+telegram_app.add_handler(CommandHandler("alertas", comando_alertas))
 
 
 # ── COMANDO /comprar ──────────────────────────────────────────────────────────
@@ -2980,210 +3052,101 @@ async def webhook_pago(request: Request):
 
 # ── SISTEMA DE ALERTAS PERSISTENTES (DB-BASED CRON) ──────────────────────────
 
-async def _ejecutar_alerta_usuario(tid: int, solicitud: str, fuente: str):
-    """Ejecuta el pipeline para un usuario y le envía el resultado. Fire-and-forget."""
-    try:
-        # 🛡️ Verificar saldo antes de lanzar el pipeline (alertas deben cobrar)
-        creditos_prev = await db.obtener_creditos(tid)
-        if creditos_prev <= 0:
-            logger.info(f"[CRON] Usuario {tid} sin créditos. Alerta pausada automáticamente.")
-            try:
-                await telegram_app.bot.send_message(
-                    chat_id=tid,
-                    text=(
-                        "⏸️ <b>Alerta pausada.</b>\n\n"
-                        "Tu saldo de créditos es 0. Recarga para que el motor siga enviándote señales automáticas."
-                    ),
-                    parse_mode="HTML"
-                )
-            except Exception:
-                pass
-            return
-
-        texto_final, grafico_bytes, url_compra, ticker = await pipeline_hibrido(
-            solicitud, msg_espera=None, fuente_datos=fuente
-        )
-        if not url_compra:
-            logger.warning(f"[CRON-DB] Sin resultado para usuario {tid}")
-            fallos = await db.incrementar_fallos_cron(tid)
-            if fallos >= 3:
-                try:
-                    await telegram_app.bot.send_message(
-                        chat_id=tid, 
-                        text="⚠️ <b>Aviso de Sistema:</b>\nHe intentado escanear tu nicho favorito en mis últimas 3 rondas y el mercado actual no ha superado nuestros estrictos filtros.\n\nPrueba a cambiar tu estrategia o fuente en el /menu.",
-                        parse_mode="HTML"
-                    )
-                except Exception:
-                    pass
-                await db.resetear_fallos_cron(tid)
-            return
-
-        # Éxito: Reseteamos fallos y procedemos
-        await db.resetear_fallos_cron(tid)
-        await db.restar_credito(tid)
-        creditos_restantes = await db.obtener_creditos(tid)
-        texto_final += f"\n\n<i>Te quedan {creditos_restantes} créditos.</i>"  # BUG FIX 5
-
-        broker_url = await db.obtener_broker_url(tid)
-        botones = []
-        if broker_url:
-            url_broker_final = broker_url.replace("{ticker}", ticker) if "{ticker}" in broker_url else broker_url
-            botones.append([InlineKeyboardButton(text="Comprar en tu Broker 🛒", url=url_broker_final)])
-        nombre_fuente = FUENTES_DATOS.get(fuente, FUENTES_DATOS["yahoo"])["nombre"]
-        botones.append([InlineKeyboardButton(text=f"Métricas en {nombre_fuente} 📈", url=url_compra)])
-        teclado = InlineKeyboardMarkup(botones)
-
+async def _enviar_resultado_cron(tid: int, texto_final: str, grafico_bytes: bytes | None, url_compra: str, ticker: str, fuente: str) -> bool:
+    creditos_prev = await db.obtener_creditos(tid)
+    if creditos_prev <= 0:
+        logger.info(f"[CRON] Usuario {tid} sin créditos. Alerta omitida.")
         try:
-            if grafico_bytes:
-                try:
-                    with io.BytesIO(grafico_bytes) as buf:
-                        # Margen súper conservador para el límite 1024 de Telegram API
-                        if len(texto_final) > 900:
-                            await telegram_app.bot.send_photo(chat_id=tid, photo=InputFile(buf, filename=f"chart_{ticker}.webp"))
-                            await telegram_app.bot.send_message(chat_id=tid, text=texto_final, reply_markup=teclado, parse_mode="HTML")
-                        else:
-                            await telegram_app.bot.send_photo(
-                                chat_id=tid, photo=InputFile(buf, filename=f"chart_{ticker}.webp"), caption=texto_final, reply_markup=teclado, parse_mode="HTML"
-                            )
-                except BadRequest:
-                    raise # Delegar fallback HTML exterior
-                except Exception as e:
-                    logger.warning(f"[CRON] Error envío de foto: {e}")
-                    await telegram_app.bot.send_message(chat_id=tid, text=texto_final, reply_markup=teclado, parse_mode="HTML")
-            else:
-                await telegram_app.bot.send_message(chat_id=tid, text=texto_final, reply_markup=teclado, parse_mode="HTML")
-        except BadRequest as e:
-            logger.warning(f"[CRON UI] Fallback a texto crudo por posible HTML inválido: {e}")
-            texto_limpio = re.sub(r'<[^>]+>', '', texto_final)
-            if grafico_bytes:
-                try:
-                    with io.BytesIO(grafico_bytes) as buf:
-                        if len(texto_limpio) > 900:
-                            await telegram_app.bot.send_photo(chat_id=tid, photo=InputFile(buf, filename=f"chart_{ticker}.webp"))
-                            await telegram_app.bot.send_message(chat_id=tid, text=texto_limpio, reply_markup=teclado, parse_mode=None)
-                        else:
-                            await telegram_app.bot.send_photo(
-                                chat_id=tid, photo=InputFile(buf, filename=f"chart_{ticker}.webp"), caption=texto_limpio, reply_markup=teclado, parse_mode=None
-                            )
-                except Exception as e:
-                    logger.warning(f"[CRON] Error envío de foto fallback: {e}")
-                    await telegram_app.bot.send_message(chat_id=tid, text=texto_limpio, reply_markup=teclado, parse_mode=None)
-            else:
-                await telegram_app.bot.send_message(chat_id=tid, text=texto_limpio, reply_markup=teclado, parse_mode=None)
-        except Exception as e:
-            logger.error(f"Fallo envío cron res: {e}")
+            await telegram_app.bot.send_message(
+                chat_id=tid,
+                text="⏸️ <b>Alerta pausada automáticamente.</b>\n\nTu saldo de créditos es 0. Recarga para recibir notificaciones automáticas.",
+                parse_mode="HTML"
+            )
+        except Exception: pass
+        return False
 
+    await db.restar_credito(tid)
+    creditos_restantes = creditos_prev - 1
+    texto_personalizado = texto_final + f"\n\n<i>Te quedan {creditos_restantes} créditos.</i>"
+
+    broker_url = await db.obtener_broker_url(tid)
+    botones = []
+    if broker_url:
+        u = broker_url.replace("{ticker}", ticker) if "{ticker}" in broker_url else broker_url
+        botones.append([InlineKeyboardButton("Comprar en tu Broker 🛒", url=u)])
+    nf = FUENTES_DATOS.get(fuente, FUENTES_DATOS["yahoo"])["nombre"]
+    botones.append([InlineKeyboardButton(f"Validar en {nf} 📈", url=url_compra)])
+    teclado = InlineKeyboardMarkup(botones)
+
+    try:
+        if grafico_bytes:
+            with io.BytesIO(grafico_bytes) as buf:
+                if len(texto_personalizado) > 900:
+                    await telegram_app.bot.send_photo(chat_id=tid, photo=InputFile(buf, filename=f"chart_{ticker}.webp"))
+                    await telegram_app.bot.send_message(chat_id=tid, text=texto_personalizado, reply_markup=teclado, parse_mode="HTML")
+                else:
+                    await telegram_app.bot.send_photo(chat_id=tid, photo=InputFile(buf, filename=f"chart_{ticker}.webp"), caption=texto_personalizado, reply_markup=teclado, parse_mode="HTML")
+        else:
+            await telegram_app.bot.send_message(chat_id=tid, text=texto_personalizado, reply_markup=teclado, parse_mode="HTML")
+    except BadRequest as e:
+        logger.warning(f"[CRON UI] Fallback texto crudo: {e}")
+        texto_limpio = re.sub(r'<[^>]+>', '', texto_personalizado)
+        await telegram_app.bot.send_message(chat_id=tid, text=texto_limpio, reply_markup=teclado, parse_mode=None)
     except Exception as e:
-        logger.error(f"[CRON-DB] Error ejecutando alerta para usuario {tid}: {e}")
+        logger.error(f"Fallo envío cron al user {tid}: {e}")
+        return False
+        
+    return True
 
-
-_usuarios_en_cron = set()
-
-
-async def procesador_lotes_cron(lista_usuarios: list):
-    """Procesa alertas con concurrencia controlada para equilibrar carga y velocidad."""
-    async def _worker_usuario(item):
-        if _CRON_SEMA is None:
-            logger.error("[CRON] Semáforo no inicializado")
-            return
-        async with _CRON_SEMA:
-            tid = item['tid']
-            try:
-                # Jitter aleatorio (0 a 3s) para no golpear la DB o APIs exactamente a la vez
-                await asyncio.sleep(random.uniform(0, 3.0)) 
-                await _ejecutar_alerta_usuario(tid, item['solicitud'], item['fuente'])
-                # Mover la actualización de la BD aquí para confirmar el éxito de ejecución
-                await db.desbloquear_y_actualizar_cron(tid, time.time())
-            except Exception as e:
-                logger.error(f"[CRON QUEUE] Error procesando al usuario {tid}: {e}")
-                await db.desbloquear_cron_fallido(tid)
-            finally:
-                _usuarios_en_cron.discard(tid)
-
-    # Lanza todas las tareas, el semáforo se encargará de que solo 5 corran simultáneamente
-    tareas = [_worker_usuario(item) for item in lista_usuarios]
-    await asyncio.gather(*tareas)
 
 @web_app.post("/cron/ejecutar")
 async def cron_ejecutar(request: Request, background_tasks: BackgroundTasks):
-    """
-    Endpoint llamado por el servicio externo (cron-job.org) cada hora.
-    Lee la BD, localiza usuarios con alerta activa y lanza su pipeline.
-    Requiere el header X-Cron-Secret configurado en CRON_SECRET.
-    """
     secret = request.headers.get("X-Cron-Secret", "")
     if not CRON_SECRET or secret != CRON_SECRET:
         raise HTTPException(status_code=403, detail="Forbidden")
 
-    # ── SWEEPER: Rescate de deadlocks (Enterprise Pattern) ────────────────────
-    # Si el proceso del cron murió en una ejecución anterior, los usuarios con
-    # cron_procesando = TRUE quedan bloqueados para siempre. Esta llamada los
-    # libera automáticamente si llevan más de 60 minutos bloqueados.
-    await db.rescatar_bloqueos_cron_muertos(max_edad_segundos=3600)
+    grupos = await db.obtener_alertas_agrupadas_pendientes(intervalo_segundos=86400) # 24h
+    if not grupos:
+        return {"ok": True, "msg": "No hay alertas pendientes."}
 
-    ahora = time.time()
-    ejecutados = 0
-    omitidos = 0
-    
-    # Paginación de usuarios para evitar saturar RAM en Render (v4.3)
-    limit = 50
-    offset = 0
-    
-    while True:
-        usuarios = await db.obtener_usuarios_con_alerta(limit=limit, offset=offset)
-        if not usuarios:
-            break
+    async def procesador_grupos(lote_grupos):
+        for g in lote_grupos:
+            hash_firma = g["hash_firma"]
+            extraccion = g["extraccion_json"]
+            alert_ids = g["alert_ids"]
+            user_ids = g["user_ids"]
+            solicitud_repr = g["solicitud_repr"]
             
-        lote_activo = []
-        ids_por_bloquear = []
-
-        for usuario in usuarios:
-            tid             = usuario["id"]
-            intervalo_s     = (usuario["alerta_intervalo"] or 6) * 3600
-            ultima_alerta   = float(usuario["ultima_alerta"] or 0)
-            solicitud       = usuario["ultima_busqueda"]
-            fuente          = usuario["fuente_datos"] or "yahoo"
-
-            if ahora - ultima_alerta < intervalo_s:
-                omitidos += 1
+            logger.info(f"[CRON MULTI] Procesando Hash: {hash_firma} para {len(user_ids)} usuarios.")
+            
+            # 1. Pipeline Cuantitativo Lote (Saltando Gemini)
+            try:
+                texto_final, grafico_bytes, url_compra, ticker = await _pipeline_hibrido_interno(
+                    extraccion=extraccion,
+                    solicitud=solicitud_repr,
+                    msg_espera=None,
+                    fuente_datos="yahoo",
+                    tid=user_ids[0]
+                )
+            except Exception as e:
+                logger.error(f"[CRON MULTI] Error pipeline en Hash {hash_firma}: {e}")
                 continue
-
-            creditos = await db.obtener_creditos(tid)
-            if creditos <= 0:
-                await db.actualizar_alerta(tid, None)
-                try:
-                    teclado_pago = InlineKeyboardMarkup([[
-                        InlineKeyboardButton("💳 Recargar", url=f"{STRIPE_PAYMENT_URL}?client_reference_id={tid}")
-                    ]])
-                    await telegram_app.bot.send_message(
-                        chat_id=tid,
-                        text="💳 <b>Alerta Cron Pausada</b>\n\nSin créditos. Recarga y reactiva desde /menu.",
-                        parse_mode="HTML", reply_markup=teclado_pago
-                    )
-                except Exception as e: logger.debug(f'Ignorado: {e}')
-                continue
-
-            async with _CRON_LOCK:
-                if tid in _usuarios_en_cron:
-                    omitidos += 1
-                    continue
-                _usuarios_en_cron.add(tid)
-            lote_activo.append({"tid": tid, "solicitud": solicitud, "fuente": fuente})
-            ids_por_bloquear.append(tid)
-            ejecutados += 1
-
-        if lote_activo:
-            exito_bloqueo = await db.bloquear_lote_cron(ids_por_bloquear)
-            if exito_bloqueo:
-                background_tasks.add_task(procesador_lotes_cron, lote_activo)
+                
+            # 2. Distribución y Cobro
+            if url_compra:
+                for tid in set(user_ids):
+                    # Jitter aleatorio
+                    await asyncio.sleep(random.uniform(0, 1.5))
+                    fuente = await db.obtener_fuente_datos(tid)
+                    await _enviar_resultado_cron(tid, texto_final, grafico_bytes, url_compra, ticker, fuente)
+                
+                # Marcar enviadas para no repetir hasta mañana
+                await db.marcar_alertas_enviadas(alert_ids)
             else:
-                for tid in ids_por_bloquear: _usuarios_en_cron.discard(tid)
+                logger.warning(f"[CRON MULTI] Sin resultados validos para Hash {hash_firma}.")
 
-        if len(usuarios) < limit:
-            break
-        offset += limit
-
-    return {"ok": True, "ejecutados": ejecutados, "omitidos": omitidos}
+    background_tasks.add_task(procesador_grupos, grupos)
+    return {"ok": True, "grupos_procesados": len(grupos)}
 
 
 @web_app.post("/admin/actualizar_seeds")

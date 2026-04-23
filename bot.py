@@ -1239,23 +1239,24 @@ async def _pipeline_hibrido_interno(
                     logger.warning(f"[REND] Yahoo Fallback falló para {gan['ticker']}: {e}")
 
             if not hist:
-                return gan, 0.0
-                hist = hist[:limit]
-                if len(hist) >= 2:
-                    p_inicial = float(hist[-1].get('close', 0))
-                    p_final = float(hist[0].get('close', 0))
-                    if p_inicial > 0:
-                        gan['rendimiento_hist'] = round(((p_final - p_inicial)/p_inicial)*100, 2)
-            return gan, gan.get('rendimiento_hist', 0.0)
+                return gan, None
+            
+            hist = hist[:limit]
+            if len(hist) >= 2:
+                p_inicial = float(hist[-1].get('close', 0))
+                p_final = float(hist[0].get('close', 0))
+                if p_inicial > 0:
+                    gan['rendimiento_hist'] = round(((p_final - p_inicial)/p_inicial)*100, 2)
+            return gan, gan.get('rendimiento_hist', None)
         except Exception as e:
             logger.warning(f"[REND PREFETCH] {gan['ticker']}: ERROR {type(e).__name__}: {e}")
-            return gan, 0.0
+            return gan, None
 
     tuples_rend = await asyncio.gather(*(_fetch_rend_solo(g) for g in pre_ganadores))
 
     candidatos_validos = [
         (gan, rend) for gan, rend in tuples_rend
-        if gan.get("_best_effort", False) or rendimiento_op(rend, rendimiento_objetivo)
+        if rend is not None and (gan.get("_best_effort", False) or rendimiento_op(rend, rendimiento_objetivo))
     ]
     candidatos_validos.sort(key=lambda x: x[1], reverse=True)
 

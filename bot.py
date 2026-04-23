@@ -1380,14 +1380,14 @@ async def _pipeline_hibrido_interno(
 
 
 
-# --- 4b. SISTEMA DE AN\u00c1LISIS POR TABLA (sin IA) ---
+# --- 4b. SISTEMA DE ANÁLISIS POR TABLA (sin IA) ---
 
 async def _pipeline_por_tabla(
     clase_activo: str,
     filtros_tabla: dict,
     msg_espera=None
 ) -> tuple[str | None, bytes | None, str | None]:
-    """Screener determin\u00edstico sin IA. Retorna (texto, bytes_grafico, ticker)."""
+    """Screener determinístico sin IA. Retorna (texto, bytes_grafico, ticker)."""
     clase_activo = clase_activo.upper()
     sector_tabla = filtros_tabla.get("sector")
     if sector_tabla == "__all__":
@@ -1397,11 +1397,11 @@ async def _pipeline_por_tabla(
     if not tickers:
         tickers = await db.obtener_semillas_busqueda(clase_activo)
     if not tickers:
-        return "\u274c No hay activos registrados para esa categor\u00eda.", None, None
+        return "❌ No hay activos registrados para esa categoría.", None, None
 
     if msg_espera:
         try:
-            await msg_espera.edit_text(f"\ud83d\udd0d Escaneando {len(tickers)} activos {clase_activo} en Financial Modeling Prep...")
+            await msg_espera.edit_text(f"🔍 Escaneando {len(tickers)} activos {clase_activo} en Financial Modeling Prep...")
         except Exception:
             pass
 
@@ -1478,11 +1478,11 @@ async def _pipeline_por_tabla(
         except asyncio.TimeoutError:
             ganadores = []
     else:
-        return f"\u274c Clase no reconocida: {clase_activo}.", None, None
+        return f"❌ Clase no reconocida: {clase_activo}.", None, None
 
     if not ganadores:
         return (
-            f"\u274c Ning\u00fan activo {clase_activo} cumple los filtros especificados.\n"
+            f"❌ Ningún activo {clase_activo} cumple los filtros especificados.\n"
             "Prueba a relajar los umbrales.",
             None, None
         )
@@ -1507,58 +1507,58 @@ async def _pipeline_por_tabla(
 
 
 def _formatear_resultado_tabla(datos: dict, clase_activo: str) -> str:
-    """Formatea el resultado del an\u00e1lisis por tabla en un mensaje Telegram legible."""
+    """Formatea el resultado del análisis por tabla en un mensaje Telegram legible."""
     ticker = datos.get("ticker", "?")
     rend   = datos.get("rendimiento_real", 0.0)
-    EMOJIS = {"ACCION": "\ud83c\udfe2", "REIT": "\ud83c\udfe0", "ETF": "\ud83d\udcc8", "CRIPTO": "\u20bf", "BONO": "\ud83d\udcdc"}
-    emoji  = EMOJIS.get(clase_activo, "\ud83d\udcca")
+    EMOJIS = {"ACCION": "🏢", "REIT": "🏠", "ETF": "📈", "CRIPTO": "₿", "BONO": "📜"}
+    emoji  = EMOJIS.get(clase_activo, "📊")
 
     lineas = [
-        f"\ud83d\udcca <b>RESULTADO \u2014 AN\u00c1LISIS POR TABLA</b>",
+        f"📊 <b>RESULTADO — ANÁLISIS POR TABLA</b>",
         f"",
         f"{emoji} <b>Ticker:</b> {ticker}",
-        f"\ud83d\uddc2 <b>Clase:</b> {clase_activo}",
+        f"🗂 <b>Clase:</b> {clase_activo}",
         f"",
-        f"\ud83d\udcc8 <b>M\u00e9tricas verificadas:</b>",
+        f"📈 <b>Métricas verificadas:</b>",
     ]
     if clase_activo == "ACCION":
         if datos.get("per") not in (None, "N/A"):
-            lineas.append(f"  \u2022 PER: <b>{datos['per']}</b>")
+            lineas.append(f"  • PER: <b>{datos['per']}</b>")
         if datos.get("div_yield_pct") is not None:
-            lineas.append(f"  \u2022 Dividendo Yield: <b>{datos['div_yield_pct']}%</b>")
+            lineas.append(f"  • Dividendo Yield: <b>{datos['div_yield_pct']}%</b>")
         if datos.get("div_rate_abs"):
-            lineas.append(f"  \u2022 Dividendo Abs.: <b>${datos['div_rate_abs']}/a\u00f1o</b>")
+            lineas.append(f"  • Dividendo Abs.: <b>${datos['div_rate_abs']}/año</b>")
     elif clase_activo == "REIT":
         if datos.get("div_yield_pct"):
-            lineas.append(f"  \u2022 Dividend Yield: <b>{datos['div_yield_pct']}%</b>")
+            lineas.append(f"  • Dividend Yield: <b>{datos['div_yield_pct']}%</b>")
         if datos.get("p_ffo_proxy") not in (None, "N/A"):
-            lineas.append(f"  \u2022 P/FFO (proxy): <b>{datos['p_ffo_proxy']}x</b>")
+            lineas.append(f"  • P/FFO (proxy): <b>{datos['p_ffo_proxy']}x</b>")
         if datos.get("sector"):
-            lineas.append(f"  \u2022 Subsector: <b>{datos['sector']}</b>")
+            lineas.append(f"  • Subsector: <b>{datos['sector']}</b>")
     elif clase_activo == "ETF":
         if datos.get("ter_pct") not in (None, "N/A"):
-            lineas.append(f"  \u2022 TER anual: <b>{datos['ter_pct']}%</b>")
+            lineas.append(f"  • TER anual: <b>{datos['ter_pct']}%</b>")
         if datos.get("aum_bn"):
-            lineas.append(f"  \u2022 AUM: <b>{datos['aum_bn']} Bn USD</b>")
+            lineas.append(f"  • AUM: <b>{datos['aum_bn']} Bn USD</b>")
         if datos.get("div_yield_pct"):
-            lineas.append(f"  \u2022 Dividend Yield: <b>{datos['div_yield_pct']}%</b>")
+            lineas.append(f"  • Dividend Yield: <b>{datos['div_yield_pct']}%</b>")
     elif clase_activo == "CRIPTO":
         if datos.get("market_cap_bn"):
-            lineas.append(f"  \u2022 Market Cap: <b>{datos['market_cap_bn']} Bn USD</b>")
+            lineas.append(f"  • Market Cap: <b>{datos['market_cap_bn']} Bn USD</b>")
         if datos.get("nombre"):
-            lineas.append(f"  \u2022 Nombre: <b>{datos['nombre']}</b>")
+            lineas.append(f"  • Nombre: <b>{datos['nombre']}</b>")
     elif clase_activo == "BONO":
         if datos.get("ytm_proxy_pct"):
-            lineas.append(f"  \u2022 YTM / Cup\u00f3n: <b>{datos['ytm_proxy_pct']}%</b>")
+            lineas.append(f"  • YTM / Cupón: <b>{datos['ytm_proxy_pct']}%</b>")
         if datos.get("aum_bn"):
-            lineas.append(f"  \u2022 AUM: <b>{datos['aum_bn']} Bn USD</b>")
+            lineas.append(f"  • AUM: <b>{datos['aum_bn']} Bn USD</b>")
         if datos.get("nombre"):
-            lineas.append(f"  \u2022 Nombre: <b>{datos['nombre']}</b>")
+            lineas.append(f"  • Nombre: <b>{datos['nombre']}</b>")
 
     rend_str = f"+{rend}%" if rend >= 0 else f"{rend}%"
-    lineas.append(f"  \u2022 Momentum 3m: <b>{rend_str}</b>")
+    lineas.append(f"  • Momentum 3m: <b>{rend_str}</b>")
     lineas.append("")
-    lineas.append("<i>\u2139\ufe0f An\u00e1lisis determin\u00edstico sin IA. Para un informe Goldman Sachs completo, usa la b\u00fasqueda libre.</i>")
+    lineas.append("<i>ℹ️ Análisis determinístico sin IA. Para un informe Goldman Sachs completo, usa la búsqueda libre.</i>")
     return "\n".join(lineas)
 
 
@@ -1576,11 +1576,11 @@ async def _enviar_pregunta_tabla(query, context, clase: str, paso: int):
             botones.append(fila); fila = []
     if fila:
         botones.append(fila)
-    botones.append([InlineKeyboardButton("\u2b05\ufe0f Cancelar", callback_data="volver_menu")])
+    botones.append([InlineKeyboardButton("⬅️ Cancelar", callback_data="volver_menu")])
     await query.edit_message_text(
-        f"\ud83d\udcca <b>AN\u00c1LISIS POR TABLA \u2014 {clase}</b> ({paso+1}/{total})\n\n"
+        f"📊 <b>ANÁLISIS POR TABLA — {clase}</b> ({paso+1}/{total})\n\n"
         f"<b>{campo['label']}</b>\n\n"
-        "Selecciona una opci\u00f3n:",
+        "Selecciona una opción:",
         reply_markup=InlineKeyboardMarkup(botones),
         parse_mode="HTML"
     )
@@ -1600,11 +1600,11 @@ async def _enviar_pregunta_tabla_message(update, context, clase: str, paso: int)
             botones.append(fila); fila = []
     if fila:
         botones.append(fila)
-    botones.append([InlineKeyboardButton("\u2b05\ufe0f Cancelar", callback_data="volver_menu")])
+    botones.append([InlineKeyboardButton("⬅️ Cancelar", callback_data="volver_menu")])
     await update.message.reply_text(
-        f"\ud83d\udcca <b>AN\u00c1LISIS POR TABLA \u2014 {clase}</b> ({paso+1}/{total})\n\n"
+        f"📊 <b>ANÁLISIS POR TABLA — {clase}</b> ({paso+1}/{total})\n\n"
         f"<b>{campo['label']}</b>\n\n"
-        "Selecciona una opci\u00f3n:",
+        "Selecciona una opción:",
         reply_markup=InlineKeyboardMarkup(botones),
         parse_mode="HTML"
     )
@@ -1617,11 +1617,11 @@ async def _ejecutar_tabla_wizard(query, context, chat_id: int):
     respuestas = wizard.get("respuestas", {})
     context.user_data["tabla_wizard"] = {}
 
-    await query.edit_message_text("\u23f3 Ejecutando criba sin IA... Por favor espera.")
+    await query.edit_message_text("⏳ Ejecutando criba sin IA... Por favor espera.")
     texto, grafico_bytes, ticker = await _pipeline_por_tabla(clase, respuestas)
 
     if not ticker:
-        await query.edit_message_text(texto or "\u274c No se encontraron activos con esos filtros.")
+        await query.edit_message_text(texto or "❌ No se encontraron activos con esos filtros.")
         return
 
     # Bloque de facturación estricto para Wizard
@@ -1640,8 +1640,8 @@ async def _ejecutar_tabla_wizard(query, context, chat_id: int):
     botones = []
     if broker_url:
         u = broker_url.replace("{ticker}", ticker) if "{ticker}" in broker_url else broker_url
-        botones.append([InlineKeyboardButton("Comprar en Broker \ud83d\uded2", url=u)])
-    botones.append([InlineKeyboardButton(f"Ver en {fuente_info['nombre']} \ud83d\udcc8", url=url_chart)])
+        botones.append([InlineKeyboardButton("Comprar en Broker 🛒", url=u)])
+    botones.append([InlineKeyboardButton(f"Ver en {fuente_info['nombre']} 📈", url=url_chart)])
     teclado = InlineKeyboardMarkup(botones)
 
     try:
@@ -1667,11 +1667,11 @@ async def _ejecutar_tabla_desde_message(update, context, chat_id: int):
     respuestas = wizard.get("respuestas", {})
     context.user_data["tabla_wizard"] = {}
 
-    msg = await update.message.reply_text("\u23f3 Ejecutando criba sin IA... Por favor espera.")
+    msg = await update.message.reply_text("⏳ Ejecutando criba sin IA... Por favor espera.")
     texto, grafico_bytes, ticker = await _pipeline_por_tabla(clase, respuestas)
 
     if not ticker:
-        await msg.edit_text(texto or "\u274c No se encontraron activos con esos filtros.")
+        await msg.edit_text(texto or "❌ No se encontraron activos con esos filtros.")
         return
 
     # Bloque de facturación estricto para Wizard
@@ -1881,7 +1881,7 @@ async def manejador_botones(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # --- An\u00e1lisis por Tabla (sin IA) ---
+    # --- Análisis por Tabla (sin IA) ---
     if query.data == "tabla_input":
         # 🛡️ Verificar créditos antes de entrar al wizard (evita UX frustrante)
         creditos_tab = await db.obtener_creditos(chat_id)
@@ -1896,17 +1896,17 @@ async def manejador_botones(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         context.user_data["tabla_wizard"] = {}
         botones = [
-            [InlineKeyboardButton("\ud83c\udfe2 Acciones",  callback_data="tabla_clase_ACCION"),
-             InlineKeyboardButton("\ud83d\udcc8 ETFs",      callback_data="tabla_clase_ETF")],
-            [InlineKeyboardButton("\ud83c\udfe0 REITs",    callback_data="tabla_clase_REIT"),
-             InlineKeyboardButton("\u20bf Cripto",         callback_data="tabla_clase_CRIPTO")],
-            [InlineKeyboardButton("\ud83d\udcdc Bonos",    callback_data="tabla_clase_BONO")],
-            [InlineKeyboardButton("\u2b05\ufe0f Volver",   callback_data="volver_menu")],
+            [InlineKeyboardButton("🏢 Acciones",  callback_data="tabla_clase_ACCION"),
+             InlineKeyboardButton("📈 ETFs",      callback_data="tabla_clase_ETF")],
+            [InlineKeyboardButton("🏠 REITs",    callback_data="tabla_clase_REIT"),
+             InlineKeyboardButton("₿ Cripto",         callback_data="tabla_clase_CRIPTO")],
+            [InlineKeyboardButton("📜 Bonos",    callback_data="tabla_clase_BONO")],
+            [InlineKeyboardButton("⬅️ Volver",   callback_data="volver_menu")],
         ]
         await query.edit_message_text(
-            "\ud83d\udcca <b>AN\u00c1LISIS POR TABLA</b>\n\n"
+            "📊 <b>ANÁLISIS POR TABLA</b>\n\n"
             "Selecciona el tipo de activo a cribar.\n"
-            "<i>No se usa IA \u2014 solo datos reales de Financial Modeling Prep en tiempo real.</i>",
+            "<i>No se usa IA — solo datos reales de Financial Modeling Prep en tiempo real.</i>",
             reply_markup=InlineKeyboardMarkup(botones),
             parse_mode="HTML"
         )
@@ -1915,7 +1915,7 @@ async def manejador_botones(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if query.data.startswith("tabla_clase_"):
         clase = query.data.replace("tabla_clase_", "")
         if clase not in TABLA_CAMPOS:
-            await query.edit_message_text("\u274c Clase de activo no reconocida.")
+            await query.edit_message_text("❌ Clase de activo no reconocida.")
             return
         context.user_data["tabla_wizard"] = {"clase": clase, "paso": 0, "respuestas": {}, "esperando_texto": False}
         await _enviar_pregunta_tabla(query, context, clase, 0)

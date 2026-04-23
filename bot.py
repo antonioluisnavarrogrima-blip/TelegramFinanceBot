@@ -1036,8 +1036,16 @@ async def _pipeline_hibrido_interno(
             "  • 'REITs con rentabilidad alta'",
             None, None, None
         )
-
     clase_activo = extraccion.get("clase_activo", "ACCION").upper()
+    
+    # EL FIX: Modo Best Effort -> Ignorar filtros restrictivos
+    es_best_effort = "__BEST_EFFORT__" in solicitud
+    if es_best_effort:
+        extraccion["filtros_dinamicos"] = []
+        extraccion["tickers_manuales"] = []
+        extraccion["tickers"] = []
+        # Si el usuario pidio best_effort, limpiamos la solicitud para no confundir a los analistas
+        solicitud = solicitud.replace("__BEST_EFFORT__", "").strip()
     perfil = extraccion.get("perfil", "Balanceado")
     sector_ia = extraccion.get("sector")
     filtros_dinamicos_raw = extraccion.get("filtros_dinamicos", [])
@@ -1299,7 +1307,7 @@ async def _pipeline_hibrido_interno(
 
     candidatos_validos = [
         (gan, rend) for gan, rend in tuples_rend
-        if rend is not None and (gan.get("_best_effort", False) or rendimiento_op(rend, rendimiento_objetivo))
+        if rend is not None and (es_best_effort or gan.get("_best_effort", False) or rendimiento_op(rend, rendimiento_objetivo))
     ]
     candidatos_validos.sort(key=lambda x: x[1], reverse=True)
 
@@ -2137,6 +2145,66 @@ async def manejador_botones(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await context.bot.send_message(chat_id=chat_id, text=re.sub(r'<[^>]+>', '', texto_final), reply_markup=teclado_final)
             
         return
+
+    # --- Botón Best Effort ---
+    if query.data.startswith("best_effort_"):
+        clase = query.data.replace("best_effort_", "")
+        busqueda = await db.obtener_ultima_busqueda(chat_id)
+        if not busqueda:
+            await query.edit_message_text(text="❌ Búsqueda expirada. Escríbeme de nuevo tu consulta.")
+            return
+
+        creditos = await db.obtener_creditos(chat_id)
+        if creditos <= 0:
+            teclado_pago = InlineKeyboardMarkup([
+                [InlineKeyboardButton("💳 Recargar Créditos", url=f"{STRIPE_PAYMENT_URL}?client_reference_id={chat_id}")]
+            ])
+            await query.edit_message_text(
+                "💳 <b>Saldo agotado.</b>\nRecarga para ver la mejor alternativa.",
+                parse_mode="HTML", reply_markup=teclado_pago
+            )
+            return
+
+        await db.restar_credito(chat_id)
+        await query.edit_message_text(text="🔍 Relajando filtros y calculando la mejor alternativa del mercado...")
+        msg_espera = await query.message.reply_text("⏳ Procesando Best Effort Quant...")
+
+        fuente = await db.obtener_fuente_datos(chat_id)
+        busqueda_forzada = busqueda + " __BEST_EFFORT__"
+        
+        texto_final, grafico_bytes, url_compra, ticker = await pipeline_hibrido(
+            busqueda_forzada, msg_espera=msg_espera, fuente_datos=fuente
+        )
+
+        if not url_compra:
+            teclado_error = InlineKeyboardMarkup([[InlineKeyboardButton("🔄 Reintentar", callback_data="reintentar")]])
+            await msg_espera.edit_text(texto_final, reply_markup=teclado_error)
+            return
+
+        creditos_restantes = await db.obtener_creditos(chat_id)
+        texto_final += f"\n\n<i>Te quedan {creditos_restantes} créditos.</i>"
+
+        broker_url = await db.obtener_broker_url(chat_id)
+        botones = []
+        if broker_url:
+            url_broker_final = broker_url.replace("{ticker}", ticker) if "{ticker}" in broker_url else broker_url
+            botones.append([InlineKeyboardButton(text="Ejecutar Compra 🛒", url=url_broker_final)])
+        nombre_fuente = FUENTES_DATOS.get(fuente, FUENTES_DATOS["yahoo"])["nombre"]
+        botones.append([InlineKeyboardButton(text=f"Ver en {nombre_fuente} 📈", url=url_compra)])
+        teclado = InlineKeyboardMarkup(botones)
+
+        try:
+            if grafico_bytes:
+                with io.BytesIO(grafico_bytes) as buf:
+                    await context.bot.send_photo(chat_id=chat_id, photo=InputFile(buf, filename=f"chart_{ticker}.webp"), caption=texto_final, reply_markup=teclado, parse_mode="HTML")
+            else:
+                await context.bot.send_message(chat_id=chat_id, text=texto_final, reply_markup=teclado, parse_mode="HTML")
+            try: await msg_espera.delete()
+            except Exception: pass
+        except Exception as e:
+            logger.error(f"Fallo envío best effort: {e}")
+        return
+
 
     # --- Botón Reintentar ---
     if query.data == "reintentar":

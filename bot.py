@@ -2293,28 +2293,31 @@ async def manejador_botones(update: Update, context: ContextTypes.DEFAULT_TYPE):
                  await msg_espera.edit_text(texto_final)
                  return
                  
-            from datetime import datetime
-            fecha_hoy = datetime.now().strftime("%Y-%m-%d")
-            intentos, dias_abuso = await db.registrar_intento_imposible(chat_id, fecha_hoy)
-
+            es_imposible = (ticker and ticker.startswith("FALLBACK_REQ_")) or (texto_final and "Filtro Gráfico Fallido" in texto_final)
             msg_aviso = ""
-            if intentos >= 3:
-                creditos_act = await db.obtener_creditos(chat_id)
-                if creditos_act <= 0:
-                    teclado_pago = InlineKeyboardMarkup([[InlineKeyboardButton("💳 Recargar Créditos", url=f"{STRIPE_PAYMENT_URL}?client_reference_id={chat_id}")]])
-                    await msg_espera.edit_text("💳 <b>Saldo agotado.</b> Has superado el límite de intentos fallidos gratuitos de hoy.", parse_mode="HTML", reply_markup=teclado_pago)
-                    return
-                await db.restar_credito(chat_id)
-                
-                if dias_abuso >= 3:
-                    await db.sumar_strike(chat_id)
-                    await db.sumar_strike(chat_id)
-                    await db.sumar_strike(chat_id) # 3 strikes = aumento de banLevel
-                
-                creditos_act = await db.obtener_creditos(chat_id)
-                msg_aviso = f"\n\n⚠️ <b>Límite diario superado.</b> Se te ha cobrado 1 crédito por este reintento imposible (Te quedan {creditos_act})."
-            else:
-                msg_aviso = f"\n\n<i>(Intento imposible {intentos}/2 gratis hoy)</i>"
+
+            if es_imposible:
+                from datetime import datetime
+                fecha_hoy = datetime.now().strftime("%Y-%m-%d")
+                intentos, dias_abuso = await db.registrar_intento_imposible(chat_id, fecha_hoy)
+
+                if intentos >= 3:
+                    creditos_act = await db.obtener_creditos(chat_id)
+                    if creditos_act <= 0:
+                        teclado_pago = InlineKeyboardMarkup([[InlineKeyboardButton("💳 Recargar Créditos", url=f"{STRIPE_PAYMENT_URL}?client_reference_id={chat_id}")]])
+                        await msg_espera.edit_text("💳 <b>Saldo agotado.</b> Has superado el límite de intentos fallidos gratuitos de hoy.", parse_mode="HTML", reply_markup=teclado_pago)
+                        return
+                    await db.restar_credito(chat_id)
+                    
+                    if dias_abuso >= 3:
+                        await db.sumar_strike(chat_id)
+                        await db.sumar_strike(chat_id)
+                        await db.sumar_strike(chat_id) # 3 strikes = aumento de banLevel
+                    
+                    creditos_act = await db.obtener_creditos(chat_id)
+                    msg_aviso = f"\n\n⚠️ <b>Límite diario superado.</b> Se te ha cobrado 1 crédito por este reintento imposible (Te quedan {creditos_act})."
+                else:
+                    msg_aviso = f"\n\n<i>(Intento imposible {intentos}/2 gratis hoy)</i>"
                  
             teclado_error = InlineKeyboardMarkup([
                 [InlineKeyboardButton("🔄 Reintentar con otros tickers", callback_data="reintentar")]
@@ -2635,28 +2638,31 @@ async def conversacion_inversor(update: Update, context: ContextTypes.DEFAULT_TY
             await msg_espera.edit_text(texto_troll)
             return
 
-        from datetime import datetime
-        fecha_hoy = datetime.now().strftime("%Y-%m-%d")
-        intentos, dias_abuso = await db.registrar_intento_imposible(tid, fecha_hoy)
-
+        es_imposible = (ticker and ticker.startswith("FALLBACK_REQ_")) or (texto_final and "Filtro Gráfico Fallido" in texto_final)
         msg_aviso = ""
-        if intentos >= 3:
-            creditos_act = await db.obtener_creditos(tid)
-            if creditos_act <= 0:
-                teclado_pago = InlineKeyboardMarkup([[InlineKeyboardButton("💳 Recargar Créditos", url=f"{STRIPE_PAYMENT_URL}?client_reference_id={tid}")]])
-                await msg_espera.edit_text("💳 <b>Saldo agotado.</b> Has superado el límite de intentos fallidos gratuitos de hoy.", parse_mode="HTML", reply_markup=teclado_pago)
-                return
-            await db.restar_credito(tid)
-            
-            if dias_abuso >= 3:
-                await db.sumar_strike(tid)
-                await db.sumar_strike(tid)
-                await db.sumar_strike(tid) # 3 strikes fuerza un aumento de banLevel
-            
-            creditos_act = await db.obtener_creditos(tid)
-            msg_aviso = f"\n\n⚠️ <b>Límite diario superado.</b> Se te ha cobrado 1 crédito por esta búsqueda imposible (Te quedan {creditos_act})."
-        else:
-            msg_aviso = f"\n\n<i>(Intento imposible {intentos}/2 gratis hoy)</i>"
+
+        if es_imposible:
+            from datetime import datetime
+            fecha_hoy = datetime.now().strftime("%Y-%m-%d")
+            intentos, dias_abuso = await db.registrar_intento_imposible(tid, fecha_hoy)
+
+            if intentos >= 3:
+                creditos_act = await db.obtener_creditos(tid)
+                if creditos_act <= 0:
+                    teclado_pago = InlineKeyboardMarkup([[InlineKeyboardButton("💳 Recargar Créditos", url=f"{STRIPE_PAYMENT_URL}?client_reference_id={tid}")]])
+                    await msg_espera.edit_text("💳 <b>Saldo agotado.</b> Has superado el límite de intentos fallidos gratuitos de hoy.", parse_mode="HTML", reply_markup=teclado_pago)
+                    return
+                await db.restar_credito(tid)
+                
+                if dias_abuso >= 3:
+                    await db.sumar_strike(tid)
+                    await db.sumar_strike(tid)
+                    await db.sumar_strike(tid) # 3 strikes fuerza un aumento de banLevel
+                
+                creditos_act = await db.obtener_creditos(tid)
+                msg_aviso = f"\n\n⚠️ <b>Límite diario superado.</b> Se te ha cobrado 1 crédito por esta búsqueda imposible (Te quedan {creditos_act})."
+            else:
+                msg_aviso = f"\n\n<i>(Intento imposible {intentos}/2 gratis hoy)</i>"
 
         texto_con_aviso = texto_final + msg_aviso
 

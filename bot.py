@@ -953,8 +953,8 @@ async def _obtener_info_bulk(tickers: list[str], clase: str) -> dict:
     if faltantes:
         extractores = [ExtractorFMP(k) for k in FMP_API_KEYS.split(',')] if FMP_API_KEYS else []
         nuevos_datos = {}
-        for i_chunk in range(0, len(faltantes), 3):
-            lote = faltantes[i_chunk:i_chunk+3]
+        for i_chunk in range(0, len(faltantes), 50):
+            lote = faltantes[i_chunk:i_chunk+50]
             res = {}
             for ext in extractores:
                 max_intentos_ext = 1 if (hasattr(ext, '_dead') and ext._dead) else 2
@@ -963,7 +963,9 @@ async def _obtener_info_bulk(tickers: list[str], clase: str) -> dict:
                     if res: break
                     await asyncio.sleep(1.5)
                 if res: break
-            if not res: continue
+            if not res:
+                logger.warning(f"[FAST-FAIL] FMP no devolvió datos para el lote. Abortando restantes.")
+                break
             for t, info in res.items():
                 if info and info.get('regularMarketPrice'):
                     nuevos_datos[t] = info
@@ -1104,6 +1106,7 @@ async def _pipeline_hibrido_interno(
                     filtros["max_per"]     = 99999
                     filtros["min_div_pct"] = 0.0
                     filtros["min_div_abs"] = 0.0
+                    filtros["filtros_extra"] = []
                 else:
                     factor_per = 1.5 ** intento
                     factor_div = 0.60 ** intento
@@ -1307,7 +1310,11 @@ async def _pipeline_hibrido_interno(
             logger.warning(f"[REND PREFETCH] {gan['ticker']}: ERROR {type(e).__name__}: {e}")
             return gan, None
 
-    tuples_rend = await asyncio.gather(*(_fetch_rend_solo(g) for g in pre_ganadores))
+    import random
+    max_candidatos = min(4, len(pre_ganadores))
+    pre_ganadores_select = random.sample(pre_ganadores, max_candidatos)
+
+    tuples_rend = await asyncio.gather(*(_fetch_rend_solo(g) for g in pre_ganadores_select))
 
     candidatos_validos = [
         (gan, rend) for gan, rend in tuples_rend
@@ -1748,20 +1755,16 @@ async def comando_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     usuario = await db.obtener_usuario(tid)
     strikes = usuario["strikes"] if usuario else 0
     teclado = InlineKeyboardMarkup([
-        [InlineKeyboardButton("⚙️ Cambiar Fuente de Datos", callback_data="pedir_fuente"),
-         InlineKeyboardButton("🛒 Configurar Broker", callback_data="pedir_url")],
-        [InlineKeyboardButton("📋 Gestionar Mis Alertas", callback_data="gestionar_alertas"),
-         InlineKeyboardButton("📚 Tutorial de Inversión", callback_data="tutorial_main")],
-        [InlineKeyboardButton("💰 Mejores Dividendos", callback_data="btn1click_divs"),
-         InlineKeyboardButton("🚀 Mejores Tecnológicas", callback_data="btn1click_growth")],
-        [InlineKeyboardButton("🏛️ Empresas Más Seguras", callback_data="btn1click_blue"),
-         InlineKeyboardButton("💎 Acciones Infravaloradas", callback_data="btn1click_value")],
-        [InlineKeyboardButton(f"⚠️ Mi Estado de Penalizaciones ({strikes})", callback_data="ver_strikes")]
+        [InlineKeyboardButton("🔍 Screeners de Mercado", callback_data="menu_screeners")],
+        [InlineKeyboardButton("💼 Mi Cartera", callback_data="accion_cartera"),
+         InlineKeyboardButton("🌍 Resumen Macro", callback_data="accion_macro")],
+        [InlineKeyboardButton("⚙️ Configuración", callback_data="menu_configuracion")],
+        [InlineKeyboardButton("📚 Educación", callback_data="menu_educacion")]
     ])
     await update.message.reply_text(
         f"⚙️ <b>Tu Panel de Inversiones</b>\n\n"
         f"💳 Créditos disponibles: <b>{creditos}</b>\n\n"
-        "Gestiona tu configuración, tus fuentes de datos y encuentra oportunidades con un solo clic.\n"
+        "Gestiona tu configuración, tu cartera y encuentra oportunidades con un solo clic.\n"
         "<i>Los análisis son ultrarrápidos y se basan en datos reales del mercado.</i>",
         reply_markup=teclado,
         parse_mode="HTML"
@@ -1793,6 +1796,51 @@ async def manejador_botones(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await db.actualizar_ultimo_uso(chat_id, ahora)
 
     await query.answer()  # Responder a Telegram para apagar el relojito del botón
+
+    # --- Nuevos Submenús (Frontend V2) ---
+    if query.data == "menu_screeners":
+        teclado = InlineKeyboardMarkup([
+            [InlineKeyboardButton("💰 Mejores Dividendos", callback_data="btn1click_divs"),
+             InlineKeyboardButton("🚀 Mejores Tecnológicas", callback_data="btn1click_growth")],
+            [InlineKeyboardButton("🏛️ Empresas Más Seguras", callback_data="btn1click_blue"),
+             InlineKeyboardButton("💎 Acciones Infravaloradas", callback_data="btn1click_value")],
+            [InlineKeyboardButton("📊 Análisis por Tabla", callback_data="tabla_input"),
+             InlineKeyboardButton("🔎 Analizar Ticker", callback_data="manual_input")],
+            [InlineKeyboardButton("🔙 Volver al Menú", callback_data="volver_menu")]
+        ])
+        await query.edit_message_text("🔍 <b>Screeners de Mercado</b>\n\nSelecciona el tipo de oportunidad que deseas escanear:", reply_markup=teclado, parse_mode="HTML")
+        return
+
+    if query.data == "menu_configuracion":
+        usuario = await db.obtener_usuario(chat_id)
+        strikes = usuario["strikes"] if usuario else 0
+        teclado = InlineKeyboardMarkup([
+            [InlineKeyboardButton("🔗 Configurar Broker", callback_data="pedir_url"),
+             InlineKeyboardButton("🌐 Fuente de Datos", callback_data="pedir_fuente")],
+            [InlineKeyboardButton("📋 Gestionar Mis Alertas", callback_data="gestionar_alertas")],
+            [InlineKeyboardButton(f"⚠️ Penalizaciones ({strikes})", callback_data="ver_strikes")],
+            [InlineKeyboardButton("🔙 Volver al Menú", callback_data="volver_menu")]
+        ])
+        await query.edit_message_text("⚙️ <b>Configuración</b>\n\nAjusta tus preferencias del bot:", reply_markup=teclado, parse_mode="HTML")
+        return
+
+    if query.data == "menu_educacion":
+        teclado = InlineKeyboardMarkup([
+            [InlineKeyboardButton("📚 Tutorial de Inversión", callback_data="tutorial_main")],
+            [InlineKeyboardButton("🔙 Volver al Menú", callback_data="volver_menu")]
+        ])
+        await query.edit_message_text("📚 <b>Educación</b>\n\nAprende los fundamentos de la inversión quant:", reply_markup=teclado, parse_mode="HTML")
+        return
+
+    if query.data == "accion_cartera":
+        teclado = InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Volver al Menú", callback_data="volver_menu")]])
+        await query.edit_message_text("💼 <b>Mi Cartera</b>\n\n(Función en desarrollo: Próximamente podrás sincronizar y hacer seguimiento de tus activos).", reply_markup=teclado, parse_mode="HTML")
+        return
+
+    if query.data == "accion_macro":
+        teclado = InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Volver al Menú", callback_data="volver_menu")]])
+        await query.edit_message_text("🌍 <b>Resumen Macro</b>\n\n(Función en desarrollo: Próximamente recibirás el estado general de los índices bursátiles).", reply_markup=teclado, parse_mode="HTML")
+        return
 
     # --- 1-Click Macros (Bypass Inteligente) ---
     if query.data.startswith("btn1click_"):
@@ -2063,23 +2111,18 @@ async def manejador_botones(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Limpiar wizard de tabla si estaba en curso
         context.user_data["tabla_wizard"] = {}
         teclado = InlineKeyboardMarkup([
-            [InlineKeyboardButton(f"⚠️ Ver mis Strikes ({strikes})", callback_data="ver_strikes")],
-            [InlineKeyboardButton("🔗 Configurar mi Broker (URL)", callback_data="pedir_url")],
-            [InlineKeyboardButton("🌐 Fuente de Validación", callback_data="pedir_fuente")],
-        [InlineKeyboardButton("⌨️ Bypass (Manual)", callback_data="manual_input"),
-         InlineKeyboardButton("📊 Análisis Tabla", callback_data="tabla_input")],
-        [InlineKeyboardButton("📋 Gestionar Mis Alertas", callback_data="gestionar_alertas"),
-         InlineKeyboardButton("📚 Tutorial de Inversión", callback_data="tutorial_main")],
-        [InlineKeyboardButton("💰 Dividendos VIP", callback_data="btn1click_divs"),
-         InlineKeyboardButton("🚀 Growth Tech", callback_data="btn1click_growth")],
-        [InlineKeyboardButton("🛡️ Blue Chips Seguras", callback_data="btn1click_blue"),
-         InlineKeyboardButton("📉 Buscachollos", callback_data="btn1click_value")]
+            [InlineKeyboardButton("🔍 Screeners de Mercado", callback_data="menu_screeners")],
+            [InlineKeyboardButton("💼 Mi Cartera", callback_data="accion_cartera"),
+             InlineKeyboardButton("🌍 Resumen Macro", callback_data="accion_macro")],
+            [InlineKeyboardButton("⚙️ Configuración", callback_data="menu_configuracion")],
+            [InlineKeyboardButton("📚 Educación", callback_data="menu_educacion")]
         ])
         await query.edit_message_text(
             text=(
-                f"⚙️ <b>PANEL DE CONTROL CUANTITATIVO</b>\n\n"
+                f"⚙️ <b>Tu Panel de Inversiones</b>\n\n"
                 f"💳 Créditos disponibles: <b>{creditos}</b>\n\n"
-                "Configura tus enlaces al Broker, cambia las fuentes de datos, o activa el <b>Motor Inteligente de Alertas</b> para automatizar la búsqueda de tu nicho favorito."
+                "Gestiona tu configuración, tu cartera y encuentra oportunidades con un solo clic.\n"
+                "<i>Los análisis son ultrarrápidos y se basan en datos reales del mercado.</i>"
             ),
             reply_markup=teclado,
             parse_mode="HTML"

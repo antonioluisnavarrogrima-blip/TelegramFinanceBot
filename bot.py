@@ -1750,6 +1750,8 @@ async def comando_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     teclado = InlineKeyboardMarkup([
         [InlineKeyboardButton("⚙️ Cambiar Fuente de Datos", callback_data="pedir_fuente"),
          InlineKeyboardButton("🛒 Configurar Broker", callback_data="pedir_url")],
+        [InlineKeyboardButton("📋 Gestionar Mis Alertas", callback_data="gestionar_alertas"),
+         InlineKeyboardButton("📚 Tutorial de Inversión", callback_data="tutorial_main")],
         [InlineKeyboardButton("💰 Mejores Dividendos", callback_data="btn1click_divs"),
          InlineKeyboardButton("🚀 Mejores Tecnológicas", callback_data="btn1click_growth")],
         [InlineKeyboardButton("🏛️ Empresas Más Seguras", callback_data="btn1click_blue"),
@@ -2066,13 +2068,12 @@ async def manejador_botones(update: Update, context: ContextTypes.DEFAULT_TYPE):
             [InlineKeyboardButton("🌐 Fuente de Validación", callback_data="pedir_fuente")],
         [InlineKeyboardButton("⌨️ Bypass (Manual)", callback_data="manual_input"),
          InlineKeyboardButton("📊 Análisis Tabla", callback_data="tabla_input")],
+        [InlineKeyboardButton("📋 Gestionar Mis Alertas", callback_data="gestionar_alertas"),
+         InlineKeyboardButton("📚 Tutorial de Inversión", callback_data="tutorial_main")],
         [InlineKeyboardButton("💰 Dividendos VIP", callback_data="btn1click_divs"),
          InlineKeyboardButton("🚀 Growth Tech", callback_data="btn1click_growth")],
         [InlineKeyboardButton("🛡️ Blue Chips Seguras", callback_data="btn1click_blue"),
-         InlineKeyboardButton("📉 Buscachollos", callback_data="btn1click_value")],
-        [InlineKeyboardButton("🔔 Configurar Alerta (6h)", callback_data="alerta_6")],
-            [InlineKeyboardButton("🔔 Configurar Alerta (12h)", callback_data="alerta_12")],
-            [InlineKeyboardButton("🛑 Detener Alertas", callback_data="alerta_stop")]
+         InlineKeyboardButton("📉 Buscachollos", callback_data="btn1click_value")]
         ])
         await query.edit_message_text(
             text=(
@@ -2296,6 +2297,104 @@ async def manejador_botones(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.answer("⚠️ Has alcanzado el límite máximo de 5 alertas activas. Bórralas usando /alertas.", show_alert=True)
         return
 
+    # --- Gestionar Alertas (desde menu) ---
+    if query.data == "gestionar_alertas":
+        alertas = await db.listar_alertas_usuario(chat_id)
+        if not alertas:
+            await query.edit_message_text(
+                "📭 No tienes ninguna alerta activa.\n\nPara crear una, haz una búsqueda y pulsa el botón '🔔 Crear Alerta Diaria' en los resultados.",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Volver", callback_data="volver_menu")]])
+            )
+            return
+        texto = "📋 <b>Tus Alertas Activas (Ejecución Diaria):</b>\n\n"
+        botones = []
+        for i, a in enumerate(alertas, 1):
+            req_resumen = a['solicitud_raw'][:40] + "..." if len(a['solicitud_raw']) > 40 else a['solicitud_raw']
+            texto += f"<b>{i}.</b> <i>{req_resumen}</i>\n"
+            botones.append([InlineKeyboardButton(f"🗑️ Borrar Alerta {i}", callback_data=f"del_alerta_{a['id']}")])
+        botones.append([InlineKeyboardButton("⬅️ Volver al menú", callback_data="volver_menu")])
+        await query.edit_message_text(texto, reply_markup=InlineKeyboardMarkup(botones), parse_mode="HTML")
+        return
+
+    # --- Tutorial de Inversión ---
+    if query.data == "tutorial_main":
+        botones = [
+            [InlineKeyboardButton("🏢 Acciones", callback_data="tutorial_acciones"),
+             InlineKeyboardButton("📈 ETFs", callback_data="tutorial_etf")],
+            [InlineKeyboardButton("🏠 REITs", callback_data="tutorial_reit"),
+             InlineKeyboardButton("₿ Cripto", callback_data="tutorial_cripto")],
+            [InlineKeyboardButton("📜 Bonos", callback_data="tutorial_bonos")],
+            [InlineKeyboardButton("⬅️ Volver al menú", callback_data="volver_menu")]
+        ]
+        await query.edit_message_text(
+            "📚 <b>Tutorial de Inversión Quant</b>\n\n"
+            "El Bot Quant te permite escanear diferentes clases de activos. "
+            "Selecciona el tipo de inversión que deseas explorar para aprender cómo funciona, sus pros/contras y qué filtros utilizar en el bot:",
+            reply_markup=InlineKeyboardMarkup(botones), parse_mode="HTML"
+        )
+        return
+
+    if query.data.startswith("tutorial_"):
+        tema = query.data.replace("tutorial_", "")
+        texto = ""
+        if tema == "acciones":
+            texto = (
+                "🏢 <b>Tutorial: Acciones (Stocks)</b>\n\n"
+                "<b>¿Qué son?</b> Participaciones en la propiedad de una empresa.\n\n"
+                "✅ <b>Beneficios:</b> Alto potencial de crecimiento a largo plazo y pago de dividendos en empresas maduras.\n"
+                "❌ <b>Contras:</b> Alta volatilidad y riesgo de quiebra corporativa.\n\n"
+                "🎯 <b>Estrategias con el Bot:</b>\n"
+                "• <i>Value Investing:</i> Pide 'acciones infravaloradas', el bot buscará PER bajo.\n"
+                "• <i>Growth:</i> Pide 'empresas tecnológicas de crecimiento', el bot obviará el dividendo y buscará rendimiento en precio.\n"
+                "• <i>Dividendos:</i> Pide 'blue chips con dividendos seguros >4%'."
+            )
+        elif tema == "etf":
+            texto = (
+                "📈 <b>Tutorial: ETFs (Exchange Traded Funds)</b>\n\n"
+                "<b>¿Qué son?</b> Fondos de inversión que cotizan en bolsa, compuestos por cestas de activos (acciones, bonos, materias primas).\n\n"
+                "✅ <b>Beneficios:</b> Diversificación instantánea, bajas comisiones (TER) y menor riesgo de quiebra total.\n"
+                "❌ <b>Contras:</b> Rendimiento promedio del mercado (no das 'el pelotazo').\n\n"
+                "🎯 <b>Estrategias con el Bot:</b>\n"
+                "• <i>Indexación Global:</i> Pide 'ETFs globales baratos', el bot buscará un TER (Total Expense Ratio) bajo y alto volumen (AUM).\n"
+                "• <i>Apuestas Sectoriales:</i> Pide 'ETFs de inteligencia artificial' o 'ETFs de energía limpia'."
+            )
+        elif tema == "reit":
+            texto = (
+                "🏠 <b>Tutorial: REITs (Real Estate)</b>\n\n"
+                "<b>¿Qué son?</b> Sociedades de inversión en el sector inmobiliario que reparten casi todos sus beneficios en dividendos.\n\n"
+                "✅ <b>Beneficios:</b> Ingresos pasivos altos y recurrentes. Exposición al sector inmobiliario sin comprar una casa.\n"
+                "❌ <b>Contras:</b> Sensibles a las subidas de tipos de interés y menor crecimiento de capital.\n\n"
+                "🎯 <b>Estrategias con el Bot:</b>\n"
+                "• <i>Rentabilidad Segura:</i> Pide 'REITs de centros de datos' o 'REITs de salud con alta rentabilidad'. El bot evaluará el P/FFO (Price to Funds From Operations) en lugar del PER clásico."
+            )
+        elif tema == "cripto":
+            texto = (
+                "₿ <b>Tutorial: Criptomonedas</b>\n\n"
+                "<b>¿Qué son?</b> Monedas digitales descentralizadas basadas en criptografía (Bitcoin, Ethereum, etc).\n\n"
+                "✅ <b>Beneficios:</b> Rendimientos explosivos, independencia del sistema bancario tradicional.\n"
+                "❌ <b>Contras:</b> Volatilidad extrema, riesgo regulatorio y riesgo de proyectos fraudulentos (scams).\n\n"
+                "🎯 <b>Estrategias con el Bot:</b>\n"
+                "• <i>Inversión Conservadora en Cripto:</i> Pide 'Criptomonedas líderes con gran capitalización'. El bot filtrará por Market Cap enorme para evitar 'shitcoins' que puedan irse a cero."
+            )
+        elif tema == "bonos":
+            texto = (
+                "📜 <b>Tutorial: Bonos (Renta Fija)</b>\n\n"
+                "<b>¿Qué son?</b> Préstamos que haces a empresas o gobiernos a cambio de un interés fijo.\n\n"
+                "✅ <b>Beneficios:</b> Alta seguridad (especialmente deuda gubernamental de países desarrollados), volatilidad muy baja.\n"
+                "❌ <b>Contras:</b> Rentabilidad baja que en ocasiones no supera la inflación.\n\n"
+                "🎯 <b>Estrategias con el Bot:</b>\n"
+                "• <i>Preservación de Capital:</i> Pide 'Bonos del tesoro americano' o 'ETFs de bonos corporativos seguros'. El bot buscará yields razonables y activos con gran volumen de activos bajo gestión (AUM)."
+            )
+        else:
+            return
+
+        botones = [
+            [InlineKeyboardButton("⬅️ Volver a Tutoriales", callback_data="tutorial_main")],
+            [InlineKeyboardButton("⬅️ Volver al Menú", callback_data="volver_menu")]
+        ]
+        await query.edit_message_text(texto, reply_markup=InlineKeyboardMarkup(botones), parse_mode="HTML")
+        return
+
     # --- Borrar Alerta ---
     if query.data.startswith("del_alerta_"):
         alerta_id = int(query.data.replace("del_alerta_", ""))
@@ -2304,7 +2403,7 @@ async def manejador_botones(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.answer("🗑️ Alerta eliminada.", show_alert=False)
             alertas = await db.listar_alertas_usuario(chat_id)
             if not alertas:
-                await query.edit_message_text("📭 No tienes ninguna alerta activa.")
+                await query.edit_message_text("📭 No tienes ninguna alerta activa.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Volver al menú", callback_data="volver_menu")]]))
                 return
             texto = "📋 <b>Tus Alertas Activas (Ejecución Diaria):</b>\n\n"
             botones = []
@@ -2312,6 +2411,7 @@ async def manejador_botones(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 req_resumen = a['solicitud_raw'][:40] + "..." if len(a['solicitud_raw']) > 40 else a['solicitud_raw']
                 texto += f"<b>{i}.</b> <i>{req_resumen}</i>\n"
                 botones.append([InlineKeyboardButton(f"🗑️ Borrar Alerta {i}", callback_data=f"del_alerta_{a['id']}")])
+            botones.append([InlineKeyboardButton("⬅️ Volver al menú", callback_data="volver_menu")])
             await query.edit_message_text(texto, reply_markup=InlineKeyboardMarkup(botones), parse_mode="HTML")
         else:
             await query.answer("❌ Error al borrar.", show_alert=True)
@@ -2421,52 +2521,8 @@ async def manejador_botones(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
 
-    # --- Detener Alertas ---
-    if query.data == "alerta_stop":
-        # Desactivar en BD (persistente)
-        await db.actualizar_alerta(chat_id, None)
-        # Limpiar jobs legacy en memoria (por si acaso)
-        try:
-            for job in context.job_queue.get_jobs_by_name(str(chat_id)):
-                job.schedule_removal()
-        except Exception:
-            pass
-        await query.edit_message_text(text="✅ Alertas desactivadas. Puedes reactivarlas desde /menu.")
-        return
-
-    # --- Configurar Alerta Periódica ---
-    if query.data.startswith("alerta_"):
-        busqueda = await db.obtener_ultima_busqueda(chat_id)
-        ultima_busqueda = (
-            busqueda if busqueda and not busqueda.startswith("__")
-            else "empresas tecnológicas de crecimiento"
-        )
-
-        try:
-            intervalo_horas = int(query.data.split("_")[1])
-        except (IndexError, ValueError):
-            await query.edit_message_text(text="❌ Error procesando la solicitud.")
-            return
-
-        # Guardar alerta en BD (sobrevive reinicios de Render)
-        await db.actualizar_alerta(chat_id, intervalo_horas)
-        # Limpiar jobs legacy en memoria
-        try:
-            for job in context.job_queue.get_jobs_by_name(str(chat_id)):
-                job.schedule_removal()
-        except Exception:
-            pass
-
-        await query.edit_message_text(
-            text=(
-                f"✅ <b>¡ALERTA ACTIVADA!</b>\n\n"
-                f"Recibirás análisis de '{ultima_busqueda}' cada <b>{intervalo_horas}h</b>.\n"
-                "El sistema es persistente — sobrevive reinicios del servidor.\n"
-                "Desáctivalo desde /menu → Detener Alertas."
-            ),
-            parse_mode="HTML"
-        )
-        return
+    # Los handlers de alerta_6, alerta_12 y alerta_stop fueron eliminados porque el bot
+    # ahora utiliza el modelo de múltiples alertas asociadas a los resultados de búsqueda.
 
 
 def obtener_penalizacion_por_ban_level(ban_level: int) -> float:
@@ -3113,7 +3169,7 @@ async def cron_ejecutar(request: Request, background_tasks: BackgroundTasks):
     if not CRON_SECRET or secret != CRON_SECRET:
         raise HTTPException(status_code=403, detail="Forbidden")
 
-    grupos = await db.obtener_alertas_agrupadas_pendientes(intervalo_segundos=86400) # 24h
+    grupos = await db.obtener_alertas_agrupadas_pendientes()
     if not grupos:
         return {"ok": True, "msg": "No hay alertas pendientes."}
 
@@ -3138,6 +3194,7 @@ async def cron_ejecutar(request: Request, background_tasks: BackgroundTasks):
                 )
             except Exception as e:
                 logger.error(f"[CRON MULTI] Error pipeline en Hash {hash_firma}: {e}")
+                await db.incrementar_fallos_alerta(alert_ids)
                 continue
                 
             # 2. Distribución y Cobro
@@ -3152,6 +3209,7 @@ async def cron_ejecutar(request: Request, background_tasks: BackgroundTasks):
                 await db.marcar_alertas_enviadas(alert_ids)
             else:
                 logger.warning(f"[CRON MULTI] Sin resultados validos para Hash {hash_firma}.")
+                await db.incrementar_fallos_alerta(alert_ids)
 
     background_tasks.add_task(procesador_grupos, grupos)
     return {"ok": True, "grupos_procesados": len(grupos)}

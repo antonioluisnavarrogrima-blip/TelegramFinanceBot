@@ -2620,7 +2620,10 @@ async def manejador_botones(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     fuente_ico = "💾" if datos_t else "❓"
                 precio_str = f"${precio:.2f}" if isinstance(precio, (int, float)) else str(precio)
                 lineas.append(f"  • <b>{t}</b>: {precio_str} {fuente_ico}")
-                botones_cartera.append([InlineKeyboardButton(f"🗑️ Eliminar {t}", callback_data=f"rm_cartera_{t}")])
+                botones_cartera.append([
+                    InlineKeyboardButton(f"🔍 Ver {t}", callback_data=f"view_cartera_{t}"),
+                    InlineKeyboardButton(f"🗑️", callback_data=f"rm_cartera_{t}")
+                ])
             lineas.append("")
 
         lineas.append("<i>⚡ = Tiempo real (WebSocket) · 💾 = Caché BD</i>")
@@ -2684,7 +2687,10 @@ async def manejador_botones(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     fuente_ico = "💾" if datos_t else "❓"
                 precio_str = f"${precio:.2f}" if isinstance(precio, (int, float)) else str(precio)
                 lineas.append(f"• <b>{t}</b>: {precio_str} {fuente_ico}")
-                bots.append([InlineKeyboardButton(f"🗑️ Eliminar {t}", callback_data=f"rm_cartera_{t}")])
+                bots.append([
+                    InlineKeyboardButton(f"🔍 Ver {t}", callback_data=f"view_cartera_{t}"),
+                    InlineKeyboardButton(f"🗑️", callback_data=f"rm_cartera_{t}")
+                ])
             lineas.append("\n<i>⚡ = Tiempo real · 💾 = Caché BD</i>")
             bots.append([InlineKeyboardButton("⬅️ Volver al Menú", callback_data="volver_menu")])
             await query.edit_message_text("\n".join(lineas), reply_markup=InlineKeyboardMarkup(bots), parse_mode="HTML")
@@ -2699,14 +2705,31 @@ async def manejador_botones(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
+    # --- Ver Empresa de la Cartera (Detalle DB) ---
+    if query.data.startswith("view_cartera_"):
+        ticker_view = query.data.replace("view_cartera_", "").upper()
+        # Informar al usuario
+        await query.answer(f"🔍 Recuperando ficha de {ticker_view}...")
+        msg_esp = await query.message.reply_text(f"⏳ Consultando terminal de datos para <b>{ticker_view}</b>...", parse_mode="HTML")
+        
+        # Usar el pipeline hibrido. 
+        # Inyectamos el ticker directamente para que el extractor lo use.
+        fuente = await db.obtener_fuente_datos(chat_id)
+        
+        # Pequeño bypass: Si ya está en la cartera, forzamos un prompt que garantice el análisis del ticker.
+        prompt_especifico = f"Dame el análisis detallado y datos fundamentales de {ticker_view}."
+        
+        # Ejecutar pipeline (esto refrescará cache si es necesario)
+        await pipeline_hibrido(prompt_especifico, msg_espera=msg_esp, fuente_datos=fuente, tid=chat_id)
+        return
+
     # --- Eliminar ticker de la Cartera ---
     if query.data.startswith("rm_cartera_"):
-        ticker_rm = query.data.replace("rm_cartera_", "")
+        ticker_rm = query.data.replace("rm_cartera_", "").upper()
         await db.eliminar_de_cartera(chat_id, ticker_rm)
-        await query.answer(f"🗑️ {ticker_rm} eliminado de tu cartera.", show_alert=False)
-        # Redirigir de nuevo al menú de cartera actualizado
-        await manejador_botones.__wrapped__(update, context) if hasattr(manejador_botones, '__wrapped__') else None
-        # Simplemente recargamos la cartera editando el mensaje
+        await query.answer(f"🗑️ {ticker_rm} eliminado.", show_alert=False)
+        
+        # Recargar cartera
         tickers_cartera = await db.obtener_cartera(chat_id)
         if not tickers_cartera:
             await query.edit_message_text(
@@ -2715,8 +2738,8 @@ async def manejador_botones(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 parse_mode="HTML"
             )
         else:
-            lineas = ["💼 <b>Mi Cartera</b>\n"]
-            botones_cartera = []
+            lineas = ["💼 <b>Mi Cartera actualizada</b>\n"]
+            bots = []
             for t in tickers_cartera:
                 datos_ws = websocket_client.cache_precios.get(t.upper())
                 if datos_ws:
@@ -2729,10 +2752,13 @@ async def manejador_botones(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     fuente_ico = "💾" if datos_t else "❓"
                 precio_str = f"${precio:.2f}" if isinstance(precio, (int, float)) else str(precio)
                 lineas.append(f"• <b>{t}</b>: {precio_str} {fuente_ico}")
-                botones_cartera.append([InlineKeyboardButton(f"🗑️ Eliminar {t}", callback_data=f"rm_cartera_{t}")])
-            lineas.append("\n<i>⚡ = Tiempo real (WebSocket) · 💾 = Caché BD</i>")
-            botones_cartera.append([InlineKeyboardButton("⬅️ Volver al Menú", callback_data="volver_menu")])
-            await query.edit_message_text("\n".join(lineas), reply_markup=InlineKeyboardMarkup(botones_cartera), parse_mode="HTML")
+                bots.append([
+                    InlineKeyboardButton(f"🔍 Ver {t}", callback_data=f"view_cartera_{t}"),
+                    InlineKeyboardButton(f"🗑️", callback_data=f"rm_cartera_{t}")
+                ])
+            lineas.append("\n<i>⚡ = Tiempo real · 💾 = Caché BD</i>")
+            bots.append([InlineKeyboardButton("⬅️ Volver al Menú", callback_data="volver_menu")])
+            await query.edit_message_text("\n".join(lineas), reply_markup=InlineKeyboardMarkup(bots), parse_mode="HTML")
         return
 
     # --- Botón Reintentar ---

@@ -6,107 +6,142 @@ import time
 try:
     import websockets
 except ImportError:
-    logging.warning("[WEBSOCKET] Librería 'websockets' no instalada. Intenta ejecutar: pip install websockets")
+    logging.warning("[WEBSOCKET] Librería 'websockets' no instalada.")
     websockets = None
 
 import database as db
 
 logger = logging.getLogger(__name__)
 
-# Caché en memoria para evitar escrituras masivas en base de datos.
-# Formato: {"BTCUSDT": {"regularMarketPrice": 64000.5, "symbol": "BTCUSDT", "updated": 1700000000}}
-cache_precios = {}
+# ─── Caché en memoria ────────────────────────────────────────────────────────
+# Formato: {"BTCUSDT": {"regularMarketPrice": 64000.5, "symbol": "BTCUSDT", "_fuente": "Binance WS"}}
+cache_precios: dict = {}
+
+# Timestamp del último tick recibido (para heartbeat monitor)
+_last_tick_ts: float = 0.0
 
 # Variables de control
 _ws_running = False
 
+# Tickers a suscribir (streams de trades en Binance US)
+_TICKERS = ["btcusdt", "ethusdt", "solusdt", "bnbusdt", "xrpusdt", "adausdt"]
+
+# ─── Parámetros de reconexión ────────────────────────────────────────────────
+_BACKOFF_BASE   = 5    # segundos iniciales
+_BACKOFF_MAX    = 60   # máximo entre intentos
+_HEARTBEAT_TIMEOUT = 90  # segundos sin datos antes de forzar reconexión
+
+
+def _build_uri() -> str:
+    """Construye la URI de stream combinado para múltiples tickers."""
+    streams = "/".join(f"{t}@trade" for t in _TICKERS)
+    return f"wss://stream.binance.us:9443/stream?streams={streams}"
+
+
 async def connect_binance():
     """
-    Se conecta al stream de trades de Binance para obtener precios en tiempo real.
-    Maneja desconexiones y reconexiones automáticamente (Resiliencia).
+    Conexión persistente y resiliente al WebSocket de Binance US.
+    Usa backoff exponencial y detecta silencio de datos (heartbeat).
     """
+    global _last_tick_ts
+
     if not websockets:
-        logger.error("[WEBSOCKET] No se puede iniciar Binance WS. Falta librería 'websockets'.")
+        logger.error("[WEBSOCKET] Librería 'websockets' no instalada.")
         return
 
-    uri = "wss://stream.binance.us:9443/ws/btcusdt@trade"
-    
+    uri = _build_uri()
+    intentos = 0
+
     while _ws_running:
+        espera = min(_BACKOFF_BASE * (2 ** min(intentos, 6)), _BACKOFF_MAX)
+        if intentos > 0:
+            logger.info(f"[WEBSOCKET] Reconexión #{intentos} en {espera}s...")
+            await asyncio.sleep(espera)
+
         try:
-            logger.info(f"[WEBSOCKET] Conectando a {uri}...")
-            async with websockets.connect(uri) as websocket:
-                logger.info("[WEBSOCKET] Conexión establecida con éxito.")
-                
-                async for message in websocket:
+            logger.info(f"[WEBSOCKET] Conectando a stream combinado ({len(_TICKERS)} tickers)...")
+            async with websockets.connect(uri, ping_interval=20, ping_timeout=10) as ws:
+                intentos = 0  # Reset del backoff en conexión exitosa
+                _last_tick_ts = time.time()
+                logger.info("[WEBSOCKET] ✅ Conexión establecida.")
+
+                async for raw in ws:
                     if not _ws_running:
                         break
-                    
-                    data = json.loads(message)
-                    # El campo 'p' contiene el precio del trade, 's' el símbolo
-                    precio = float(data.get('p', 0.0))
-                    symbol = data.get('s', 'BTCUSDT').upper()
-                    
-                    if precio > 0:
-                        # Actualizamos SOLAMENTE la caché en memoria
+
+                    _last_tick_ts = time.time()
+                    data = json.loads(raw)
+
+                    # Stream combinado anida el payload en "data"
+                    payload = data.get("data", data)
+                    precio = float(payload.get("p", 0.0))
+                    symbol = payload.get("s", "").upper()
+
+                    if precio > 0 and symbol:
                         cache_precios[symbol] = {
                             "regularMarketPrice": precio,
                             "symbol": symbol,
-                            "_fuente": "Binance WS"
+                            "_fuente": "Binance WS",
+                            "_ts": _last_tick_ts,
                         }
-                        # logger.debug(f"[WEBSOCKET] Precio actualizado en memoria: {symbol} = {precio}")
-                        
+
         except Exception as e:
-            logger.error(f"[WEBSOCKET] Conexión perdida o error de red: {e}")
-            if _ws_running:
-                logger.info("[WEBSOCKET] Reintentando reconexión en 5 segundos...")
-                await asyncio.sleep(5)
+            intentos += 1
+            logger.error(f"[WEBSOCKET] Error ({type(e).__name__}): {e}. Intento #{intentos}.")
+
+
+async def heartbeat_monitor():
+    """
+    Vigila que lleguen datos del WS. Si no hay ticks en _HEARTBEAT_TIMEOUT segundos,
+    registra una advertencia (la reconexión la gestiona connect_binance automáticamente).
+    """
+    while _ws_running:
+        await asyncio.sleep(30)
+        if _last_tick_ts > 0:
+            silencio = time.time() - _last_tick_ts
+            if silencio > _HEARTBEAT_TIMEOUT:
+                logger.warning(
+                    f"[WEBSOCKET] ⚠️ Sin datos hace {silencio:.0f}s. "
+                    "El reconnector debería estar actuando."
+                )
+            else:
+                logger.debug(f"[WEBSOCKET] Heartbeat OK — último tick hace {silencio:.1f}s")
 
 
 async def sync_to_supabase():
     """
-    Cron interno que cada 30 segundos lee la caché en memoria y 
-    realiza un UPSERT masivo a Supabase usando `guardar_yf_cache_bulk`.
-    (Protección CRÍTICA de Supabase)
+    Escribe la caché en Supabase cada 30 segundos (protección anti-flood de BD).
     """
-    intervalo_sync = 30  # segundos
-    
+    intervalo = 30
+
     while _ws_running:
-        await asyncio.sleep(intervalo_sync)
-        
+        await asyncio.sleep(intervalo)
+
         if not cache_precios:
             continue
-            
-        # Tomamos un snapshot de los precios actuales para sincronizar
-        # (Esto evita problemas si el diccionario muta mientras preparamos los datos)
+
         snapshot = dict(cache_precios)
-        
-        # Preparamos los datos en el formato que espera `guardar_yf_cache_bulk`
-        # snapshot es {"BTCUSDT": {"regularMarketPrice": 64000.5, ...}}
         try:
             await db.guardar_yf_cache_bulk(snapshot, clase="CRIPTO")
-            logger.info(f"[WEBSOCKET] Sincronización diferida completada. {len(snapshot)} activos actualizados en Supabase.")
+            logger.info(
+                f"[WEBSOCKET] Sync Supabase: {len(snapshot)} tickers actualizados."
+            )
         except Exception as e:
-            logger.error(f"[WEBSOCKET] Error durante la sincronización a Supabase: {e}")
+            logger.error(f"[WEBSOCKET] Error sync Supabase: {e}")
 
 
 async def iniciar_websockets():
-    """
-    Inicia todas las tareas asíncronas necesarias para los WebSockets
-    dentro del mismo Event Loop (sin bloquear).
-    """
+    """Lanza todas las tareas WS como background tasks del Event Loop de Uvicorn."""
     global _ws_running
     _ws_running = True
-    
-    logger.info("[WEBSOCKET] Inicializando tareas de WebSocket en segundo plano...")
-    # asyncio.create_task() lanza las corrutinas sin bloquear la actual
+    logger.info("[WEBSOCKET] Inicializando tareas en segundo plano...")
     asyncio.create_task(connect_binance())
     asyncio.create_task(sync_to_supabase())
+    asyncio.create_task(heartbeat_monitor())
+
 
 async def detener_websockets():
-    """
-    Señal para detener los loops de reconexión y sincronización
-    (Ideal para invocar en el evento de apagado de la app).
-    """
+    """Señaliza el apagado limpio de todos los loops."""
     global _ws_running
     _ws_running = False
-    logger.info("[WEBSOCKET] Tareas de WebSocket detenidas.")
+    logger.info("[WEBSOCKET] Tareas detenidas.")

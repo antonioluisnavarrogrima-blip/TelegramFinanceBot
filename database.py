@@ -117,8 +117,13 @@ async def inicializar_db():
             ("intentos_imposibles", "ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS intentos_imposibles INTEGER NOT NULL DEFAULT 0"),
             ("fecha_imposibles",   "ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS fecha_imposibles TEXT"),
             ("dias_abuso_imposibles","ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS dias_abuso_imposibles INTEGER NOT NULL DEFAULT 0"),
-            ("best_effort_cache",   "ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS best_effort_cache JSONB"),
-            ("ultima_extraccion",   "ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS ultima_extraccion JSONB"),
+            ("best_effort_cache",       "ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS best_effort_cache JSONB"),
+            ("ultima_extraccion",        "ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS ultima_extraccion JSONB"),
+            # ── Columnas de plan/suscripción ──
+            ("plan",                     "ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS plan TEXT NOT NULL DEFAULT 'free'"),
+            ("stripe_customer_id",       "ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS stripe_customer_id TEXT"),
+            ("stripe_subscription_id",   "ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS stripe_subscription_id TEXT"),
+            ("plan_expira",              "ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS plan_expira FLOAT"),
         ]
         for _col, ddl in columnas_extra:
             try:
@@ -1100,4 +1105,118 @@ async def obtener_cartera(tid: int) -> list[str]:
             tid
         )
         return [r["ticker"] for r in rows]
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 10. GESTIÓN DE PLANES (SUSCRIPCIONES)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+async def obtener_plan(tid: int) -> str:
+    """Devuelve el plan activo del usuario: 'free', 'plus', 'pro'."""
+    pool = _get_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT plan, plan_expira FROM usuarios WHERE id = $1", tid
+        )
+        if not row:
+            return 'free'
+        plan = row['plan'] or 'free'
+        # Verificar que la suscripción no haya expirado
+        if plan != 'free' and row['plan_expira'] and time.time() > row['plan_expira']:
+            # Expirada: degradar automáticamente
+            await conn.execute("UPDATE usuarios SET plan = 'free' WHERE id = $1", tid)
+            return 'free'
+        return plan
+
+async def es_plus(tid: int) -> bool:
+    """Comprueba si el usuario tiene plan Plus o Pro activo."""
+    plan = await obtener_plan(tid)
+    return plan in ('plus', 'pro')
+
+async def activar_suscripcion(tid: int, plan: str, stripe_customer_id: str,
+                               stripe_subscription_id: str, expira_ts: float | None = None) -> None:
+    """
+    Activa una suscripción (plus o pro) para el usuario.
+    Guarda los IDs de Stripe para gestionar renovaciones y cancelaciones.
+    """
+    pool = _get_pool()
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """
+            UPDATE usuarios
+            SET plan = $1,
+                stripe_customer_id = $2,
+                stripe_subscription_id = $3,
+                plan_expira = $4
+            WHERE id = $5
+            """,
+            plan, stripe_customer_id, stripe_subscription_id, expira_ts, tid
+        )
+        logger.info(f"[DB] Plan '{plan}' activado para usuario {tid} (sub: {stripe_subscription_id})")
+
+async def desactivar_suscripcion_por_stripe_id(stripe_subscription_id: str) -> int | None:
+    """
+    Degrada a 'free' al usuario cuya suscripción de Stripe haya sido cancelada.
+    Devuelve el telegram_id del usuario afectado o None.
+    """
+    pool = _get_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT id FROM usuarios WHERE stripe_subscription_id = $1", stripe_subscription_id
+        )
+        if not row:
+            return None
+        tid = row['id']
+        await conn.execute(
+            "UPDATE usuarios SET plan = 'free', plan_expira = NULL WHERE id = $1", tid
+        )
+        logger.info(f"[DB] Suscripción cancelada → usuario {tid} degradado a 'free'")
+        return tid
+
+async def obtener_info_plan(tid: int) -> dict:
+    """Devuelve un dict con plan, plan_expira y creditos del usuario."""
+    pool = _get_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT plan, plan_expira, creditos FROM usuarios WHERE id = $1", tid
+        )
+        if not row:
+            return {'plan': 'free', 'plan_expira': None, 'creditos': 0}
+        return dict(row)
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 11. HIGIENE Y MANTENIMIENTO
+# ═══════════════════════════════════════════════════════════════════════════════
+
+async def purgar_datos_obsoletos() -> dict:
+    """
+    Limpia registros antiguos para evitar saturación de la base de datos.
+    - Caché de Yahoo Finance > 7 días
+    - Eventos de Stripe > 30 días
+    """
+    pool = _get_pool()
+    ahora = time.time()
+    siete_dias = 7 * 24 * 3600
+    treinta_dias = 30 * 24 * 3600
+
+    async with pool.acquire() as conn:
+        # Borrar ticks obsoletos en la caché
+        res_yf = await conn.execute(
+            "DELETE FROM yf_cache WHERE updated_at < $1", 
+            ahora - siete_dias
+        )
+        
+        # Borrar registros de eventos de Stripe antiguos (ya procesados)
+        res_stripe = await conn.execute(
+            "DELETE FROM stripe_eventos WHERE procesado_at < $1",
+            ahora - treinta_dias
+        )
+        
+        # Opcional: Borrar alertas inactivas de usuarios que no existen o son muy antiguas
+        # res_alertas = await conn.execute(...)
+
+        count_yf = int(res_yf.split(" ")[1]) if "DELETE" in res_yf else 0
+        count_stripe = int(res_stripe.split(" ")[1]) if "DELETE" in res_stripe else 0
+
+        logger.info(f"[HIGIENE] Limpieza completada: {count_yf} ticks de caché y {count_stripe} eventos Stripe eliminados.")
+        return {"yf_cache_deleted": count_yf, "stripe_events_deleted": count_stripe}
 

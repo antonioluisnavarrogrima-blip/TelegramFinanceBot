@@ -2502,6 +2502,19 @@ async def manejador_botones(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # --- Añadir ticker a la Cartera ---
     if query.data.startswith("add_cartera_"):
         ticker_cartera = query.data.replace("add_cartera_", "")
+        
+        # Gate Free: máximo 5 activos
+        es_usuario_plus = await db.es_plus(chat_id)
+        if not es_usuario_plus:
+            tickers_actuales = await db.obtener_cartera(chat_id)
+            if len(tickers_actuales) >= 5:
+                await query.answer(
+                    "⚠️ Límite de 5 activos en el plan Free.\n\n"
+                    "Usa /plan para actualizar a Plus y tener cartera ilimitada.",
+                    show_alert=True
+                )
+                return
+
         exito = await db.add_a_cartera(chat_id, ticker_cartera)
         if exito:
             await query.answer(f"✅ {ticker_cartera} añadido a tu cartera.", show_alert=True)
@@ -2510,41 +2523,174 @@ async def manejador_botones(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     # --- Mi Cartera (visualización) ---
-    if query.data == "accion_cartera":
+    if query.data == "accion_cartera" or query.data == "cartera_csv":
+        # Exportar CSV (solo Plus)
+        if query.data == "cartera_csv":
+            es_usuario_plus = await db.es_plus(chat_id)
+            if not es_usuario_plus:
+                await query.answer("⭐ El export CSV es exclusivo de Plus. Usa /plan para actualizar.", show_alert=True)
+                return
+            tickers_cartera = await db.obtener_cartera(chat_id)
+            if not tickers_cartera:
+                await query.answer("Tu cartera está vacía.", show_alert=True)
+                return
+            
+            # Construir CSV
+            import csv, io as _io
+            buf_csv = _io.StringIO()
+            writer = csv.writer(buf_csv)
+            writer.writerow(["Ticker", "Precio", "Fuente", "Timestamp"])
+            for t in tickers_cartera:
+                datos_ws = websocket_client.cache_precios.get(t.upper())
+                if datos_ws:
+                    precio = datos_ws.get("regularMarketPrice", "N/D")
+                    fuente_csv = "WebSocket"
+                    ts = datos_ws.get("_ts", "")
+                else:
+                    datos_bd = await db.obtener_yf_cache_bulk([t])
+                    datos_t = datos_bd.get(t.upper(), {})
+                    precio = datos_t.get("regularMarketPrice", datos_t.get("price", "N/D"))
+                    fuente_csv = "Cache BD"
+                    ts = datos_t.get("updated_at", "")
+                writer.writerow([t, precio, fuente_csv, ts])
+            
+            csv_bytes = buf_csv.getvalue().encode("utf-8")
+            await context.bot.send_document(
+                chat_id=chat_id,
+                document=InputFile(_io.BytesIO(csv_bytes), filename="cartera.csv"),
+                caption="📊 Tu cartera exportada. Ábrela en Excel o Google Sheets."
+            )
+            return
+
+        # Vista normal
         tickers_cartera = await db.obtener_cartera(chat_id)
+        es_usuario_plus = await db.es_plus(chat_id)
+        
         if not tickers_cartera:
+            bots_btn = [[InlineKeyboardButton("⬅️ Volver", callback_data="volver_menu")]]
+            if not es_usuario_plus and STRIPE_PAYMENT_LINK:
+                bots_btn.insert(0, [InlineKeyboardButton("⭐ Actualizar a Plus", url=f"{STRIPE_PAYMENT_LINK}?client_reference_id={chat_id}")])
             await query.edit_message_text(
                 "💼 <b>Mi Cartera</b>\n\nTu cartera está vacía.\n\n"
                 "<i>Cuando encuentres una oportunidad de inversión, pulsa el botón '💼 Añadir a Cartera' para guardarla aquí.</i>",
-                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Volver", callback_data="volver_menu")]]),
+                reply_markup=InlineKeyboardMarkup(bots_btn),
                 parse_mode="HTML"
             )
             return
 
-        # Construir panel de cartera
-        lineas = ["💼 <b>Mi Cartera</b>\n"]
-        botones_cartera = []
+        # Agrupar por clase de activo (usando semillas de BD)
+        CLASES_ICONOS = {
+            "ACCION": "🏢", "ETF": "📈", "REIT": "🏠",
+            "CRIPTO": "₿", "BONO": "📜", "?": "❓"
+        }
+
+        # Obtener clase de cada ticker desde semillas
+        pool = db._get_pool()
+        async with pool.acquire() as conn:
+            rows_clase = await conn.fetch(
+                "SELECT ticker, clase FROM semillas WHERE ticker = ANY($1::text[])",
+                tickers_cartera
+            )
+        clase_map = {r["ticker"]: r["clase"] for r in rows_clase}
         
+        # Agrupar
+        grupos: dict[str, list] = {}
         for t in tickers_cartera:
-            # 1º intento: precio en tiempo real desde WebSocket (RAM)
-            datos_ws = websocket_client.cache_precios.get(t.upper())
-            if datos_ws:
-                precio = datos_ws.get("regularMarketPrice", "N/D")
-                fuente_ico = "⚡"  # Lightning = tiempo real
-            else:
-                # 2º intento: desde la caché de BD (Yahoo/FMP)
-                datos_bd = await db.obtener_yf_cache_bulk([t])
-                datos_t = datos_bd.get(t.upper(), {})
-                precio = datos_t.get("regularMarketPrice", datos_t.get("price", "N/D"))
-                fuente_ico = "💾" if datos_t else "❓"
-            
-            precio_str = f"${precio:.2f}" if isinstance(precio, (int, float)) else str(precio)
-            lineas.append(f"• <b>{t}</b>: {precio_str} {fuente_ico}")
-            botones_cartera.append([InlineKeyboardButton(f"🗑️ Eliminar {t}", callback_data=f"rm_cartera_{t}")])
-        
-        lineas.append("\n<i>⚡ = Tiempo real (WebSocket) · 💾 = Caché BD</i>")
+            clase = clase_map.get(t, "?")
+            grupos.setdefault(clase, []).append(t)
+
+        lineas = ["💼 <b>Mi Cartera</b>"]
+        if es_usuario_plus:
+            lineas[0] += " ⭐"
+        lineas.append("")
+
+        botones_cartera = []
+        for clase, ticks in grupos.items():
+            ico = CLASES_ICONOS.get(clase, "❓")
+            lineas.append(f"{ico} <b>{clase}</b>")
+            for t in ticks:
+                datos_ws = websocket_client.cache_precios.get(t.upper())
+                if datos_ws:
+                    precio = datos_ws.get("regularMarketPrice", "N/D")
+                    fuente_ico = "⚡"
+                else:
+                    datos_bd = await db.obtener_yf_cache_bulk([t])
+                    datos_t = datos_bd.get(t.upper(), {})
+                    precio = datos_t.get("regularMarketPrice", datos_t.get("price", "N/D"))
+                    fuente_ico = "💾" if datos_t else "❓"
+                precio_str = f"${precio:.2f}" if isinstance(precio, (int, float)) else str(precio)
+                lineas.append(f"  • <b>{t}</b>: {precio_str} {fuente_ico}")
+                botones_cartera.append([InlineKeyboardButton(f"🗑️ Eliminar {t}", callback_data=f"rm_cartera_{t}")])
+            lineas.append("")
+
+        lineas.append("<i>⚡ = Tiempo real (WebSocket) · 💾 = Caché BD</i>")
+        if not es_usuario_plus:
+            lineas.append(f"\n<i>📦 {len(tickers_cartera)}/5 activos (Free). ⭐ Plus = ilimitados + CSV</i>")
+
         texto_cartera = "\n".join(lineas)
+        
+        if es_usuario_plus:
+            botones_cartera.append([InlineKeyboardButton("📥 Exportar CSV", callback_data="cartera_csv")])
+        else:
+            if STRIPE_PAYMENT_LINK:
+                botones_cartera.append([InlineKeyboardButton("⭐ Actualizar a Plus", url=f"{STRIPE_PAYMENT_LINK}?client_reference_id={chat_id}")])
         botones_cartera.append([InlineKeyboardButton("⬅️ Volver al Menú", callback_data="volver_menu")])
+        
+        await query.edit_message_text(
+            text=texto_cartera,
+            reply_markup=InlineKeyboardMarkup(botones_cartera),
+            parse_mode="HTML"
+        )
+        return
+
+    # --- Eliminar ticker de la Cartera ---
+    if query.data.startswith("rm_cartera_"):
+        ticker_rm = query.data.replace("rm_cartera_", "")
+        await db.eliminar_de_cartera(chat_id, ticker_rm)
+        await query.answer(f"🗑️ {ticker_rm} eliminado.", show_alert=False)
+        # Forzar recarga del panel de cartera
+        update.callback_query.data = "accion_cartera"
+        query._data = "accion_cartera"
+        # Recargar usando la misma lógica
+        tickers_cartera = await db.obtener_cartera(chat_id)
+        if not tickers_cartera:
+            await query.edit_message_text(
+                "💼 <b>Mi Cartera</b>\n\nTu cartera está vacía.",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Volver", callback_data="volver_menu")]]),
+                parse_mode="HTML"
+            )
+        else:
+            # Redirigir a la vista completa reusando el handler
+            await query.edit_message_text("🔄 Actualizando cartera...")
+            # Pequeño truco: llamar al mismo handler simulando accion_cartera
+            class _FakeQuery:
+                data = "accion_cartera"
+                async def edit_message_text(self, *a, **kw): return await query.edit_message_text(*a, **kw)
+                async def answer(self, *a, **kw): return await query.answer(*a, **kw)
+                message = query.message
+            update._callback_query = _FakeQuery()
+            # Re-ejecutar via recursión directa es peligroso; simplest: repetir la lógica de display
+            lineas = ["💼 <b>Mi Cartera actualizada</b>\n"]
+            bots = []
+            for t in tickers_cartera:
+                datos_ws = websocket_client.cache_precios.get(t.upper())
+                if datos_ws:
+                    precio = datos_ws.get("regularMarketPrice", "N/D")
+                    fuente_ico = "⚡"
+                else:
+                    datos_bd = await db.obtener_yf_cache_bulk([t])
+                    datos_t = datos_bd.get(t.upper(), {})
+                    precio = datos_t.get("regularMarketPrice", datos_t.get("price", "N/D"))
+                    fuente_ico = "💾" if datos_t else "❓"
+                precio_str = f"${precio:.2f}" if isinstance(precio, (int, float)) else str(precio)
+                lineas.append(f"• <b>{t}</b>: {precio_str} {fuente_ico}")
+                bots.append([InlineKeyboardButton(f"🗑️ Eliminar {t}", callback_data=f"rm_cartera_{t}")])
+            lineas.append("\n<i>⚡ = Tiempo real · 💾 = Caché BD</i>")
+            bots.append([InlineKeyboardButton("⬅️ Volver al Menú", callback_data="volver_menu")])
+            await query.edit_message_text("\n".join(lineas), reply_markup=InlineKeyboardMarkup(bots), parse_mode="HTML")
+        return
+
+
         
         await query.edit_message_text(
             text=texto_cartera,
@@ -3076,6 +3222,56 @@ async def comando_alertas(update: Update, context: ContextTypes.DEFAULT_TYPE):
 telegram_app.add_handler(CommandHandler("alertas", comando_alertas))
 
 
+# ── COMANDO /plan ─────────────────────────────────────────────────────────────
+
+async def comando_plan(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Muestra el plan activo, fecha de expiración y opciones de upgrade."""
+    tid = update.effective_user.id
+    info = await db.obtener_info_plan(tid)
+    plan  = info.get("plan", "free")
+    expira = info.get("plan_expira")
+    creditos = info.get("creditos", 0)
+
+    if plan == "free":
+        estado_txt = "🆓 <b>Plan Free</b>"
+        detalle = (
+            f"• Créditos disponibles: <b>{creditos}</b>\n"
+            "• Cartera: hasta 5 activos\n"
+            "• Alertas: máximo cada 24h\n\n"
+            "<i>Actualiza a Plus para desbloquear cartera ilimitada,\n"
+            "alertas cada 4h y precios en tiempo real de todos tus activos.</i>"
+        )
+        botones = []
+        if STRIPE_PAYMENT_LINK:
+            botones.append([InlineKeyboardButton(
+                "⭐ Actualizar a Plus → 7.99€/mes",
+                url=f"{STRIPE_PAYMENT_LINK}?client_reference_id={tid}"
+            )])
+    else:
+        estrella = "⭐" if plan == "plus" else "💎"
+        estado_txt = f"{estrella} <b>Plan {plan.upper()} activo</b>"
+        exp_str = ""
+        if expira:
+            from datetime import datetime
+            exp_str = f"\n• Próxima renovación: <b>{datetime.fromtimestamp(expira).strftime('%d/%m/%Y')}</b>"
+        detalle = (
+            f"• Créditos disponibles: <b>{creditos}</b>{exp_str}\n"
+            "• Cartera ilimitada ✅\n"
+            "• Alertas cada 4h ✅\n"
+            "• Precios en tiempo real (WebSocket) ✅\n"
+            "• Exportar a CSV ✅"
+        )
+        botones = []
+
+    await update.message.reply_text(
+        f"{estado_txt}\n\n{detalle}",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(botones) if botones else None
+    )
+
+telegram_app.add_handler(CommandHandler("plan", comando_plan))
+
+
 # ── COMANDO /comprar ──────────────────────────────────────────────────────────
 
 async def comando_comprar(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -3140,7 +3336,8 @@ async def lifespan(app: FastAPI):
 
     # Iniciar conexión persistente por WebSocket y Cron Interno
     await websocket_client.iniciar_websockets()
-    cron_task = asyncio.create_task(cron_interno_alertas())
+    cron_task    = asyncio.create_task(cron_interno_alertas())
+    higiene_task = asyncio.create_task(higiene_db_loop())
     
     # Pre-calentar el crumb de Financial Modeling Prep antes de que llegue tráfico de usuarios.
     logger.info("[LIFESPAN] Inicializando bot de Telegram...")
@@ -3250,42 +3447,107 @@ async def webhook_pago(request: Request):
 
     event_id = event.get("id", "")
 
-    if event["type"] == "checkout.session.completed":
+    tipo = event["type"]
+
+    # ── EVENTO 1: Pago completado (créditos y/o activación de suscripción) ──────
+    if tipo == "checkout.session.completed":
         session     = event["data"]["object"]
         telegram_id = session.get("client_reference_id")
-        
-        # Calcular creditos dinamicos
-        metadata = session.get("metadata", {})
-        if "creditos" in metadata:
-            creditos_a_sumar = int(metadata["creditos"])
-        else:
-            creditos_a_sumar = CREDITOS_POR_COMPRA # Fallback de seguridad puro
+        metadata    = session.get("metadata") or {}
+        modo        = session.get("mode", "payment")  # 'payment' | 'subscription'
 
-        if creditos_a_sumar <= 0:
-            creditos_a_sumar = CREDITOS_POR_COMPRA # Fallback de seguridad
-
-        if telegram_id and event_id:
-            try:
-                # Transacción atómica: inserta evento + acredita créditos en un solo paso.
-                # Si el evento ya existe (duplicado de Stripe), retorna False sin acreditar.
-                acreditado = await db.acreditar_pago_atomico(
-                    event_id, int(telegram_id), creditos_a_sumar
-                )
-                if acreditado:
-                    logger.info(
-                        f"[STRIPE] Pago completado → +{creditos_a_sumar} créditos "
-                        f"al usuario {telegram_id}"
-                    )
-                else:
-                    logger.info(f"[STRIPE] Evento {event_id} duplicado. Sin acreditar.")
-                    return {"ok": True, "duplicado": True}
-            except Exception as e:
-                logger.error(f"[STRIPE] Error acreditando créditos: {e}")
-        else:
+        if not telegram_id or not event_id:
             logger.warning("[STRIPE] Evento sin client_reference_id o event_id.")
+            return {"ok": True}
+
+        tid = int(telegram_id)
+
+        # --- Acreditar créditos si el metadata lo indica ---
+        creditos_a_sumar = int(metadata.get("creditos", 0)) or CREDITOS_POR_COMPRA
+        if creditos_a_sumar > 0:
+            acreditado = await db.acreditar_pago_atomico(event_id, tid, creditos_a_sumar)
+            if acreditado:
+                logger.info(f"[STRIPE] +{creditos_a_sumar} créditos al usuario {tid}")
+                try:
+                    await telegram_app.bot.send_message(
+                        chat_id=tid,
+                        text=f"✅ <b>¡Pago recibido!</b>\n\n+{creditos_a_sumar} créditos añadidos a tu cuenta.",
+                        parse_mode="HTML"
+                    )
+                except Exception: pass
+            else:
+                logger.info(f"[STRIPE] Evento {event_id} duplicado.")
+                return {"ok": True, "duplicado": True}
+
+        # --- Activar suscripción si el metadata lo indica ---
+        plan_meta = metadata.get("suscripcion", "").lower()  # 'plus' | 'pro'
+        if plan_meta in ("plus", "pro") and modo == "subscription":
+            sub_id = session.get("subscription", "")
+            customer_id = session.get("customer", "")
+            # La fecha de expiración la gestiona el evento invoice.paid / subscription.updated
+            await db.activar_suscripcion(tid, plan_meta, customer_id, sub_id, expira_ts=None)
+            try:
+                await telegram_app.bot.send_message(
+                    chat_id=tid,
+                    text=(
+                        f"⭐ <b>¡Bienvenido a {plan_meta.upper()}!</b>\n\n"
+                        f"Tu plan ha sido activado. Ahora tienes acceso a la cartera avanzada, "
+                        f"alertas más frecuentes y datos en tiempo real.\n\n"
+                        f"Usa /plan para ver el estado de tu suscripción."
+                    ),
+                    parse_mode="HTML"
+                )
+            except Exception: pass
+
+    # ── EVENTO 2: Suscripción renovada (actualizar fecha de expiración) ─────────
+    elif tipo == "customer.subscription.updated":
+        sub = event["data"]["object"]
+        sub_id      = sub.get("id", "")
+        status      = sub.get("status", "")
+        expira_ts   = float(sub.get("current_period_end", 0))
+        customer_id = sub.get("customer", "")
+        # Leer el plan del metadata del subscription (Stripe lo hereda del Price)
+        meta_sub = sub.get("metadata") or {}
+        plan_meta = meta_sub.get("suscripcion", "").lower()
+
+        if status == "active" and plan_meta and sub_id:
+            # Buscar usuario por subscription_id y actualizar su expiración
+            pool = db._get_pool()
+            async with pool.acquire() as conn:
+                tid_row = await conn.fetchrow(
+                    "SELECT id FROM usuarios WHERE stripe_subscription_id = $1", sub_id
+                )
+                if tid_row:
+                    await db.activar_suscripcion(
+                        tid_row["id"], plan_meta, customer_id, sub_id, expira_ts
+                    )
+        elif status in ("canceled", "unpaid", "past_due"):
+            tid_afectado = await db.desactivar_suscripcion_por_stripe_id(sub_id)
+            if tid_afectado:
+                try:
+                    await telegram_app.bot.send_message(
+                        chat_id=tid_afectado,
+                        text="⚠️ <b>Suscripción pausada.</b>\n\nTu plan ha vuelto a Free. Renueva desde /plan.",
+                        parse_mode="HTML"
+                    )
+                except Exception: pass
+
+    # ── EVENTO 3: Suscripción cancelada definitivamente ───────────────────
+    elif tipo == "customer.subscription.deleted":
+        sub    = event["data"]["object"]
+        sub_id = sub.get("id", "")
+        tid_afectado = await db.desactivar_suscripcion_por_stripe_id(sub_id)
+        if tid_afectado:
+            try:
+                await telegram_app.bot.send_message(
+                    chat_id=tid_afectado,
+                    text="❌ <b>Suscripción cancelada.</b>\n\nTu plan ha vuelto a Free. Puedes volver a suscribirte cuando quieras desde /plan.",
+                    parse_mode="HTML"
+                )
+            except Exception: pass
+
     else:
-        logger.debug(f"[STRIPE] Evento ignorado: {event['type']}")
-        # Marcar igualmente para no reprocesar otros tipos de eventos
+        logger.debug(f"[STRIPE] Evento ignorado: {tipo}")
         if event_id:
             await db.marcar_evento_procesado(event_id)
 
@@ -3395,6 +3657,19 @@ async def cron_interno_alertas():
             break
         except Exception as e:
             logger.error(f"[CRON INTERNO] Error en loop: {e}")
+
+async def higiene_db_loop():
+    """Bucle diario para purgar datos obsoletos y mantener la salud de la BD."""
+    logger.info("[HIGIENE] Iniciando loop de mantenimiento de base de datos (cada 24h)...")
+    while True:
+        try:
+            # Esperar 24 horas entre limpiezas
+            await asyncio.sleep(86400)
+            await db.purgar_datos_obsoletos()
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            logger.error(f"[HIGIENE] Error en loop de limpieza: {e}")
 
 @web_app.post("/cron/ejecutar")
 async def cron_ejecutar(request: Request, background_tasks: BackgroundTasks):

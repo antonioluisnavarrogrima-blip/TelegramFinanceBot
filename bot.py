@@ -2677,62 +2677,14 @@ async def manejador_botones(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # --- Eliminar ticker de la Cartera ---
     if query.data.startswith("rm_cartera_"):
-        ticker_rm = query.data.replace("rm_cartera_", "")
+        ticker_rm = query.data.replace("rm_cartera_", "").upper()
         await db.eliminar_de_cartera(chat_id, ticker_rm)
         await query.answer(f"🗑️ {ticker_rm} eliminado.", show_alert=False)
-        # Forzar recarga del panel de cartera
-        update.callback_query.data = "accion_cartera"
-        query._data = "accion_cartera"
-        # Recargar usando la misma lógica
-        tickers_cartera = await db.obtener_cartera(chat_id)
-        if not tickers_cartera:
-            await query.edit_message_text(
-                "💼 <b>Mi Cartera</b>\n\nTu cartera está vacía.",
-                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Volver", callback_data="volver_menu")]]),
-                parse_mode="HTML"
-            )
-        else:
-            # Redirigir a la vista completa reusando el handler
-            await query.edit_message_text("🔄 Actualizando cartera...")
-            # Pequeño truco: llamar al mismo handler simulando accion_cartera
-            class _FakeQuery:
-                data = "accion_cartera"
-                async def edit_message_text(self, *a, **kw): return await query.edit_message_text(*a, **kw)
-                async def answer(self, *a, **kw): return await query.answer(*a, **kw)
-                message = query.message
-            update._callback_query = _FakeQuery()
-            # Re-ejecutar via recursión directa es peligroso; simplest: repetir la lógica de display
-            lineas = ["💼 <b>Mi Cartera actualizada</b>\n"]
-            bots = []
-            for t in tickers_cartera:
-                datos_ws = websocket_client.cache_precios.get(t.upper())
-                if datos_ws:
-                    precio = datos_ws.get("regularMarketPrice", "N/D")
-                    fuente_ico = "⚡"
-                else:
-                    datos_bd = await db.obtener_yf_cache_bulk([t])
-                    datos_t = datos_bd.get(t.upper(), {})
-                    precio = datos_t.get("regularMarketPrice", datos_t.get("price", "N/D"))
-                    fuente_ico = "💾" if datos_t else "❓"
-                precio_str = f"${precio:.2f}" if isinstance(precio, (int, float)) else str(precio)
-                lineas.append(f"• <b>{t}</b>: {precio_str} {fuente_ico}")
-                bots.append([
-                    InlineKeyboardButton(f"🔍 Ver {t}", callback_data=f"view_cartera_{t}"),
-                    InlineKeyboardButton(f"🗑️", callback_data=f"rm_cartera_{t}")
-                ])
-            lineas.append("\n<i>⚡ = Tiempo real · 💾 = Caché BD</i>")
-            bots.append([InlineKeyboardButton("⬅️ Volver al Menú", callback_data="volver_menu")])
-            await query.edit_message_text("\n".join(lineas), reply_markup=InlineKeyboardMarkup(bots), parse_mode="HTML")
-        return
+        # Cambiamos el query.data para que el siguiente bloque (Mi Cartera) se ejecute automáticamente
+        query.data = "accion_cartera"
 
-
-        
-        await query.edit_message_text(
-            text=texto_cartera,
-            reply_markup=InlineKeyboardMarkup(botones_cartera),
-            parse_mode="HTML"
-        )
-        return
+    # --- Mi Cartera (visualización) ---
+    if query.data == "accion_cartera" or query.data == "cartera_csv":
 
     # --- Ver Empresa de la Cartera (Detalle DB) ---
     if query.data.startswith("view_cartera_"):

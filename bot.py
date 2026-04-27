@@ -2562,26 +2562,30 @@ async def manejador_botones(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         fuente_csv = "RealTime (WS)"
                         age = 0
                     else:
-                        datos_bd = await db.obtener_yf_cache_bulk([t_up])
+                        datos_bd = await db.obtener_yf_cache_bulk([t_up], allow_stale=True)
                         datos_t = datos_bd.get(t_up, {})
                         precio = datos_t.get("regularMarketPrice", datos_t.get("price", "N/D"))
-                        fuente_csv = "Caché DB"
-                        age = int(ahora - datos_t.get("updated_at", ahora))
+                        fuente_csv = "Caché DB (Hist)"
+                        age = int(ahora - datos_t.get("updated_at", ahora)) if datos_t.get("updated_at") else "N/D"
                     
                     writer.writerow([t_up, precio, fuente_csv, age])
                 
-                # Convertir a bytes para envío
-                csv_content = output.getvalue().encode("utf-8")
+                # Obtener el string y convertir a bytes
+                csv_string = output.getvalue()
                 output.close()
+                csv_bytes = csv_string.encode("utf-8")
                 
-                with io.BytesIO(csv_content) as bio:
-                    bio.name = "mi_cartera.csv"
-                    await context.bot.send_document(
-                        chat_id=chat_id,
-                        document=InputFile(bio, filename="mi_cartera.csv"),
-                        caption=f"📂 <b>Exportación Finalizada</b>\nSe han procesado {len(tickers_cartera)} activos.",
-                        parse_mode="HTML"
-                    )
+                # Usar BytesIO con el contenido ya en bytes
+                bio = io.BytesIO(csv_bytes)
+                bio.name = "mi_cartera.csv"
+                
+                await context.bot.send_document(
+                    chat_id=chat_id,
+                    document=bio,
+                    filename="mi_cartera.csv",
+                    caption=f"📂 <b>Exportación Finalizada</b>\nSe han procesado {len(tickers_cartera)} activos de tu cartera.",
+                    parse_mode="HTML"
+                )
             except Exception as e:
                 logger.error(f"[CSV] Error generando: {e}")
                 await query.answer("❌ Error técnico al generar el CSV.", show_alert=True)
@@ -2639,7 +2643,7 @@ async def manejador_botones(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     precio = datos_ws.get("regularMarketPrice", "N/D")
                     fuente_ico = "⚡"
                 else:
-                    datos_bd = await db.obtener_yf_cache_bulk([t])
+                    datos_bd = await db.obtener_yf_cache_bulk([t], allow_stale=True)
                     datos_t = datos_bd.get(t.upper(), {})
                     precio = datos_t.get("regularMarketPrice", datos_t.get("price", "N/D"))
                     fuente_ico = "💾" if datos_t else "❓"
@@ -2792,43 +2796,7 @@ async def manejador_botones(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await msg_esp.edit_text(texto_final, reply_markup=teclado, parse_mode="HTML")
         return
 
-    # --- Eliminar ticker de la Cartera ---
-    if query.data.startswith("rm_cartera_"):
-        ticker_rm = query.data.replace("rm_cartera_", "").upper()
-        await db.eliminar_de_cartera(chat_id, ticker_rm)
-        await query.answer(f"🗑️ {ticker_rm} eliminado.", show_alert=False)
-        
-        # Recargar cartera
-        tickers_cartera = await db.obtener_cartera(chat_id)
-        if not tickers_cartera:
-            await query.edit_message_text(
-                "💼 <b>Mi Cartera</b>\n\nTu cartera está vacía.",
-                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Volver", callback_data="volver_menu")]]),
-                parse_mode="HTML"
-            )
-        else:
-            lineas = ["💼 <b>Mi Cartera actualizada</b>\n"]
-            bots = []
-            for t in tickers_cartera:
-                datos_ws = websocket_client.cache_precios.get(t.upper())
-                if datos_ws:
-                    precio = datos_ws.get("regularMarketPrice", "N/D")
-                    fuente_ico = "⚡"
-                else:
-                    datos_bd = await db.obtener_yf_cache_bulk([t])
-                    datos_t = datos_bd.get(t.upper(), {})
-                    precio = datos_t.get("regularMarketPrice", datos_t.get("price", "N/D"))
-                    fuente_ico = "💾" if datos_t else "❓"
-                precio_str = f"${precio:.2f}" if isinstance(precio, (int, float)) else str(precio)
-                lineas.append(f"• <b>{t}</b>: {precio_str} {fuente_ico}")
-                bots.append([
-                    InlineKeyboardButton(f"🔍 Ver {t}", callback_data=f"view_cartera_{t}"),
-                    InlineKeyboardButton(f"🗑️", callback_data=f"rm_cartera_{t}")
-                ])
-            lineas.append("\n<i>⚡ = Tiempo real · 💾 = Caché BD</i>")
-            bots.append([InlineKeyboardButton("⬅️ Volver al Menú", callback_data="volver_menu")])
-            await query.edit_message_text("\n".join(lineas), reply_markup=InlineKeyboardMarkup(bots), parse_mode="HTML")
-        return
+    # (Bloque rm_cartera_ eliminado por duplicidad y gestionado arriba)
 
     # --- Botón Reintentar ---
     if query.data == "reintentar":

@@ -904,15 +904,14 @@ async def marcar_evento_procesado(event_id: str):
 
 
 
-async def obtener_yf_cache_bulk(tickers: list[str], require_fundamentals: bool = False) -> dict:
+async def obtener_yf_cache_bulk(tickers: list[str], require_fundamentals: bool = False, allow_stale: bool = False) -> dict:
     """
     Retorna datos cacheados válidos para los tickers solicitados.
 
     Args:
         require_fundamentals: Si True, se excluyen del resultado los registros
-            sin fundamentales (precio sin PER/Dividendo), forzando descarga fresca.
-            Actualmente YahooV11 siempre devuelve datos completos, pero el parámetro
-            se mantiene por compatibilidad con datos legados en caché.
+            sin fundamentales.
+        allow_stale: Si True, se ignoran los TTL y se devuelve lo que haya en la BD.
     """
     if not tickers: return {}
     pool = _get_pool()
@@ -933,8 +932,9 @@ async def obtener_yf_cache_bulk(tickers: list[str], require_fundamentals: bool =
             clase = row["clase"] or "ACCION"
             ttl = _YF_CACHE_TTL.get(clase, _TTL_DEFAULT)
             age = ahora - row["updated_at"]
-            if age > ttl:
-                continue  # Entrada expirada, ignorar
+            
+            if not allow_stale and age > ttl:
+                continue  # Entrada expirada
             data = json.loads(row["data"]) if isinstance(row["data"], str) else dict(row["data"])
             # Excluir datos legados sin fundamentales (datos pre-YahooV11 o degradados).
             if require_fundamentals and data.get("_fuente") in ("YahooV8_Degradado", "FMP", "AlphaVantage") and not data.get("trailingPE") and not data.get("dividendYield"):

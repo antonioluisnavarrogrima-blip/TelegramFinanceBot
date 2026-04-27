@@ -2502,65 +2502,89 @@ async def manejador_botones(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # --- Añadir ticker a la Cartera ---
     if query.data.startswith("add_cartera_"):
-        ticker_cartera = query.data.replace("add_cartera_", "")
+        ticker_cartera = query.data.replace("add_cartera_", "").upper().strip()
+        if not ticker_cartera:
+            await query.answer("❌ Error: Ticker no identificado.", show_alert=True)
+            return
+
+        # Dar feedback inmediato para quitar el reloj
+        await query.answer(f"💼 Procesando {ticker_cartera}...")
         
         # Gate Free: máximo 5 activos
         es_usuario_plus = await db.es_plus(chat_id)
         if not es_usuario_plus:
             tickers_actuales = await db.obtener_cartera(chat_id)
             if len(tickers_actuales) >= 5:
-                await query.answer(
-                    "⚠️ Límite de 5 activos en el plan Free.\n\n"
-                    "Usa /plan para actualizar a Plus y tener cartera ilimitada.",
-                    show_alert=True
+                await context.bot.send_message(
+                    chat_id=chat_id,
+                    text="⚠️ <b>Límite de Cartera alcanzado</b>\n\nEl plan Free permite un máximo de 5 activos. Actualiza a Plus para seguimiento ilimitado.",
+                    reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⭐ Ver Plan Plus", callback_data="ver_plan_plus")]]),
+                    parse_mode="HTML"
                 )
                 return
 
         exito = await db.add_a_cartera(chat_id, ticker_cartera)
         if exito:
-            await query.answer(f"✅ {ticker_cartera} añadido a tu cartera.", show_alert=True)
+            await context.bot.send_message(chat_id=chat_id, text=f"✅ <b>{ticker_cartera}</b> se ha añadido a tu cartera correctamente.", parse_mode="HTML")
         else:
-            await query.answer(f"⚠️ {ticker_cartera} ya está en tu cartera.", show_alert=True)
+            await context.bot.send_message(chat_id=chat_id, text=f"ℹ️ <b>{ticker_cartera}</b> ya estaba en tu cartera.", parse_mode="HTML")
         return
 
     # --- Mi Cartera (visualización) ---
     if query.data == "accion_cartera" or query.data == "cartera_csv":
         # Exportar CSV (solo Plus)
         if query.data == "cartera_csv":
+            # 1. Feedback inmediato
+            await query.answer("📊 Generando informe CSV...")
+            
             es_usuario_plus = await db.es_plus(chat_id)
             if not es_usuario_plus:
-                await query.answer("⭐ El export CSV es exclusivo de Plus. Usa /plan para actualizar.", show_alert=True)
+                await query.answer("⭐ El export CSV es exclusivo de Plus.", show_alert=True)
                 return
+            
             tickers_cartera = await db.obtener_cartera(chat_id)
             if not tickers_cartera:
-                await query.answer("Tu cartera está vacía.", show_alert=True)
+                await query.answer("La cartera está vacía.", show_alert=True)
                 return
             
-            # Construir CSV
-            import csv, io as _io
-            buf_csv = _io.StringIO()
-            writer = csv.writer(buf_csv)
-            writer.writerow(["Ticker", "Precio", "Fuente", "Timestamp"])
-            for t in tickers_cartera:
-                datos_ws = websocket_client.cache_precios.get(t.upper())
-                if datos_ws:
-                    precio = datos_ws.get("regularMarketPrice", "N/D")
-                    fuente_csv = "WebSocket"
-                    ts = datos_ws.get("_ts", "")
-                else:
-                    datos_bd = await db.obtener_yf_cache_bulk([t])
-                    datos_t = datos_bd.get(t.upper(), {})
-                    precio = datos_t.get("regularMarketPrice", datos_t.get("price", "N/D"))
-                    fuente_csv = "Cache BD"
-                    ts = datos_t.get("updated_at", "")
-                writer.writerow([t, precio, fuente_csv, ts])
-            
-            csv_bytes = buf_csv.getvalue().encode("utf-8")
-            await context.bot.send_document(
-                chat_id=chat_id,
-                document=InputFile(_io.BytesIO(csv_bytes), filename="cartera.csv"),
-                caption="📊 Tu cartera exportada. Ábrela en Excel o Google Sheets."
-            )
+            try:
+                import csv
+                output = io.StringIO()
+                writer = csv.writer(output)
+                writer.writerow(["Ticker", "Precio", "Fuente", "Antigüedad (s)"])
+                
+                ahora = time.time()
+                for t in tickers_cartera:
+                    t_up = t.upper()
+                    datos_ws = websocket_client.cache_precios.get(t_up)
+                    if datos_ws:
+                        precio = datos_ws.get("regularMarketPrice", "N/D")
+                        fuente_csv = "RealTime (WS)"
+                        age = 0
+                    else:
+                        datos_bd = await db.obtener_yf_cache_bulk([t_up])
+                        datos_t = datos_bd.get(t_up, {})
+                        precio = datos_t.get("regularMarketPrice", datos_t.get("price", "N/D"))
+                        fuente_csv = "Caché DB"
+                        age = int(ahora - datos_t.get("updated_at", ahora))
+                    
+                    writer.writerow([t_up, precio, fuente_csv, age])
+                
+                # Convertir a bytes para envío
+                csv_content = output.getvalue().encode("utf-8")
+                output.close()
+                
+                with io.BytesIO(csv_content) as bio:
+                    bio.name = "mi_cartera.csv"
+                    await context.bot.send_document(
+                        chat_id=chat_id,
+                        document=InputFile(bio, filename="mi_cartera.csv"),
+                        caption=f"📂 <b>Exportación Finalizada</b>\nSe han procesado {len(tickers_cartera)} activos.",
+                        parse_mode="HTML"
+                    )
+            except Exception as e:
+                logger.error(f"[CSV] Error generando: {e}")
+                await query.answer("❌ Error técnico al generar el CSV.", show_alert=True)
             return
 
         # Vista normal

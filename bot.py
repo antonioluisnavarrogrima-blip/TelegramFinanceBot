@@ -1651,6 +1651,8 @@ async def _ejecutar_tabla_wizard(query, context, chat_id: int):
         u = broker_url.replace("{ticker}", ticker) if "{ticker}" in broker_url else broker_url
         botones.append([InlineKeyboardButton("Comprar en Broker 🛒", url=u)])
     botones.append([InlineKeyboardButton(f"Ver en {fuente_info['nombre']} 📈", url=url_chart)])
+    botones.append([InlineKeyboardButton("💼 Añadir a Cartera", callback_data=f"add_cartera_{ticker}")])
+    botones.append([InlineKeyboardButton("🔔 Crear Alerta", callback_data="crear_alerta")])
     teclado = InlineKeyboardMarkup(botones)
 
     try:
@@ -1701,6 +1703,8 @@ async def _ejecutar_tabla_desde_message(update, context, chat_id: int):
         u = broker_url.replace("{ticker}", ticker) if "{ticker}" in broker_url else broker_url
         botones.append([InlineKeyboardButton("Comprar en Broker 🛒", url=u)])
     botones.append([InlineKeyboardButton(f"Ver en {fuente_info['nombre']} 📈", url=url_chart)])
+    botones.append([InlineKeyboardButton("💼 Añadir a Cartera", callback_data=f"add_cartera_{ticker}")])
+    botones.append([InlineKeyboardButton("🔔 Crear Alerta", callback_data="crear_alerta")])
     teclado = InlineKeyboardMarkup(botones)
 
     try:
@@ -1835,9 +1839,7 @@ async def manejador_botones(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if query.data == "accion_cartera":
-        teclado = InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Volver al Menú", callback_data="volver_menu")]])
-        await query.edit_message_text("💼 <b>Mi Cartera</b>\n\n(Función en desarrollo: Próximamente podrás sincronizar y hacer seguimiento de tus activos).", reply_markup=teclado, parse_mode="HTML")
-        return
+        pass  # cae al handler completo más abajo
 
     if query.data == "accion_macro":
         teclado = InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Volver al Menú", callback_data="volver_menu")]])
@@ -1885,6 +1887,8 @@ async def manejador_botones(update: Update, context: ContextTypes.DEFAULT_TYPE):
             u = broker_url.replace("{ticker}", ticker) if "{ticker}" in broker_url else broker_url
             botones.append([InlineKeyboardButton("Comprar en Broker 🛒", url=u)])
         botones.append([InlineKeyboardButton(f"Ver en {fuente_info['nombre']} 📈", url=url_chart)])
+        botones.append([InlineKeyboardButton("💼 Añadir a Cartera", callback_data=f"add_cartera_{ticker}")])
+        botones.append([InlineKeyboardButton("🔔 Crear Alerta", callback_data="crear_alerta")])
         teclado = InlineKeyboardMarkup(botones)
 
         import io
@@ -2969,6 +2973,7 @@ async def conversacion_inversor(update: Update, context: ContextTypes.DEFAULT_TY
         botones.append([InlineKeyboardButton(text="Ejecutar Compra en Broker 🛒", url=url_broker_final)])
     nombre_fuente = FUENTES_DATOS.get(fuente, FUENTES_DATOS["yahoo"])["nombre"]
     botones.append([InlineKeyboardButton(text=f"Validar en {nombre_fuente} 📈", url=url_compra)])
+    botones.append([InlineKeyboardButton(text="💼 Añadir a Cartera", callback_data=f"add_cartera_{ticker}")])
     botones.append([InlineKeyboardButton(text="🔔 Crear Alerta Diaria (1 crédito/hit)", callback_data="crear_alerta")])
     teclado = InlineKeyboardMarkup(botones)
 

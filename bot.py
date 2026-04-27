@@ -1044,7 +1044,8 @@ async def _pipeline_hibrido_interno(
             "  • 'REITs con rentabilidad alta'",
             None, None, None
         )
-    clase_activo = extraccion.get("clase_activo", "ACCION").upper()
+    clase_activo = (extraccion.get("clase_activo") or "ACCION").upper()
+    if not clase_activo: clase_activo = "ACCION"
     
     # EL FIX: Modo Best Effort -> Ignorar filtros restrictivos
     es_best_effort = "__BEST_EFFORT__" in solicitud
@@ -2708,19 +2709,63 @@ async def manejador_botones(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # --- Ver Empresa de la Cartera (Detalle DB) ---
     if query.data.startswith("view_cartera_"):
         ticker_view = query.data.replace("view_cartera_", "").upper()
-        # Informar al usuario
         await query.answer(f"🔍 Recuperando ficha de {ticker_view}...")
-        msg_esp = await query.message.reply_text(f"⏳ Consultando terminal de datos para <b>{ticker_view}</b>...", parse_mode="HTML")
+        msg_esp = await query.message.reply_text(f"⏳ Consultando base de datos para <b>{ticker_view}</b>...", parse_mode="HTML")
         
-        # Usar el pipeline hibrido. 
-        # Inyectamos el ticker directamente para que el extractor lo use.
+        # BYPASS IA: Construir extracción manual para evitar coste de créditos y latencia
+        extraccion_directa = {
+            "tickers_manuales": [ticker_view],
+            "clase_activo": "ACCION",
+            "perfil": "Balanceado",
+            "sector": "general",
+            "filtros_dinamicos": []
+        }
+        
+        # Intentar ajustar clase según semillas
+        pool = db._get_pool()
+        async with pool.acquire() as conn:
+            row = await conn.fetchrow("SELECT clase FROM semillas WHERE ticker = $1", ticker_view)
+            if row: extraccion_directa["clase_activo"] = row["clase"]
+
         fuente = await db.obtener_fuente_datos(chat_id)
         
-        # Pequeño bypass: Si ya está en la cartera, forzamos un prompt que garantice el análisis del ticker.
-        prompt_especifico = f"Dame el análisis detallado y datos fundamentales de {ticker_view}."
-        
-        # Ejecutar pipeline (esto refrescará cache si es necesario)
-        await pipeline_hibrido(prompt_especifico, msg_espera=msg_esp, fuente_datos=fuente, tid=chat_id)
+        # Ejecutar pipeline interno (dentro del semáforo)
+        async with _PIPELINE_SEMA:
+            texto_final, grafico_bytes, url_compra, ticker = await _pipeline_hibrido_interno(
+                extraccion_directa, f"Visualización directa de {ticker_view}", msg_esp, fuente, tid=chat_id
+            )
+            
+            if not texto_final:
+                await msg_esp.edit_text(f"❌ No se han podido recuperar datos de <b>{ticker_view}</b> en este momento.", parse_mode="HTML")
+                return
+
+            # Construir teclado
+            broker_url = await db.obtener_broker_url(chat_id)
+            botones = []
+            if broker_url:
+                url_b = broker_url.replace("{ticker}", ticker) if "{ticker}" in broker_url else broker_url
+                botones.append([InlineKeyboardButton(text="Ejecutar Compra 🛒", url=url_b)])
+            if url_compra:
+                nombre_f = FUENTES_DATOS.get(fuente, FUENTES_DATOS["yahoo"])["nombre"]
+                botones.append([InlineKeyboardButton(text=f"Ver en {nombre_f} 📈", url=url_compra)])
+            
+            botones.append([InlineKeyboardButton("⬅️ Volver a Cartera", callback_data="accion_cartera")])
+            teclado = InlineKeyboardMarkup(botones)
+
+            # Enviar resultado
+            try:
+                if grafico_bytes:
+                    with io.BytesIO(grafico_bytes) as buf:
+                        await context.bot.send_photo(
+                            chat_id=chat_id, photo=InputFile(buf, filename=f"{ticker_view}.webp"),
+                            caption=texto_final[:1024], reply_markup=teclado, parse_mode="HTML"
+                        )
+                else:
+                    await context.bot.send_message(chat_id=chat_id, text=texto_final, reply_markup=teclado, parse_mode="HTML")
+                await msg_esp.delete()
+            except Exception as e:
+                logger.error(f"[VIEW-CARTERA] Error enviando: {e}")
+                await msg_esp.edit_text(texto_final, reply_markup=teclado, parse_mode="HTML")
         return
 
     # --- Eliminar ticker de la Cartera ---

@@ -29,7 +29,7 @@ async def connect_binance():
         logger.error("[WEBSOCKET] No se puede iniciar Binance WS. Falta librería 'websockets'.")
         return
 
-    uri = "wss://stream.binance.com:9443/ws/btcusdt@trade"
+    uri = "wss://stream.binance.us:9443/ws/btcusdt@trade"
     
     while _ws_running:
         try:

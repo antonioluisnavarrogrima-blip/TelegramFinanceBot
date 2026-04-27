@@ -184,6 +184,17 @@ async def inicializar_db():
             ON yf_cache (updated_at)
         """)
 
+        # ── Tabla de Cartera del Usuario ───────────────────────────────
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS cartera_usuario (
+                id SERIAL PRIMARY KEY,
+                user_id BIGINT REFERENCES usuarios(id) ON DELETE CASCADE,
+                ticker TEXT NOT NULL,
+                fecha_agregado FLOAT NOT NULL,
+                UNIQUE(user_id, ticker)
+            )
+        """)
+
     
         # ── RLS y Seguridad por DEFECTO ──────────────────────────────────────
         tablas = ["usuarios", "semillas", "stripe_eventos", "yf_cache"]
@@ -1048,4 +1059,45 @@ async def incrementar_fallos_alerta(alert_ids: list[int]):
     pool = _get_pool()
     async with pool.acquire() as conn:
         await conn.execute("UPDATE alertas_inversion SET fallos_consecutivos = fallos_consecutivos + 1 WHERE id = ANY($1::int[])", alert_ids)
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 9. GESTIÓN DE CARTERA
+# ═══════════════════════════════════════════════════════════════════════════════
+
+async def add_a_cartera(tid: int, ticker: str) -> bool:
+    """Añade un ticker a la cartera del usuario. Devuelve True si se añadió, False si ya existía."""
+    pool = _get_pool()
+    ahora = time.time()
+    try:
+        async with pool.acquire() as conn:
+            await conn.execute(
+                """
+                INSERT INTO cartera_usuario (user_id, ticker, fecha_agregado)
+                VALUES ($1, $2, $3)
+                """,
+                tid, ticker.upper(), ahora
+            )
+            return True
+    except asyncpg.UniqueViolationError:
+        return False
+    except Exception as e:
+        logger.error(f"[DB] Error añadiendo a cartera: {e}")
+        return False
+
+async def eliminar_de_cartera(tid: int, ticker: str) -> bool:
+    """Elimina un ticker de la cartera."""
+    pool = _get_pool()
+    async with pool.acquire() as conn:
+        res = await conn.execute("DELETE FROM cartera_usuario WHERE user_id = $1 AND ticker = $2", tid, ticker.upper())
+        return res != "DELETE 0"
+
+async def obtener_cartera(tid: int) -> list[str]:
+    """Devuelve la lista de tickers en la cartera del usuario."""
+    pool = _get_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT ticker FROM cartera_usuario WHERE user_id = $1 ORDER BY fecha_agregado ASC", 
+            tid
+        )
+        return [r["ticker"] for r in rows]
 

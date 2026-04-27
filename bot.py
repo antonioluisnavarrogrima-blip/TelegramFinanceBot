@@ -2184,6 +2184,8 @@ async def manejador_botones(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         n_fuente = FUENTES_DATOS.get(fuente, FUENTES_DATOS["yahoo"])["nombre"]
         botones.append([InlineKeyboardButton(text=f"Validar en {n_fuente} 📈", url=url_compra)])
+        botones.append([InlineKeyboardButton(text="💼 Añadir a Cartera", callback_data=f"add_cartera_{ticker}")])
+        botones.append([InlineKeyboardButton(text="🔔 Crear Alerta", callback_data="crear_alerta")])
         teclado_final = InlineKeyboardMarkup(botones)
 
         # Entrega de datos y renderizado (reutilizando tu manejador de excepciones)
@@ -2265,6 +2267,7 @@ async def manejador_botones(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 u = broker_url.replace("{ticker}", ticker) if "{ticker}" in broker_url else broker_url
                 botones.append([InlineKeyboardButton("Ejecutar Compra 🛒", url=u)])
             botones.append([InlineKeyboardButton(f"Ver en {FUENTES_DATOS.get(fuente, FUENTES_DATOS['yahoo'])['nombre']} 📈", url=url_compra)])
+            botones.append([InlineKeyboardButton(text="💼 Añadir a Cartera", callback_data=f"add_cartera_{ticker}")])
             botones.append([InlineKeyboardButton(text="🔔 Crear Alerta Diaria (1 crédito/hit)", callback_data="crear_alerta")])
             teclado = InlineKeyboardMarkup(botones)
 
@@ -2305,6 +2308,7 @@ async def manejador_botones(update: Update, context: ContextTypes.DEFAULT_TYPE):
             botones.append([InlineKeyboardButton(text="Ejecutar Compra 🛒", url=url_broker_final)])
         nombre_fuente = FUENTES_DATOS.get(fuente, FUENTES_DATOS["yahoo"])["nombre"]
         botones.append([InlineKeyboardButton(text=f"Ver en {nombre_fuente} 📈", url=url_compra)])
+        botones.append([InlineKeyboardButton(text="💼 Añadir a Cartera", callback_data=f"add_cartera_{ticker}")])
         botones.append([InlineKeyboardButton(text="🔔 Crear Alerta Diaria (1 crédito/hit)", callback_data="crear_alerta")])
         teclado = InlineKeyboardMarkup(botones)
 
@@ -2489,6 +2493,96 @@ async def manejador_botones(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text(texto, reply_markup=InlineKeyboardMarkup(botones), parse_mode="HTML")
         else:
             await query.answer("❌ Error al borrar.", show_alert=True)
+        return
+
+    # --- Añadir ticker a la Cartera ---
+    if query.data.startswith("add_cartera_"):
+        ticker_cartera = query.data.replace("add_cartera_", "")
+        exito = await db.add_a_cartera(chat_id, ticker_cartera)
+        if exito:
+            await query.answer(f"✅ {ticker_cartera} añadido a tu cartera.", show_alert=True)
+        else:
+            await query.answer(f"⚠️ {ticker_cartera} ya está en tu cartera.", show_alert=True)
+        return
+
+    # --- Mi Cartera (visualización) ---
+    if query.data == "accion_cartera":
+        tickers_cartera = await db.obtener_cartera(chat_id)
+        if not tickers_cartera:
+            await query.edit_message_text(
+                "💼 <b>Mi Cartera</b>\n\nTu cartera está vacía.\n\n"
+                "<i>Cuando encuentres una oportunidad de inversión, pulsa el botón '💼 Añadir a Cartera' para guardarla aquí.</i>",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Volver", callback_data="volver_menu")]]),
+                parse_mode="HTML"
+            )
+            return
+
+        # Construir panel de cartera
+        lineas = ["💼 <b>Mi Cartera</b>\n"]
+        botones_cartera = []
+        
+        for t in tickers_cartera:
+            # 1º intento: precio en tiempo real desde WebSocket (RAM)
+            datos_ws = websocket_client.cache_precios.get(t.upper())
+            if datos_ws:
+                precio = datos_ws.get("regularMarketPrice", "N/D")
+                fuente_ico = "⚡"  # Lightning = tiempo real
+            else:
+                # 2º intento: desde la caché de BD (Yahoo/FMP)
+                datos_bd = await db.obtener_yf_cache_bulk([t])
+                datos_t = datos_bd.get(t.upper(), {})
+                precio = datos_t.get("regularMarketPrice", datos_t.get("price", "N/D"))
+                fuente_ico = "💾" if datos_t else "❓"
+            
+            precio_str = f"${precio:.2f}" if isinstance(precio, (int, float)) else str(precio)
+            lineas.append(f"• <b>{t}</b>: {precio_str} {fuente_ico}")
+            botones_cartera.append([InlineKeyboardButton(f"🗑️ Eliminar {t}", callback_data=f"rm_cartera_{t}")])
+        
+        lineas.append("\n<i>⚡ = Tiempo real (WebSocket) · 💾 = Caché BD</i>")
+        texto_cartera = "\n".join(lineas)
+        botones_cartera.append([InlineKeyboardButton("⬅️ Volver al Menú", callback_data="volver_menu")])
+        
+        await query.edit_message_text(
+            text=texto_cartera,
+            reply_markup=InlineKeyboardMarkup(botones_cartera),
+            parse_mode="HTML"
+        )
+        return
+
+    # --- Eliminar ticker de la Cartera ---
+    if query.data.startswith("rm_cartera_"):
+        ticker_rm = query.data.replace("rm_cartera_", "")
+        await db.eliminar_de_cartera(chat_id, ticker_rm)
+        await query.answer(f"🗑️ {ticker_rm} eliminado de tu cartera.", show_alert=False)
+        # Redirigir de nuevo al menú de cartera actualizado
+        await manejador_botones.__wrapped__(update, context) if hasattr(manejador_botones, '__wrapped__') else None
+        # Simplemente recargamos la cartera editando el mensaje
+        tickers_cartera = await db.obtener_cartera(chat_id)
+        if not tickers_cartera:
+            await query.edit_message_text(
+                "💼 <b>Mi Cartera</b>\n\nTu cartera está vacía.",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Volver", callback_data="volver_menu")]]),
+                parse_mode="HTML"
+            )
+        else:
+            lineas = ["💼 <b>Mi Cartera</b>\n"]
+            botones_cartera = []
+            for t in tickers_cartera:
+                datos_ws = websocket_client.cache_precios.get(t.upper())
+                if datos_ws:
+                    precio = datos_ws.get("regularMarketPrice", "N/D")
+                    fuente_ico = "⚡"
+                else:
+                    datos_bd = await db.obtener_yf_cache_bulk([t])
+                    datos_t = datos_bd.get(t.upper(), {})
+                    precio = datos_t.get("regularMarketPrice", datos_t.get("price", "N/D"))
+                    fuente_ico = "💾" if datos_t else "❓"
+                precio_str = f"${precio:.2f}" if isinstance(precio, (int, float)) else str(precio)
+                lineas.append(f"• <b>{t}</b>: {precio_str} {fuente_ico}")
+                botones_cartera.append([InlineKeyboardButton(f"🗑️ Eliminar {t}", callback_data=f"rm_cartera_{t}")])
+            lineas.append("\n<i>⚡ = Tiempo real (WebSocket) · 💾 = Caché BD</i>")
+            botones_cartera.append([InlineKeyboardButton("⬅️ Volver al Menú", callback_data="volver_menu")])
+            await query.edit_message_text("\n".join(lineas), reply_markup=InlineKeyboardMarkup(botones_cartera), parse_mode="HTML")
         return
 
     # --- Botón Reintentar ---
@@ -3039,9 +3133,10 @@ async def lifespan(app: FastAPI):
     await db.inicializar_db()
     await db.precargar_semillas_basicas()    # Asegura operatividad inmediata v4.3
 
-    # Iniciar conexión persistente por WebSocket
+    # Iniciar conexión persistente por WebSocket y Cron Interno
     await websocket_client.iniciar_websockets()
-
+    cron_task = asyncio.create_task(cron_interno_alertas())
+    
     # Pre-calentar el crumb de Financial Modeling Prep antes de que llegue tráfico de usuarios.
     logger.info("[LIFESPAN] Inicializando bot de Telegram...")
     await telegram_app.initialize()
@@ -3240,6 +3335,61 @@ async def _enviar_resultado_cron(tid: int, texto_final: str, grafico_bytes: byte
         
     return True
 
+async def procesar_todas_las_alertas():
+    grupos = await db.obtener_alertas_agrupadas_pendientes()
+    if not grupos:
+        return "No hay alertas pendientes."
+
+    for g in grupos:
+        hash_firma = g["hash_firma"]
+        extraccion = g["extraccion_json"]
+        alert_ids = g["alert_ids"]
+        user_ids = g["user_ids"]
+        solicitud_repr = g["solicitud_repr"]
+        
+        logger.info(f"[CRON MULTI] Procesando Hash: {hash_firma} para {len(user_ids)} usuarios.")
+        
+        # 1. Pipeline Cuantitativo Lote (Saltando Gemini)
+        try:
+            texto_final, grafico_bytes, url_compra, ticker = await _pipeline_hibrido_interno(
+                extraccion=extraccion,
+                solicitud=solicitud_repr,
+                msg_espera=None,
+                fuente_datos="yahoo",
+                tid=user_ids[0]
+            )
+        except Exception as e:
+            logger.error(f"[CRON MULTI] Error pipeline en Hash {hash_firma}: {e}")
+            await db.incrementar_fallos_alerta(alert_ids)
+            continue
+            
+        # 2. Distribución y Cobro
+        if url_compra:
+            for tid in set(user_ids):
+                # Jitter aleatorio
+                await asyncio.sleep(random.uniform(0, 1.5))
+                fuente = await db.obtener_fuente_datos(tid)
+                await _enviar_resultado_cron(tid, texto_final, grafico_bytes, url_compra, ticker, fuente)
+            
+            # Marcar enviadas para no repetir
+            await db.marcar_alertas_enviadas(alert_ids)
+        else:
+            logger.warning(f"[CRON MULTI] Sin resultados validos para Hash {hash_firma}.")
+            await db.incrementar_fallos_alerta(alert_ids)
+            
+    return f"Procesados {len(grupos)} grupos de alertas."
+
+async def cron_interno_alertas():
+    """Bucle infinito que procesa alertas cada 5 minutos independientemente de cron-job.org"""
+    logger.info("[CRON INTERNO] Inicializando cron asíncrono para alertas (cada 5m)...")
+    while True:
+        try:
+            await asyncio.sleep(300) # 5 minutos
+            await procesar_todas_las_alertas()
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            logger.error(f"[CRON INTERNO] Error en loop: {e}")
 
 @web_app.post("/cron/ejecutar")
 async def cron_ejecutar(request: Request, background_tasks: BackgroundTasks):
@@ -3247,50 +3397,8 @@ async def cron_ejecutar(request: Request, background_tasks: BackgroundTasks):
     if not CRON_SECRET or secret != CRON_SECRET:
         raise HTTPException(status_code=403, detail="Forbidden")
 
-    grupos = await db.obtener_alertas_agrupadas_pendientes()
-    if not grupos:
-        return {"ok": True, "msg": "No hay alertas pendientes."}
-
-    async def procesador_grupos(lote_grupos):
-        for g in lote_grupos:
-            hash_firma = g["hash_firma"]
-            extraccion = g["extraccion_json"]
-            alert_ids = g["alert_ids"]
-            user_ids = g["user_ids"]
-            solicitud_repr = g["solicitud_repr"]
-            
-            logger.info(f"[CRON MULTI] Procesando Hash: {hash_firma} para {len(user_ids)} usuarios.")
-            
-            # 1. Pipeline Cuantitativo Lote (Saltando Gemini)
-            try:
-                texto_final, grafico_bytes, url_compra, ticker = await _pipeline_hibrido_interno(
-                    extraccion=extraccion,
-                    solicitud=solicitud_repr,
-                    msg_espera=None,
-                    fuente_datos="yahoo",
-                    tid=user_ids[0]
-                )
-            except Exception as e:
-                logger.error(f"[CRON MULTI] Error pipeline en Hash {hash_firma}: {e}")
-                await db.incrementar_fallos_alerta(alert_ids)
-                continue
-                
-            # 2. Distribución y Cobro
-            if url_compra:
-                for tid in set(user_ids):
-                    # Jitter aleatorio
-                    await asyncio.sleep(random.uniform(0, 1.5))
-                    fuente = await db.obtener_fuente_datos(tid)
-                    await _enviar_resultado_cron(tid, texto_final, grafico_bytes, url_compra, ticker, fuente)
-                
-                # Marcar enviadas para no repetir hasta mañana
-                await db.marcar_alertas_enviadas(alert_ids)
-            else:
-                logger.warning(f"[CRON MULTI] Sin resultados validos para Hash {hash_firma}.")
-                await db.incrementar_fallos_alerta(alert_ids)
-
-    background_tasks.add_task(procesador_grupos, grupos)
-    return {"ok": True, "grupos_procesados": len(grupos)}
+    background_tasks.add_task(procesar_todas_las_alertas)
+    return {"ok": True, "msg": "Proceso de alertas iniciado en segundo plano."}
 
 
 @web_app.post("/admin/actualizar_seeds")

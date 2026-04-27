@@ -2320,26 +2320,55 @@ async def manejador_botones(update: Update, context: ContextTypes.DEFAULT_TYPE):
             logger.error(f"Fallo envío best effort: {e}")
         return
 
-    # --- Botón Suscribirse a Alerta ---
+    # --- Selección de Intervalo de Alerta ---
     if query.data == "crear_alerta":
         busqueda = await db.obtener_ultima_busqueda(chat_id)
         extraccion = await db.obtener_ultima_extraccion(chat_id)
         if not busqueda or not extraccion:
             await query.answer("❌ Error: No se pudo recuperar el contexto de la búsqueda (intenta hacer una búsqueda nueva primero).", show_alert=True)
             return
+
+        # Opciones de intervalo configurables
+        # Podemos leerlas de un ENV o usar una lista predefinida premium
+        opciones = [
+            ("⚡ Cada 4h", 4),
+            ("🌅 Cada 12h", 12),
+            ("📅 Diario (24h)", 24),
+            ("⏳ Semanal (168h)", 168)
+        ]
+        
+        botones = []
+        for texto, horas in opciones:
+            botones.append([InlineKeyboardButton(texto, callback_data=f"confirm_alerta_{horas}")])
+        botones.append([InlineKeyboardButton("🔙 Cancelar", callback_data="volver_menu")])
+        
+        await query.edit_message_text(
+            "🔔 <b>Configurar Frecuencia de Alerta</b>\n\n¿Cada cuánto tiempo quieres que el motor cuántico verifique esta oportunidad por ti?",
+            reply_markup=InlineKeyboardMarkup(botones),
+            parse_mode="HTML"
+        )
+        return
+
+    # --- Confirmación Final de Alerta ---
+    if query.data.startswith("confirm_alerta_"):
+        intervalo = int(query.data.replace("confirm_alerta_", ""))
+        busqueda = await db.obtener_ultima_busqueda(chat_id)
+        extraccion = await db.obtener_ultima_extraccion(chat_id)
+        
+        if not busqueda or not extraccion:
+            await query.answer("❌ Sesión expirada.", show_alert=True)
+            return
             
-        exito = await db.crear_alerta_inversion(chat_id, busqueda, extraccion)
+        exito = await db.crear_alerta_inversion(chat_id, busqueda, extraccion, intervalo=intervalo)
         if exito:
-            await query.answer("✅ ¡Suscrito! Te notificaremos automáticamente.", show_alert=True)
-            try:
-                # Ocultamos el botón para que no vuelva a pulsar
-                teclado_actual = query.message.reply_markup.inline_keyboard
-                nuevo_teclado = [fila for fila in teclado_actual if not any(getattr(b, 'callback_data', '') == "crear_alerta" for b in fila)]
-                await query.message.edit_reply_markup(reply_markup=InlineKeyboardMarkup(nuevo_teclado))
-            except Exception:
-                pass
+            await query.answer(f"✅ ¡Suscrito! Te notificaremos cada {intervalo}h.", show_alert=True)
+            await query.edit_message_text(
+                f"✅ <b>Alerta Programada</b>\n\nFrecuencia: Cada {intervalo} horas.\nRecibirás un reporte detallado en este chat cuando se detecten cambios significativos.",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Volver al Menú", callback_data="volver_menu")]]),
+                parse_mode="HTML"
+            )
         else:
-            await query.answer("⚠️ Has alcanzado el límite máximo de 5 alertas activas. Bórralas usando /alertas.", show_alert=True)
+            await query.answer("⚠️ Límite de 5 alertas alcanzado.", show_alert=True)
         return
 
     # --- Gestionar Alertas (desde menu) ---

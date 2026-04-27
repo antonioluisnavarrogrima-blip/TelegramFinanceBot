@@ -2496,7 +2496,6 @@ async def manejador_botones(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 botones.append([InlineKeyboardButton(f"🗑️ Borrar Alerta {i}", callback_data=f"del_alerta_{a['id']}")])
             botones.append([InlineKeyboardButton("⬅️ Volver al menú", callback_data="volver_menu")])
             await query.edit_message_text(texto, reply_markup=InlineKeyboardMarkup(botones), parse_mode="HTML")
-        else:
             await query.answer("❌ Error al borrar.", show_alert=True)
         return
 
@@ -2507,10 +2506,9 @@ async def manejador_botones(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.answer("❌ Error: Ticker no identificado.", show_alert=True)
             return
 
-        # Dar feedback inmediato para quitar el reloj
+        # Dar feedback inmediato
         await query.answer(f"💼 Procesando {ticker_cartera}...")
         
-        # Gate Free: máximo 5 activos
         es_usuario_plus = await db.es_plus(chat_id)
         if not es_usuario_plus:
             tickers_actuales = await db.obtener_cartera(chat_id)
@@ -2530,28 +2528,26 @@ async def manejador_botones(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await context.bot.send_message(chat_id=chat_id, text=f"ℹ️ <b>{ticker_cartera}</b> ya estaba en tu cartera.", parse_mode="HTML")
         return
 
-    # --- Mi Cartera (visualización) ---
+    # --- Mi Cartera (visualización y CSV) ---
     if query.data == "accion_cartera" or query.data == "cartera_csv":
-        # Exportar CSV (solo Plus)
+        es_usuario_plus = await db.es_plus(chat_id)
+        tickers_cartera = await db.obtener_cartera(chat_id)
+
+        # 1. Caso: Exportar CSV
         if query.data == "cartera_csv":
-            # 1. Feedback inmediato
-            await query.answer("📊 Generando informe CSV...")
-            
-            es_usuario_plus = await db.es_plus(chat_id)
+            await query.answer("📊 Generando informe...")
             if not es_usuario_plus:
                 await query.answer("⭐ El export CSV es exclusivo de Plus.", show_alert=True)
                 return
-            
-            tickers_cartera = await db.obtener_cartera(chat_id)
             if not tickers_cartera:
-                await query.answer("La cartera está vacía.", show_alert=True)
+                await query.answer("Tu cartera está vacía.", show_alert=True)
                 return
-            
+
             try:
                 import csv
                 output = io.StringIO()
                 writer = csv.writer(output)
-                writer.writerow(["Ticker", "Precio", "Fuente", "Antigüedad (s)"])
+                writer.writerow(["Ticker", "Precio", "Fuente", "Antiguedad_Segundos"])
                 
                 ahora = time.time()
                 for t in tickers_cartera:
@@ -2559,84 +2555,61 @@ async def manejador_botones(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     datos_ws = websocket_client.cache_precios.get(t_up)
                     if datos_ws:
                         precio = datos_ws.get("regularMarketPrice", "N/D")
-                        fuente_csv = "RealTime (WS)"
+                        fuente_csv = "RealTime_WS"
                         age = 0
                     else:
                         datos_bd = await db.obtener_yf_cache_bulk([t_up], allow_stale=True)
                         datos_t = datos_bd.get(t_up, {})
                         precio = datos_t.get("regularMarketPrice", datos_t.get("price", "N/D"))
-                        fuente_csv = "Caché DB (Hist)"
+                        fuente_csv = "Cache_DB"
                         age = int(ahora - datos_t.get("updated_at", ahora)) if datos_t.get("updated_at") else "N/D"
-                    
                     writer.writerow([t_up, precio, fuente_csv, age])
                 
-                # Obtener el string y convertir a bytes
-                csv_string = output.getvalue()
+                csv_bytes = output.getvalue().encode("utf-8")
                 output.close()
-                csv_bytes = csv_string.encode("utf-8")
                 
-                # Usar BytesIO con el contenido ya en bytes
-                bio = io.BytesIO(csv_bytes)
-                bio.name = "mi_cartera.csv"
-                
-                await context.bot.send_document(
-                    chat_id=chat_id,
-                    document=bio,
-                    filename="mi_cartera.csv",
-                    caption=f"📂 <b>Exportación Finalizada</b>\nSe han procesado {len(tickers_cartera)} activos de tu cartera.",
-                    parse_mode="HTML"
-                )
+                with io.BytesIO(csv_bytes) as bio:
+                    bio.name = "mi_cartera.csv"
+                    await query.message.reply_document(
+                        document=bio,
+                        filename="mi_cartera.csv",
+                        caption=f"📂 <b>Exportación Finalizada</b>\nSe han procesado {len(tickers_cartera)} activos de tu cartera.",
+                        parse_mode="HTML"
+                    )
             except Exception as e:
-                logger.error(f"[CSV] Error generando: {e}")
-                await query.answer("❌ Error técnico al generar el CSV.", show_alert=True)
+                logger.error(f"[CSV] Error: {e}")
+                await query.answer("❌ Error al generar el archivo.", show_alert=True)
             return
 
-        # Vista normal
-        tickers_cartera = await db.obtener_cartera(chat_id)
-        es_usuario_plus = await db.es_plus(chat_id)
-        
+        # 2. Caso: Visualización Normal
         if not tickers_cartera:
             bots_btn = [[InlineKeyboardButton("⬅️ Volver", callback_data="volver_menu")]]
             if not es_usuario_plus and STRIPE_PAYMENT_LINK:
                 bots_btn.insert(0, [InlineKeyboardButton("⭐ Actualizar a Plus", url=f"{STRIPE_PAYMENT_LINK}?client_reference_id={chat_id}")])
             await query.edit_message_text(
                 "💼 <b>Mi Cartera</b>\n\nTu cartera está vacía.\n\n"
-                "<i>Cuando encuentres una oportunidad de inversión, pulsa el botón '💼 Añadir a Cartera' para guardarla aquí.</i>",
+                "<i>Añade activos desde los análisis para verlos aquí.</i>",
                 reply_markup=InlineKeyboardMarkup(bots_btn),
                 parse_mode="HTML"
             )
             return
 
-        # Agrupar por clase de activo (usando semillas de BD)
-        CLASES_ICONOS = {
-            "ACCION": "🏢", "ETF": "📈", "REIT": "🏠",
-            "CRIPTO": "₿", "BONO": "📜", "?": "❓"
-        }
-
-        # Obtener clase de cada ticker desde semillas
+        # Lógica de agrupamiento
+        CLASES_ICONOS = {"ACCION": "🏢", "ETF": "📈", "REIT": "🏠", "CRIPTO": "₿", "BONO": "📜", "?": "❓"}
         pool = db._get_pool()
         async with pool.acquire() as conn:
-            rows_clase = await conn.fetch(
-                "SELECT ticker, clase FROM semillas WHERE ticker = ANY($1::text[])",
-                tickers_cartera
-            )
+            rows_clase = await conn.fetch("SELECT ticker, clase FROM semillas WHERE ticker = ANY($1::text[])", tickers_cartera)
         clase_map = {r["ticker"]: r["clase"] for r in rows_clase}
         
-        # Agrupar
-        grupos: dict[str, list] = {}
+        grupos = {}
         for t in tickers_cartera:
             clase = clase_map.get(t, "?")
             grupos.setdefault(clase, []).append(t)
 
-        lineas = ["💼 <b>Mi Cartera</b>"]
-        if es_usuario_plus:
-            lineas[0] += " ⭐"
-        lineas.append("")
-
+        lineas = ["💼 <b>Mi Cartera</b>" + (" ⭐" if es_usuario_plus else ""), ""]
         botones_cartera = []
         for clase, ticks in grupos.items():
-            ico = CLASES_ICONOS.get(clase, "❓")
-            lineas.append(f"{ico} <b>{clase}</b>")
+            lineas.append(f"{CLASES_ICONOS.get(clase, '❓')} <b>{clase}</b>")
             for t in ticks:
                 datos_ws = websocket_client.cache_precios.get(t.upper())
                 if datos_ws:
@@ -2655,12 +2628,10 @@ async def manejador_botones(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 ])
             lineas.append("")
 
-        lineas.append("<i>⚡ = Tiempo real (WebSocket) · 💾 = Caché BD</i>")
+        lineas.append("<i>⚡ = Tiempo real · 💾 = Caché BD</i>")
         if not es_usuario_plus:
             lineas.append(f"\n<i>📦 {len(tickers_cartera)}/5 activos (Free). ⭐ Plus = ilimitados + CSV</i>")
 
-        texto_cartera = "\n".join(lineas)
-        
         if es_usuario_plus:
             botones_cartera.append([InlineKeyboardButton("📥 Exportar CSV", callback_data="cartera_csv")])
         else:
@@ -2668,12 +2639,9 @@ async def manejador_botones(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 botones_cartera.append([InlineKeyboardButton("⭐ Actualizar a Plus", url=f"{STRIPE_PAYMENT_LINK}?client_reference_id={chat_id}")])
         botones_cartera.append([InlineKeyboardButton("⬅️ Volver al Menú", callback_data="volver_menu")])
         
-        await query.edit_message_text(
-            text=texto_cartera,
-            reply_markup=InlineKeyboardMarkup(botones_cartera),
-            parse_mode="HTML"
-        )
+        await query.edit_message_text(text="\n".join(lineas), reply_markup=InlineKeyboardMarkup(botones_cartera), parse_mode="HTML")
         return
+
 
     # --- Eliminar ticker de la Cartera ---
     if query.data.startswith("rm_cartera_"):
@@ -2683,8 +2651,6 @@ async def manejador_botones(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Cambiamos el query.data para que el siguiente bloque (Mi Cartera) se ejecute automáticamente
         query.data = "accion_cartera"
 
-    # --- Mi Cartera (visualización) ---
-    if query.data == "accion_cartera" or query.data == "cartera_csv":
 
     # --- Ver Empresa de la Cartera (Detalle DB) ---
     if query.data.startswith("view_cartera_"):

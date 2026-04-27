@@ -13,7 +13,7 @@ import os
 import time
 import json
 import logging
-from typing import Optional
+from typing import Optional, List
 
 import asyncpg
 
@@ -200,9 +200,21 @@ async def inicializar_db():
             )
         """)
 
+        # ── Tabla de Alertas de Precio (Stop-Loss / Take-Profit) ───────
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS alertas_precio (
+                id SERIAL PRIMARY KEY,
+                user_id BIGINT REFERENCES usuarios(id) ON DELETE CASCADE,
+                ticker TEXT NOT NULL,
+                tipo TEXT NOT NULL,
+                precio_objetivo FLOAT NOT NULL,
+                activa BOOLEAN NOT NULL DEFAULT TRUE
+            )
+        """)
+
     
         # ── RLS y Seguridad por DEFECTO ──────────────────────────────────────
-        tablas = ["usuarios", "semillas", "stripe_eventos", "yf_cache"]
+        tablas = ["usuarios", "semillas", "stripe_eventos", "yf_cache", "alertas_precio"]
         for t in tablas:
             try:
                 await conn.execute(f"ALTER TABLE {t} ENABLE ROW LEVEL SECURITY;")
@@ -1219,4 +1231,62 @@ async def purgar_datos_obsoletos() -> dict:
 
         logger.info(f"[HIGIENE] Limpieza completada: {count_yf} ticks de caché y {count_stripe} eventos Stripe eliminados.")
         return {"yf_cache_deleted": count_yf, "stripe_events_deleted": count_stripe}
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 7. GESTIÓN DE ALERTAS DE PRECIO (Stop-Loss / Take-Profit)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+async def crear_alerta_precio(user_id: int, ticker: str, tipo: str, precio_objetivo: float) -> int:
+    """Crea una nueva alerta de precio. tipo puede ser 'stop_loss' o 'take_profit'."""
+    pool = _get_pool()
+    async with pool.acquire() as conn:
+        id_alerta = await conn.fetchval(
+            """
+            INSERT INTO alertas_precio (user_id, ticker, tipo, precio_objetivo)
+            VALUES ($1, $2, $3, $4)
+            RETURNING id
+            """,
+            user_id, ticker.upper(), tipo.lower(), precio_objetivo
+        )
+    logger.info(f"[DB] Alerta de precio creada: {id_alerta} para {ticker} ({tipo} @ {precio_objetivo})")
+    return id_alerta
+
+async def listar_alertas_precio_usuario(user_id: int) -> List[dict]:
+    """Retorna todas las alertas de precio de un usuario."""
+    pool = _get_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT * FROM alertas_precio WHERE user_id = $1 ORDER BY id DESC",
+            user_id
+        )
+    return [dict(r) for r in rows]
+
+async def eliminar_alerta_precio(user_id: int, alerta_id: int) -> bool:
+    """Elimina una alerta de precio si pertenece al usuario."""
+    pool = _get_pool()
+    async with pool.acquire() as conn:
+        resultado = await conn.execute(
+            "DELETE FROM alertas_precio WHERE id = $1 AND user_id = $2",
+            alerta_id, user_id
+        )
+    return resultado == "DELETE 1"
+
+async def obtener_alertas_precio_activas() -> List[dict]:
+    """Retorna todas las alertas de precio activas para el proceso de verificación."""
+    pool = _get_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT * FROM alertas_precio WHERE activa = TRUE"
+        )
+    return [dict(r) for r in rows]
+
+async def desactivar_alerta_precio(alerta_id: int):
+    """Marca una alerta como inactiva tras dispararse."""
+    pool = _get_pool()
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE alertas_precio SET activa = FALSE WHERE id = $1",
+            alerta_id
+        )
 

@@ -488,7 +488,7 @@ async def generador_informe_goldman(ticker: str, sector: str, datos: dict, perfi
         f"PROHIBIDO usar etiquetas <font>, <span>, <div> o atributos CSS. Utiliza EXCLUSIVAMENTE HTML básico soportado por Telegram (<b>, <i>, <u>, <s>). "
         f"REGLA CRUCIAL: Si los datos provistos en el json del contexto son vacíos parciales o nulos (ej. {{}}), DEBES NEGARTE a generar un veredicto de invencion. Responde estrictamente con: 'DATOS INSUFICIENTES'. "
         f"{restricciones} "
-        f"Estructura: 🎯<b>Tesis:</b> [1 frase] | 📊<b>Datos:</b> [métricas] | ⚖️<b>Veredicto:</b> [1 frase]\n"
+        f"Estructura:\n🎯 <b>Tesis:</b> [1 frase]\n📊 <b>Datos:</b> [métricas clave]\n⚖️ <b>Veredicto:</b> [1 frase]\n"
         f"{ejemplo}"
     )
 
@@ -1382,7 +1382,7 @@ async def _pipeline_hibrido_interno(
     texto_final = (
         f"⚡ <b>Señal {emoji_clase} {clase_activo}: {ticker_final}</b>{aviso_grafico}\n"
         f"📈 Rendimiento ({temporalidad}): <b>{signo}{rend_str}%</b>\n\n"
-        f"🔍 <b>Análisis:</b>\n"
+        f"🔍 <b>Análisis Quant:</b>\n"
         f"{informe_gs}"
     )
     texto_final = _limpiar_html_telegram(texto_final)
@@ -3200,7 +3200,171 @@ async def comando_alertas(update: Update, context: ContextTypes.DEFAULT_TYPE):
     teclado = InlineKeyboardMarkup(botones)
     await update.message.reply_text(texto, reply_markup=teclado, parse_mode="HTML")
 
-telegram_app.add_handler(CommandHandler("alertas", comando_alertas))
+
+# ── COMANDO /alerta_precio ───────────────────────────────────────────────────
+
+async def comando_alerta_precio(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Configura una alerta de precio (Stop-Loss o Take-Profit)."""
+    tid = update.effective_user.id
+    # Validar plan Pro
+    info = await db.obtener_usuario(tid)
+    if info.get("plan", "free") == "free":
+        await update.message.reply_text(
+            "⭐ <b>Funcionalidad Pro</b>\n\nLas alertas de precio (Stop-Loss/Take-Profit) están reservadas para usuarios Plus o superiores.",
+            parse_mode="HTML"
+        )
+        return
+
+    args = context.args
+    if len(args) < 3:
+        await update.message.reply_text(
+            "❌ <b>Uso incorrecto</b>\n\nFormato: <code>/alerta_precio TICKER TIPO PRECIO</code>\n"
+            "Ejemplos:\n"
+            "• <code>/alerta_precio AAPL stop_loss 175.50</code>\n"
+            "• <code>/alerta_precio MSFT take_profit 450</code>",
+            parse_mode="HTML"
+        )
+        return
+
+    ticker = args[0].upper()
+    tipo = args[1].lower()
+    if tipo not in ["stop_loss", "take_profit"]:
+        await update.message.reply_text("❌ El tipo debe ser <code>stop_loss</code> o <code>take_profit</code>.", parse_mode="HTML")
+        return
+
+    try:
+        precio = float(args[2].replace(",", "."))
+    except ValueError:
+        await update.message.reply_text("❌ El precio debe ser un valor numérico.", parse_mode="HTML")
+        return
+
+    await db.crear_alerta_precio(tid, ticker, tipo, precio)
+    
+    emoji = "🛑" if tipo == "stop_loss" else "🎯"
+    nombre_tipo = "Stop-Loss" if tipo == "stop_loss" else "Take-Profit"
+    await update.message.reply_text(
+        f"✅ <b>Alerta Configurada</b>\n\n"
+        f"Activo: <code>{ticker}</code>\n"
+        f"Tipo: {emoji} {nombre_tipo}\n"
+        f"Precio Objetivo: <b>{precio}</b>\n\n"
+        f"Te avisaré en cuanto el precio cruce este umbral.",
+        parse_mode="HTML"
+    )
+
+# ── COMANDO /valor (DCF) ─────────────────────────────────────────────────────
+
+async def comando_valor(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Calcula el valor intrínseco (DCF) usando IA y datos de FMP."""
+    tid = update.effective_user.id
+    args = context.args
+    if not args:
+        await update.message.reply_text("❌ Indica un ticker. Ejemplo: <code>/valor AAPL</code>", parse_mode="HTML")
+        return
+
+    ticker = args[0].upper()
+    msg_espera = await update.message.reply_text(f"⏳ Calculando valor intrínseco para <b>{ticker}</b> (Modelo DCF + IA)...", parse_mode="HTML")
+
+    try:
+        # 1. Obtener datos DCF de FMP
+        fmp_keys = [k.strip() for k in FMP_API_KEYS.split(',') if k.strip()]
+        dcf_data = None
+        for key in fmp_keys:
+            url = f"https://financialmodelingprep.com/api/v3/discounted-cash-flow/{ticker}?apikey={key}"
+            resp = await http_client.get(url, timeout=10.0)
+            if resp.status_code == 200:
+                data = resp.json()
+                if data:
+                    dcf_data = data[0]
+                    break
+        
+        if not dcf_data:
+            await msg_espera.edit_text(f"❌ No se encontraron datos de valoración para <code>{ticker}</code>.")
+            return
+
+        # 2. Generar informe con Gemini
+        precio_actual = dcf_data.get("Stock Price", 0)
+        valor_dcf = dcf_data.get("dcf", 0)
+        margen = ((valor_dcf - precio_actual) / precio_actual * 100) if precio_actual > 0 else 0
+        
+        prompt = (
+            f"Actúa como un analista senior de Value Investing. Analiza el siguiente modelo DCF para {ticker}:\n"
+            f"- Precio Actual: {precio_actual}\n"
+            f"- Valor Intrínseco calculado (DCF): {valor_dcf}\n"
+            f"- Margen de Seguridad: {margen:.2f}%\n\n"
+            f"Explica brevemente (2-3 párrafos) si la acción está infravalorada o sobrevalorada, "
+            f"menciona qué significa este margen de seguridad y da un veredicto final. "
+            f"Usa HTML básico (<b>, <i>)."
+        )
+
+        res = await client.aio.models.generate_content(
+            model='gemini-2.5-flash',
+            contents=prompt
+        )
+        informe = res.text.strip()
+        informe = _limpiar_html_telegram(informe)
+
+        texto_final = (
+            f"💎 <b>Valoración Intrínseca: {ticker}</b>\n\n"
+            f"💵 Precio Actual: <b>{precio_actual:.2f}</b>\n"
+            f"📐 Valor DCF: <b>{valor_dcf:.2f}</b>\n"
+            f"🛡️ Margen: <b>{margen:+.2f}%</b>\n\n"
+            f"🔍 <b>Análisis del Analista:</b>\n"
+            f"{informe}"
+        )
+        await msg_espera.edit_text(texto_final, parse_mode="HTML")
+
+    except Exception as e:
+        logger.error(f"[VALOR] Error: {e}")
+        await msg_espera.edit_text("❌ Error al calcular el valor intrínseco. Inténtalo más tarde.")
+
+# ── COMANDO /insider ──────────────────────────────────────────────────────────
+
+async def comando_insider(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Muestra movimientos recientes de insiders."""
+    args = context.args
+    if not args:
+        await update.message.reply_text("❌ Indica un ticker. Ejemplo: <code>/insider AAPL</code>", parse_mode="HTML")
+        return
+
+    ticker = args[0].upper()
+    msg_espera = await update.message.reply_text(f"🔍 Buscando movimientos de directivos (Insider Trading) para <b>{ticker}</b>...", parse_mode="HTML")
+
+    try:
+        fmp_keys = [k.strip() for k in FMP_API_KEYS.split(',') if k.strip()]
+        insider_data = []
+        for key in fmp_keys:
+            url = f"https://financialmodelingprep.com/api/v4/insider-trading?symbol={ticker}&limit=5&apikey={key}"
+            resp = await http_client.get(url, timeout=10.0)
+            if resp.status_code == 200:
+                insider_data = resp.json()
+                break
+        
+        if not insider_data:
+            await msg_espera.edit_text(f"✅ No se han detectado movimientos de insiders recientes para <code>{ticker}</code>.")
+            return
+
+        lineas = []
+        for trade in insider_data:
+            fecha = trade.get("transactionDate", "N/A")
+            persona = trade.get("reportingName", "Desconocido")
+            tipo = trade.get("transactionType", "N/A")
+            cantidad = trade.get("securitiesTransacted", 0)
+            precio = trade.get("price", 0)
+            
+            emoji = "🟢 Compra" if "Purchase" in tipo or tipo == "P" else "🔴 Venta" if "Sale" in tipo or tipo == "S" else "⚪ Operación"
+            lineas.append(f"• <b>{fecha}</b>: {emoji} de {persona}\n  Cant: {cantidad:,} @ {precio:.2f}")
+
+        texto_final = (
+            f"🐳 <b>Movimientos de Insiders: {ticker}</b>\n\n"
+            + "\n\n".join(lineas)
+            + "\n\n<i>Datos basados en SEC Form 4 (Últimos 5 movimientos)</i>"
+        )
+        await msg_espera.edit_text(texto_final, parse_mode="HTML")
+
+    except Exception as e:
+        logger.error(f"[INSIDER] Error: {e}")
+        await msg_espera.edit_text("❌ Error al consultar movimientos de insiders.")
+
 
 
 # ── COMANDO /plan ─────────────────────────────────────────────────────────────
@@ -3250,8 +3414,11 @@ async def comando_plan(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_markup=InlineKeyboardMarkup(botones) if botones else None
     )
 
+telegram_app.add_handler(CommandHandler("alertas", comando_alertas))
+telegram_app.add_handler(CommandHandler("alerta_precio", comando_alerta_precio))
+telegram_app.add_handler(CommandHandler("valor", comando_valor))
+telegram_app.add_handler(CommandHandler("insider", comando_insider))
 telegram_app.add_handler(CommandHandler("plan", comando_plan))
-
 
 # ── COMANDO /comprar ──────────────────────────────────────────────────────────
 
@@ -3317,8 +3484,10 @@ async def lifespan(app: FastAPI):
 
     # Iniciar conexión persistente por WebSocket y Cron Interno
     await websocket_client.iniciar_websockets()
-    cron_task    = asyncio.create_task(cron_interno_alertas())
-    higiene_task = asyncio.create_task(higiene_db_loop())
+    asyncio.create_task(cron_interno_alertas())
+    asyncio.create_task(cron_alertas_precio_loop())
+    asyncio.create_task(higiene_db_loop())
+    asyncio.create_task(cron_informe_semanal_loop())
     
     # Pre-calentar el crumb de Financial Modeling Prep antes de que llegue tráfico de usuarios.
     logger.info("[LIFESPAN] Inicializando bot de Telegram...")
@@ -3638,6 +3807,131 @@ async def cron_interno_alertas():
             break
         except Exception as e:
             logger.error(f"[CRON INTERNO] Error en loop: {e}")
+
+async def cron_alertas_precio_loop():
+    """Bucle para verificar alertas de precio (Stop-Loss / Take-Profit) cada 5 minutos."""
+    logger.info("[CRON PRECIO] Inicializando verificador de alertas de precio (cada 5m)...")
+    while True:
+        try:
+            await asyncio.sleep(300)
+            await verificar_alertas_precio()
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            logger.error(f"[CRON PRECIO] Error en loop: {e}")
+
+async def verificar_alertas_precio():
+    """Verifica si se han cruzado los umbrales de precio de las alertas activas."""
+    alertas = await db.obtener_alertas_precio_activas()
+    if not alertas:
+        return
+
+    # Agrupar por ticker para optimizar llamadas a API
+    tickers = list(set(a["ticker"] for a in alertas))
+    precios = {}
+    
+    # Obtener precios actuales (intentar caché primero, luego API)
+    for t in tickers:
+        data = await db.obtener_yf_cache(t)
+        if data and "regularMarketPrice" in data:
+            precios[t] = data["regularMarketPrice"]
+        else:
+            # Fallback a API si no hay caché reciente
+            keys = [k.strip() for k in FMP_API_KEYS.split(',') if k.strip()]
+            for key in keys:
+                url = f"https://financialmodelingprep.com/api/v3/quote/{t}?apikey={key}"
+                resp = await http_client.get(url, timeout=10.0)
+                if resp.status_code == 200:
+                    d = resp.json()
+                    if d:
+                        precios[t] = d[0].get("price")
+                        break
+    
+    for alerta in alertas:
+        ticker = alerta["ticker"]
+        precio_actual = precios.get(ticker)
+        if precio_actual is None:
+            continue
+        
+        objetivo = alerta["precio_objetivo"]
+        tipo = alerta["tipo"]
+        disparada = False
+        
+        if tipo == "stop_loss" and precio_actual <= objetivo:
+            disparada = True
+        elif tipo == "take_profit" and precio_actual >= objetivo:
+            disparada = True
+            
+        if disparada:
+            emoji = "🛑" if tipo == "stop_loss" else "🎯"
+            nombre = "Stop-Loss" if tipo == "stop_loss" else "Take-Profit"
+            msg = (
+                f"{emoji} <b>¡ALERTA DE PRECIO DISPARADA!</b>\n\n"
+                f"Activo: <code>{ticker}</code>\n"
+                f"Tipo: {nombre}\n"
+                f"Precio Objetivo: <b>{objetivo}</b>\n"
+                f"Precio Actual: <b>{precio_actual}</b>\n\n"
+                f"La alerta ha sido desactivada automáticamente."
+            )
+            try:
+                await telegram_app.bot.send_message(chat_id=alerta["user_id"], text=msg, parse_mode="HTML")
+                await db.desactivar_alerta_precio(alerta["id"])
+            except Exception as e:
+                logger.error(f"[ALERTA PRECIO] Error enviando mensaje a {alerta['user_id']}: {e}")
+
+async def cron_informe_semanal_loop():
+    """Bucle que verifica si es domingo para enviar el informe de salud de cartera."""
+    import datetime
+    logger.info("[CRON SEMANAL] Inicializando loop de informe de salud (cada 1h)...")
+    while True:
+        try:
+            ahora = datetime.datetime.now()
+            # Domingo a las 10:00 AM (hora local del servidor)
+            if ahora.weekday() == 6 and ahora.hour == 10:
+                logger.info("[CRON SEMANAL] Iniciando generación de informes dominicales...")
+                await generar_y_enviar_informes_semanales()
+                # Dormir 1 hora para no repetir en el mismo bloque horario
+                await asyncio.sleep(3600)
+            else:
+                await asyncio.sleep(3600) # Verificar cada hora
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            logger.error(f"[CRON SEMANAL] Error en loop: {e}")
+
+async def generar_y_enviar_informes_semanales():
+    """Itera por los usuarios Pro y envía un resumen de salud de sus carteras."""
+    # 1. Obtener todos los usuarios con plan Pro/Plus
+    # Nota: Esta es una simplificación, en producción se usaría paginación.
+    pool = db._get_pool()
+    async with pool.acquire() as conn:
+        usuarios = await conn.fetch("SELECT id, plan FROM usuarios WHERE plan != 'free'")
+    
+    for u in usuarios:
+        tid = u["id"]
+        try:
+            cartera = await db.obtener_cartera(tid)
+            if not cartera:
+                continue
+                
+            resumenes = []
+            for ticker in cartera[:5]: # Limitar a Top 5 para no saturar APIs/Tokens
+                # Obtener info básica y rendimiento semanal
+                grafico, rend = await fabricante_de_graficos(ticker, "1w")
+                signo = "+" if rend >= 0 else ""
+                resumenes.append(f"• <b>{ticker}</b>: {signo}{rend:.2f}% esta semana.")
+            
+            if resumenes:
+                texto_informe = (
+                    "📊 <b>Informe Semanal de Salud de Cartera</b>\n\n"
+                    "Aquí tienes el rendimiento semanal de tus principales activos:\n\n"
+                    + "\n".join(resumenes) +
+                    "\n\n<i>Usa /cartera para ver detalles completos o /valor [TICKER] para análisis IA profundo.</i>"
+                )
+                await telegram_app.bot.send_message(chat_id=tid, text=texto_informe, parse_mode="HTML")
+                await asyncio.sleep(0.5) # Anti-flood
+        except Exception as e:
+            logger.error(f"[INFORME SEMANAL] Error procesando usuario {tid}: {e}")
 
 async def higiene_db_loop():
     """Bucle diario para purgar datos obsoletos y mantener la salud de la BD."""

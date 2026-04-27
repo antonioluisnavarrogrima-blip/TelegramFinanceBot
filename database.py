@@ -976,7 +976,10 @@ async def obtener_ultima_extraccion(tid: int) -> dict | None:
         if not row or not row["ultima_extraccion"]: return None
         return json.loads(row["ultima_extraccion"]) if isinstance(row["ultima_extraccion"], str) else row["ultima_extraccion"]
 
-async def crear_alerta_inversion(tid: int, solicitud_raw: str, extraccion_json: dict, intervalo: int = 24) -> bool:
+async def crear_alerta_inversion(tid: int, solicitud_raw: str, extraccion_json: dict, intervalo: int = None) -> bool:
+    if intervalo is None:
+        intervalo = int(os.getenv("DEFAULT_ALERT_INTERVAL_HOURS", 24))
+        
     pool = _get_pool()
     firma_str = json.dumps(extraccion_json, sort_keys=True)
     import hashlib

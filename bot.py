@@ -34,6 +34,7 @@ from telegram import BotCommandScopeDefault
 import html as _html_stdlib
 
 import database as db
+import websocket_client
 
 # --- CONFIGURACIÓN DE LOGGING ---
 logging.basicConfig(
@@ -85,6 +86,7 @@ FMP_API_KEYS               = os.getenv("FMP_API_KEYS", os.getenv("FMP_API_KEY", 
 ALPHAVANTAGE_API_KEYS      = os.getenv("ALPHAVANTAGE_API_KEYS", "")
 RAPIDAPI_KEY               = os.getenv("RAPIDAPI_KEY", "")
 CF_WORKER_PROXY            = os.getenv("CF_WORKER_PROXY", "")
+DEFAULT_ALERT_INTERVAL_HOURS = _obtener_int_env("DEFAULT_ALERT_INTERVAL_HOURS", 24)
 
 OPS = {
     ">": operator.gt, "<": operator.lt, ">=": operator.ge,
@@ -3008,6 +3010,9 @@ async def lifespan(app: FastAPI):
     await db.inicializar_db()
     await db.precargar_semillas_basicas()    # Asegura operatividad inmediata v4.3
 
+    # Iniciar conexión persistente por WebSocket
+    await websocket_client.iniciar_websockets()
+
     # Pre-calentar el crumb de Financial Modeling Prep antes de que llegue tráfico de usuarios.
     logger.info("[LIFESPAN] Inicializando bot de Telegram...")
     await telegram_app.initialize()
@@ -3041,7 +3046,8 @@ async def lifespan(app: FastAPI):
     await telegram_app.stop()
     await telegram_app.shutdown()
     
-    logger.info("[LIFESPAN] Cerrando pool de Base de Datos y HTTP Client...")
+    logger.info("[LIFESPAN] Cerrando conexiones persistentes...")
+    await websocket_client.detener_websockets()
     await db.cerrar_pool()
     await http_client.aclose()
     

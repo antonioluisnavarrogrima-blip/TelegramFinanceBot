@@ -1039,6 +1039,16 @@ async def eliminar_alerta_inversion(alerta_id: int, tid: int) -> bool:
         res = await conn.execute("DELETE FROM alertas_inversion WHERE id = $1 AND user_id = $2", alerta_id, tid)
         return res != "DELETE 0"
 
+async def actualizar_intervalo_alerta(alerta_id: int, intervalo: int, user_id: int) -> bool:
+    """Cambia la frecuencia de una alerta verificando ownership. Disponible para todos los usuarios."""
+    pool = _get_pool()
+    async with pool.acquire() as conn:
+        res = await conn.execute(
+            "UPDATE alertas_inversion SET intervalo = $1 WHERE id = $2 AND user_id = $3",
+            intervalo, alerta_id, user_id
+        )
+        return res != "UPDATE 0"
+
 async def obtener_alertas_agrupadas_pendientes() -> list[dict]:
     pool = _get_pool()
     ahora = time.time()

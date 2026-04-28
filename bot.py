@@ -2389,12 +2389,17 @@ async def manejador_botones(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Volver", callback_data="volver_menu")]])
             )
             return
-        texto = "📋 <b>Tus Alertas Activas (Ejecución Diaria):</b>\n\n"
+        _IVL = {4: "⚡4h", 12: "🌅12h", 24: "📅24h", 168: "⏳Semanal"}
+        texto = "📋 <b>Tus Alertas Activas:</b>\n\n"
         botones = []
         for i, a in enumerate(alertas, 1):
-            req_resumen = a['solicitud_raw'][:40] + "..." if len(a['solicitud_raw']) > 40 else a['solicitud_raw']
-            texto += f"<b>{i}.</b> <i>{req_resumen}</i>\n"
-            botones.append([InlineKeyboardButton(f"🗑️ Borrar Alerta {i}", callback_data=f"del_alerta_{a['id']}")])
+            req_resumen = a['solicitud_raw'][:35] + "..." if len(a['solicitud_raw']) > 35 else a['solicitud_raw']
+            ivl = _IVL.get(a.get('intervalo', 24), f"{a.get('intervalo','?')}h")
+            texto += f"<b>{i}.</b> <i>{req_resumen}</i> — {ivl}\n"
+            botones.append([
+                InlineKeyboardButton(f"⚙️ Editar {i}", callback_data=f"edit_alerta_{a['id']}"),
+                InlineKeyboardButton(f"🗑️ Borrar {i}", callback_data=f"del_alerta_{a['id']}"),
+            ])
         botones.append([InlineKeyboardButton("⬅️ Volver al menú", callback_data="volver_menu")])
         await query.edit_message_text(texto, reply_markup=InlineKeyboardMarkup(botones), parse_mode="HTML")
         return
@@ -2484,19 +2489,67 @@ async def manejador_botones(update: Update, context: ContextTypes.DEFAULT_TYPE):
         exito = await db.eliminar_alerta_inversion(alerta_id, chat_id)
         if exito:
             await query.answer("🗑️ Alerta eliminada.", show_alert=False)
-            alertas = await db.listar_alertas_usuario(chat_id)
-            if not alertas:
-                await query.edit_message_text("📭 No tienes ninguna alerta activa.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Volver al menú", callback_data="volver_menu")]]))
-                return
-            texto = "📋 <b>Tus Alertas Activas (Ejecución Diaria):</b>\n\n"
-            botones = []
-            for i, a in enumerate(alertas, 1):
-                req_resumen = a['solicitud_raw'][:40] + "..." if len(a['solicitud_raw']) > 40 else a['solicitud_raw']
-                texto += f"<b>{i}.</b> <i>{req_resumen}</i>\n"
-                botones.append([InlineKeyboardButton(f"🗑️ Borrar Alerta {i}", callback_data=f"del_alerta_{a['id']}")])
-            botones.append([InlineKeyboardButton("⬅️ Volver al menú", callback_data="volver_menu")])
-            await query.edit_message_text(texto, reply_markup=InlineKeyboardMarkup(botones), parse_mode="HTML")
+        else:
             await query.answer("❌ Error al borrar.", show_alert=True)
+            return
+        alertas = await db.listar_alertas_usuario(chat_id)
+        if not alertas:
+            await query.edit_message_text("📭 No tienes ninguna alerta activa.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Volver al menú", callback_data="volver_menu")]]))
+            return
+        _IVL = {4: "⚡4h", 12: "🌅12h", 24: "📅24h", 168: "⏳Semanal"}
+        texto = "📋 <b>Tus Alertas Activas:</b>\n\n"
+        botones = []
+        for i, a in enumerate(alertas, 1):
+            req_resumen = a['solicitud_raw'][:35] + "..." if len(a['solicitud_raw']) > 35 else a['solicitud_raw']
+            ivl = _IVL.get(a.get('intervalo', 24), f"{a.get('intervalo','?')}h")
+            texto += f"<b>{i}.</b> <i>{req_resumen}</i> — {ivl}\n"
+            botones.append([
+                InlineKeyboardButton(f"⚙️ Editar {i}", callback_data=f"edit_alerta_{a['id']}"),
+                InlineKeyboardButton(f"🗑️ Borrar {i}", callback_data=f"del_alerta_{a['id']}"),
+            ])
+        botones.append([InlineKeyboardButton("⬅️ Volver al menú", callback_data="volver_menu")])
+        await query.edit_message_text(texto, reply_markup=InlineKeyboardMarkup(botones), parse_mode="HTML")
+        return
+
+    # --- Editar Frecuencia de Alerta (disponible para todos) ---
+    if query.data.startswith("edit_alerta_"):
+        alerta_id = int(query.data.replace("edit_alerta_", ""))
+        opciones = [("⚡ Cada 4h", 4), ("🌅 Cada 12h", 12), ("📅 Diario (24h)", 24), ("⏳ Semanal (168h)", 168)]
+        botones = [[InlineKeyboardButton(txt, callback_data=f"set_intervalo_{alerta_id}_{h}")] for txt, h in opciones]
+        botones.append([InlineKeyboardButton("🔙 Cancelar", callback_data="gestionar_alertas")])
+        await query.edit_message_text(
+            "⚙️ <b>Cambiar Frecuencia de Alerta</b>\n\n¿Con qué frecuencia quieres recibir esta alerta?\n<i>(Cada disparo consume 1 crédito)</i>",
+            reply_markup=InlineKeyboardMarkup(botones), parse_mode="HTML"
+        )
+        return
+
+    # --- Confirmar nuevo intervalo ---
+    if query.data.startswith("set_intervalo_"):
+        partes = query.data.replace("set_intervalo_", "").split("_")
+        alerta_id, horas = int(partes[0]), int(partes[1])
+        exito = await db.actualizar_intervalo_alerta(alerta_id, horas, chat_id)
+        _IVL = {4: "⚡4h", 12: "🌅12h", 24: "📅24h", 168: "⏳Semanal"}
+        if exito:
+            await query.answer(f"✅ Frecuencia actualizada a {_IVL.get(horas, f'{horas}h')}.", show_alert=True)
+        else:
+            await query.answer("❌ No se pudo actualizar.", show_alert=True)
+        # Volver a la lista de alertas
+        alertas = await db.listar_alertas_usuario(chat_id)
+        if not alertas:
+            await query.edit_message_text("📭 No tienes ninguna alerta activa.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Volver al menú", callback_data="volver_menu")]]))
+            return
+        texto = "📋 <b>Tus Alertas Activas:</b>\n\n"
+        botones = []
+        for i, a in enumerate(alertas, 1):
+            req_resumen = a['solicitud_raw'][:35] + "..." if len(a['solicitud_raw']) > 35 else a['solicitud_raw']
+            ivl = _IVL.get(a.get('intervalo', 24), f"{a.get('intervalo','?')}h")
+            texto += f"<b>{i}.</b> <i>{req_resumen}</i> — {ivl}\n"
+            botones.append([
+                InlineKeyboardButton(f"⚙️ Editar {i}", callback_data=f"edit_alerta_{a['id']}"),
+                InlineKeyboardButton(f"🗑️ Borrar {i}", callback_data=f"del_alerta_{a['id']}"),
+            ])
+        botones.append([InlineKeyboardButton("⬅️ Volver al menú", callback_data="volver_menu")])
+        await query.edit_message_text(texto, reply_markup=InlineKeyboardMarkup(botones), parse_mode="HTML")
         return
 
     # --- Añadir ticker a la Cartera ---
@@ -3184,21 +3237,26 @@ telegram_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, convers
 async def comando_alertas(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     alertas = await db.listar_alertas_usuario(user_id)
-    
+
     if not alertas:
         await update.message.reply_text("📭 No tienes ninguna alerta activa.\n\nPara crear una, haz una búsqueda y pulsa el botón '🔔 Crear Alerta Diaria' en los resultados.")
         return
-        
-    texto = "📋 <b>Tus Alertas Activas (Ejecución Diaria):</b>\n\n"
+
+    _IVL = {4: "⚡4h", 12: "🌅12h", 24: "📅24h", 168: "⏳Semanal"}
+    texto = "📋 <b>Tus Alertas Activas:</b>\n\n"
     botones = []
-    
     for i, a in enumerate(alertas, 1):
-        req_resumen = a['solicitud_raw'][:40] + "..." if len(a['solicitud_raw']) > 40 else a['solicitud_raw']
-        texto += f"<b>{i}.</b> <i>{req_resumen}</i>\n"
-        botones.append([InlineKeyboardButton(f"🗑️ Borrar Alerta {i}", callback_data=f"del_alerta_{a['id']}")])
-        
-    teclado = InlineKeyboardMarkup(botones)
-    await update.message.reply_text(texto, reply_markup=teclado, parse_mode="HTML")
+        req_resumen = a['solicitud_raw'][:35] + "..." if len(a['solicitud_raw']) > 35 else a['solicitud_raw']
+        ivl = _IVL.get(a.get('intervalo', 24), f"{a.get('intervalo','?')}h")
+        texto += f"<b>{i}.</b> <i>{req_resumen}</i> — {ivl}\n"
+        botones.append([
+            InlineKeyboardButton(f"⚙️ Editar {i}", callback_data=f"edit_alerta_{a['id']}"),
+            InlineKeyboardButton(f"🗑️ Borrar {i}", callback_data=f"del_alerta_{a['id']}"),
+        ])
+
+    await update.message.reply_text(texto, reply_markup=InlineKeyboardMarkup(botones), parse_mode="HTML")
+
+
 
 
 # ── COMANDO /alerta_precio ───────────────────────────────────────────────────
@@ -3254,8 +3312,15 @@ async def comando_alerta_precio(update: Update, context: ContextTypes.DEFAULT_TY
 # ── COMANDO /valor (DCF) ─────────────────────────────────────────────────────
 
 async def comando_valor(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Calcula el valor intrínseco (DCF) usando IA y datos de FMP."""
+    """Calcula el valor intrínseco (DCF) usando IA y datos de FMP. Requiere plan Plus."""
     tid = update.effective_user.id
+    if not await db.es_plus(tid):
+        await update.message.reply_text(
+            "💎 <b>Calculadora DCF — Plan Plus</b>\n\nEl análisis de valor intrínseco por IA es exclusivo de usuarios Plus o Pro.\n\n"
+            "Actualiza tu plan con /plan para desbloquear esta función.",
+            parse_mode="HTML"
+        )
+        return
     args = context.args
     if not args:
         await update.message.reply_text("❌ Indica un ticker. Ejemplo: <code>/valor AAPL</code>", parse_mode="HTML")
@@ -3320,7 +3385,16 @@ async def comando_valor(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ── COMANDO /insider ──────────────────────────────────────────────────────────
 
 async def comando_insider(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Muestra movimientos recientes de insiders."""
+    """Muestra movimientos de insiders/ballenas. Requiere plan Pro."""
+    tid = update.effective_user.id
+    plan = await db.obtener_plan(tid)
+    if plan != 'pro':
+        await update.message.reply_text(
+            "🐳 <b>Caza de Ballenas — Plan Pro</b>\n\nEl seguimiento de movimientos de directivos (insider trading) es exclusivo del plan Pro.\n\n"
+            "Actualiza tu plan con /plan.",
+            parse_mode="HTML"
+        )
+        return
     args = context.args
     if not args:
         await update.message.reply_text("❌ Indica un ticker. Ejemplo: <code>/insider AAPL</code>", parse_mode="HTML")
@@ -3419,6 +3493,67 @@ telegram_app.add_handler(CommandHandler("alerta_precio", comando_alerta_precio))
 telegram_app.add_handler(CommandHandler("valor", comando_valor))
 telegram_app.add_handler(CommandHandler("insider", comando_insider))
 telegram_app.add_handler(CommandHandler("plan", comando_plan))
+
+# ── COMANDO /prediccion (Análisis Técnico IA — Plan Pro) ──────────────────────
+
+async def comando_prediccion(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Análisis técnico con IA constreñida. Solo accesible a usuarios Pro. Consume 1 crédito."""
+    tid = update.effective_user.id
+    plan = await db.obtener_plan(tid)
+    if plan != 'pro':
+        await update.message.reply_text(
+            "📈 <b>Análisis Técnico IA — Plan Pro</b>\n\n"
+            "El módulo de predicción técnica (RSI, MACD, Bollinger + IA) es exclusivo del plan Pro.\n\n"
+            "Actualiza con /plan.",
+            parse_mode="HTML"
+        )
+        return
+
+    args = context.args
+    if not args:
+        await update.message.reply_text(
+            "❌ Indica un ticker. Ejemplo: <code>/prediccion AAPL</code>",
+            parse_mode="HTML"
+        )
+        return
+
+    creditos = await db.obtener_creditos(tid)
+    if creditos <= 0:
+        await update.message.reply_text(
+            "⏸️ <b>Sin créditos.</b>\n\nNecesitas al menos 1 crédito para usar el análisis técnico. Recarga con /comprar.",
+            parse_mode="HTML"
+        )
+        return
+
+    ticker = args[0].upper()
+    msg = await update.message.reply_text(
+        f"⚙️ Calculando indicadores técnicos para <b>{ticker}</b>...",
+        parse_mode="HTML"
+    )
+
+    try:
+        import predictor as pred
+        fmp_keys = [k.strip() for k in FMP_API_KEYS.split(',') if k.strip()] if FMP_API_KEYS else []
+        analisis = await pred.generar_prediccion_tecnica(ticker, fmp_keys, http_client, client)
+        analisis = _limpiar_html_telegram(analisis)
+
+        await db.restar_credito(tid)
+        creditos_restantes = creditos - 1
+
+        texto_final = (
+            f"📊 <b>Análisis Técnico IA: {ticker}</b>\n\n"
+            f"{analisis}\n\n"
+            f"<i>Créditos restantes: {creditos_restantes}</i>"
+        )
+        await msg.edit_text(texto_final, parse_mode="HTML")
+
+    except Exception as e:
+        logger.error(f"[PREDICCION] Error para {ticker}: {e}")
+        await msg.edit_text("❌ Error al calcular el análisis técnico. Inténtalo más tarde.")
+
+telegram_app.add_handler(CommandHandler("prediccion", comando_prediccion))
+
+
 
 # ── COMANDO /comprar ──────────────────────────────────────────────────────────
 
@@ -3900,38 +4035,85 @@ async def cron_informe_semanal_loop():
             logger.error(f"[CRON SEMANAL] Error en loop: {e}")
 
 async def generar_y_enviar_informes_semanales():
-    """Itera por los usuarios Pro y envía un resumen de salud de sus carteras."""
-    # 1. Obtener todos los usuarios con plan Pro/Plus
-    # Nota: Esta es una simplificación, en producción se usaría paginación.
+    """Itera por los usuarios Pro/Plus y envía un resumen de salud de sus carteras.
+    Los usuarios Pro reciben además el resumen de movimientos de directivos (ballenas).
+    """
     pool = db._get_pool()
     async with pool.acquire() as conn:
         usuarios = await conn.fetch("SELECT id, plan FROM usuarios WHERE plan != 'free'")
-    
+
+    fmp_keys = [k.strip() for k in FMP_API_KEYS.split(',') if k.strip()] if FMP_API_KEYS else []
+
     for u in usuarios:
         tid = u["id"]
+        plan = u["plan"]
         try:
             cartera = await db.obtener_cartera(tid)
             if not cartera:
                 continue
-                
+
+            # --- Rendimiento semanal (Top 5) ---
             resumenes = []
-            for ticker in cartera[:5]: # Limitar a Top 5 para no saturar APIs/Tokens
-                # Obtener info básica y rendimiento semanal
-                grafico, rend = await fabricante_de_graficos(ticker, "1w")
-                signo = "+" if rend >= 0 else ""
-                resumenes.append(f"• <b>{ticker}</b>: {signo}{rend:.2f}% esta semana.")
-            
-            if resumenes:
-                texto_informe = (
-                    "📊 <b>Informe Semanal de Salud de Cartera</b>\n\n"
-                    "Aquí tienes el rendimiento semanal de tus principales activos:\n\n"
-                    + "\n".join(resumenes) +
-                    "\n\n<i>Usa /cartera para ver detalles completos o /valor [TICKER] para análisis IA profundo.</i>"
-                )
-                await telegram_app.bot.send_message(chat_id=tid, text=texto_informe, parse_mode="HTML")
-                await asyncio.sleep(0.5) # Anti-flood
+            for ticker in cartera[:5]:
+                try:
+                    _grafico, rend = await fabricante_de_graficos(ticker, "1w")
+                    if rend is not None:
+                        signo = "+" if rend >= 0 else ""
+                        resumenes.append(f"• <b>{ticker}</b>: {signo}{rend:.2f}% esta semana.")
+                    else:
+                        resumenes.append(f"• <b>{ticker}</b>: Sin datos de rendimiento.")
+                except Exception:
+                    resumenes.append(f"• <b>{ticker}</b>: Error al obtener datos.")
+
+            texto_informe = (
+                "📊 <b>Informe Semanal de Salud de Cartera</b>\n\n"
+                "Rendimiento semanal de tus principales activos:\n\n"
+                + "\n".join(resumenes)
+            )
+
+            # --- Movimientos de directivos (solo usuarios Pro) ---
+            if plan == 'pro' and fmp_keys:
+                movimientos_semana = []
+                import datetime as _dt
+                hace_7d = (_dt.datetime.utcnow() - _dt.timedelta(days=7)).strftime("%Y-%m-%d")
+                for ticker in cartera[:5]:
+                    try:
+                        for key in fmp_keys:
+                            url = f"https://financialmodelingprep.com/api/v4/insider-trading?symbol={ticker}&limit=3&apikey={key}"
+                            resp = await http_client.get(url, timeout=8.0)
+                            if resp.status_code == 200:
+                                trades = resp.json()
+                                for t in trades:
+                                    fecha = t.get("transactionDate", "")
+                                    if fecha >= hace_7d:
+                                        tipo = t.get("transactionType", "")
+                                        emoji = "🟢" if "Purchase" in tipo or tipo == "P" else "🔴"
+                                        cant = t.get("securitiesTransacted", 0)
+                                        persona = t.get("reportingName", "Directivo")
+                                        movimientos_semana.append(
+                                            f"{emoji} <b>{ticker}</b> — {persona}: {int(cant):,} acciones"
+                                        )
+                                break
+                    except Exception:
+                        continue
+
+                if movimientos_semana:
+                    texto_informe += (
+                        "\n\n🐳 <b>Movimientos de Directivos (7 días):</b>\n"
+                        + "\n".join(movimientos_semana)
+                    )
+                else:
+                    texto_informe += "\n\n🐳 <i>Sin movimientos de directivos significativos esta semana.</i>"
+
+            texto_informe += "\n\n<i>Usa /cartera para detalles o /valor [TICKER] para análisis DCF.</i>"
+
+            await telegram_app.bot.send_message(chat_id=tid, text=texto_informe, parse_mode="HTML")
+            await asyncio.sleep(0.5)
+
         except Exception as e:
             logger.error(f"[INFORME SEMANAL] Error procesando usuario {tid}: {e}")
+
+
 
 async def higiene_db_loop():
     """Bucle diario para purgar datos obsoletos y mantener la salud de la BD."""

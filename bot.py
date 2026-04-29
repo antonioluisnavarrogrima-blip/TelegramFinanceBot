@@ -111,6 +111,7 @@ _REGEX_FINANCIERO = re.compile(
 # NUNCA instanciar asyncio.Semaphore/Lock a nivel de módulo (RuntimeError en Python 3.10+).
 _PIPELINE_SEMA:    asyncio.Semaphore | None = None
 _QUICKCHART_SEMA:  asyncio.Semaphore | None = None
+_FMP_HIST_DEAD:    bool = False   # Se activa al primer 403 del endpoint legacy historical-price-full
 _CRON_SEMA:        asyncio.Semaphore | None = None
 _CRON_LOCK:        asyncio.Lock      | None = None
 
@@ -520,7 +521,7 @@ async def generador_informe_goldman(ticker: str, sector: str, datos: dict, perfi
 
 # --- 2. HERRAMIENTAS MATEMÁTICAS LOCALES ---
 async def fabricante_de_graficos(ticker: str, periodo: str = "3mo") -> tuple[bytes | None, float]:
-    global _QUICKCHART_SEMA, http_client
+    global _QUICKCHART_SEMA, http_client, _FMP_HIST_DEAD
     import datetime
     labels = []
     prices = []
@@ -532,14 +533,22 @@ async def fabricante_de_graficos(ticker: str, periodo: str = "3mo") -> tuple[byt
 
         hist = []
         keys = [k.strip() for k in FMP_API_KEYS.split(',') if k.strip()] if FMP_API_KEYS else []
-        for fmp_key in keys:
-            url = f"https://financialmodelingprep.com/api/v3/historical-price-full/{ticker}?apikey={fmp_key}"
-            resp = await http_client.get(url, timeout=10.0)
-            if resp.status_code == 200:
-                hist = resp.json().get("historical", [])
-                if hist: break
-            else:
-                logger.warning(f"[CHART] FMP Key fallida: {resp.status_code} - {resp.text[:100]}")
+        if not _FMP_HIST_DEAD and keys:
+            for fmp_key in keys:
+                url = f"https://financialmodelingprep.com/api/v3/historical-price-full/{ticker}?apikey={fmp_key}"
+                try:
+                    resp = await http_client.get(url, timeout=10.0)
+                    if resp.status_code == 200:
+                        hist = resp.json().get("historical", [])
+                        if hist: break
+                    elif resp.status_code == 403:
+                        _FMP_HIST_DEAD = True
+                        logger.warning("[CHART] FMP historical-price-full marcado como Legacy (403). Bypass activado.")
+                        break
+                    else:
+                        logger.warning(f"[CHART] FMP Key fallida: {resp.status_code}")
+                except Exception:
+                    pass
         
         # Fallback 1 a RapidAPI (yh-finance) si está configurado
         if not hist and RAPIDAPI_KEY:
@@ -1023,6 +1032,7 @@ async def _pipeline_hibrido_interno(
     msg_espera=None,
     fuente_datos: str = "yahoo",
     tid: int | None = None,
+    ticker_excluido: str | None = None,  # Anti-repetición en alertas automáticas
 ) -> tuple[str | None, str | None, str | None, str | None]:
     """Orquesta Filtro Fundamentales → Gráfico → Goldman Sachs.
     La fase NLP ya se ejecutó en pipeline_hibrido() fuera del semáforo.
@@ -1222,6 +1232,7 @@ async def _pipeline_hibrido_interno(
     # usando solo yfinance (sin generar imágenes). Coste: N llamadas YF en paralelo.
     async def _fetch_rend_solo(gan: dict) -> tuple[dict, float]:
         """Obtiene el rendimiento histórico usando RAW Yahoo V8 API."""
+        global _FMP_HIST_DEAD
         try:
             import random
             await asyncio.sleep(random.uniform(0.1, 1.5))
@@ -1232,14 +1243,22 @@ async def _pipeline_hibrido_interno(
 
             hist = []
             keys = [k.strip() for k in FMP_API_KEYS.split(',') if k.strip()] if FMP_API_KEYS else []
-            for fmp_key in keys:
-                url = f"https://financialmodelingprep.com/api/v3/historical-price-full/{gan['ticker']}?apikey={fmp_key}"
-                resp = await http_client.get(url, timeout=10.0)
-                if resp.status_code == 200:
-                    hist = resp.json().get('historical', [])
-                    if hist: break
-                else:
-                    logger.warning(f"[REND] FMP Key fallida para {gan['ticker']}: HTTP {resp.status_code} - {resp.text[:100]}")
+            if not _FMP_HIST_DEAD and keys:
+                for fmp_key in keys:
+                    url = f"https://financialmodelingprep.com/api/v3/historical-price-full/{gan['ticker']}?apikey={fmp_key}"
+                    try:
+                        resp = await http_client.get(url, timeout=10.0)
+                        if resp.status_code == 200:
+                            hist = resp.json().get('historical', [])
+                            if hist: break
+                        elif resp.status_code == 403:
+                            _FMP_HIST_DEAD = True
+                            logger.warning("[REND] FMP historical-price-full marcado como Legacy (403). Bypass activado.")
+                            break
+                        else:
+                            logger.warning(f"[REND] FMP Key fallida para {gan['ticker']}: HTTP {resp.status_code}")
+                    except Exception:
+                        pass
             
             # Fallback 1 a RapidAPI (yh-finance)
             if not hist and RAPIDAPI_KEY:
@@ -1315,7 +1334,13 @@ async def _pipeline_hibrido_interno(
 
     import random
     max_candidatos = min(4, len(pre_ganadores))
-    pre_ganadores_select = random.sample(pre_ganadores, max_candidatos)
+    # Anti-repetición: excluir el ticker enviado en la última alerta si hay más candidatos
+    if ticker_excluido and len(pre_ganadores) > 1:
+        candidatos_sin_repetir = [g for g in pre_ganadores if g['ticker'].upper() != ticker_excluido.upper()]
+        pool_seleccion = candidatos_sin_repetir if candidatos_sin_repetir else pre_ganadores
+    else:
+        pool_seleccion = pre_ganadores
+    pre_ganadores_select = random.sample(pool_seleccion, min(max_candidatos, len(pool_seleccion)))
 
     tuples_rend = await asyncio.gather(*(_fetch_rend_solo(g) for g in pre_ganadores_select))
 
@@ -2106,6 +2131,43 @@ async def manejador_botones(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
+    if query.data == "ver_planes_detalle":
+        texto_planes = (
+            "📋 <b>Comparativa de Planes Quant</b>\n\n"
+            "🆓 <b>Plan Free</b>\n"
+            "  • 3 créditos iniciales de bienvenida\n"
+            "  • Búsquedas en lenguaje natural con IA\n"
+            "  • Screeners de 1 clic\n"
+            "  • Cartera: hasta 5 activos\n"
+            "  • Alertas: máx. cada 24h\n\n"
+            "⭐ <b>Plan Plus — 7.99€/mes</b>\n"
+            "  ✅ TODO lo de Free, más:\n"
+            "  • Cartera <b>ilimitada</b>\n"
+            "  • Alertas cada <b>4h, 12h o 24h</b>\n"
+            "  • Exportar cartera a <b>CSV</b>\n"
+            "  • Precios en <b>tiempo real</b> vía WebSocket\n"
+            "  • Alertas Stop-Loss / Take-Profit\n"
+            "  • Cálculo de valor intrínseco DCF (/valor)\n\n"
+            "💎 <b>Plan Pro — 19.99€/mes</b>\n"
+            "  ✅ TODO lo de Plus, más:\n"
+            "  • <b>Análisis Técnico IA</b> (RSI, MACD, Bollinger)\n"
+            "  • <b>Seguimiento de Insiders</b> (directivos SEC)\n"
+            "  • <b>Informe semanal</b> de salud de cartera\n\n"
+            "<i>💡 Los créditos son válidos para todos los planes y no caducan.</i>"
+        )
+        botones_planes = []
+        if STRIPE_PAYMENT_LINK:
+            botones_planes.append([InlineKeyboardButton("💳 +50 Créditos → 4.99€", url=f"{STRIPE_PAYMENT_LINK}?client_reference_id={chat_id}")])
+        url_plus = os.getenv("STRIPE_LINK_PLUS", STRIPE_PAYMENT_LINK)
+        if url_plus:
+            botones_planes.append([InlineKeyboardButton("⭐ Suscribirse a Plus → 7.99€/mes", url=f"{url_plus}?client_reference_id={chat_id}")])
+        url_pro = os.getenv("STRIPE_LINK_PRO", STRIPE_PAYMENT_LINK)
+        if url_pro:
+            botones_planes.append([InlineKeyboardButton("💎 Suscribirse a Pro → 19.99€/mes", url=f"{url_pro}?client_reference_id={chat_id}")])
+        botones_planes.append([InlineKeyboardButton("⬅️ Volver", callback_data="volver_menu")])
+        await query.edit_message_text(texto_planes, reply_markup=InlineKeyboardMarkup(botones_planes), parse_mode="HTML")
+        return
+
     if query.data == "volver_menu":
         # Limpiar cualquier estado pendiente (ej. si escapan de pedir_url)
         context.user_data['estado'] = None
@@ -2395,7 +2457,11 @@ async def manejador_botones(update: Update, context: ContextTypes.DEFAULT_TYPE):
         for i, a in enumerate(alertas, 1):
             req_resumen = a['solicitud_raw'][:35] + "..." if len(a['solicitud_raw']) > 35 else a['solicitud_raw']
             ivl = _IVL.get(a.get('intervalo', 24), f"{a.get('intervalo','?')}h")
-            texto += f"<b>{i}.</b> <i>{req_resumen}</i> — {ivl}\n"
+            # FIX: Mostrar estado activo/inactivo para cada alerta por defecto
+            estado_icono = "🟢" if a.get('activa', True) else "🔴"
+            fallos = a.get('fallos_consecutivos', 0)
+            fallos_str = f" ⚠️{fallos} fallos" if fallos > 0 else ""
+            texto += f"{estado_icono} <b>{i}.</b> <i>{req_resumen}</i>\n   📅 Frecuencia: {ivl}{fallos_str}\n\n"
             botones.append([
                 InlineKeyboardButton(f"⚙️ Editar {i}", callback_data=f"edit_alerta_{a['id']}"),
                 InlineKeyboardButton(f"🗑️ Borrar {i}", callback_data=f"del_alerta_{a['id']}"),
@@ -2588,24 +2654,27 @@ async def manejador_botones(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         # 1. Caso: Exportar CSV
         if query.data == "cartera_csv":
-            await query.answer("📊 Generando informe...")
             if not es_usuario_plus:
-                await query.answer("⭐ El export CSV es exclusivo de Plus.", show_alert=True)
+                await query.answer("⭐ El export CSV es exclusivo de Plus o Pro.", show_alert=True)
                 return
             if not tickers_cartera:
                 await query.answer("Tu cartera está vacía.", show_alert=True)
                 return
+
+            await query.answer("📊 Generando informe CSV...")
 
             try:
                 import csv
                 output = io.StringIO()
                 writer = csv.writer(output)
                 writer.writerow(["Ticker", "Precio", "Fuente", "Antiguedad_Segundos"])
-                
+
                 ahora = time.time()
                 for t in tickers_cartera:
                     t_up = t.upper()
-                    datos_ws = websocket_client.cache_precios.get(t_up)
+                    # Mapeo de símbolos cripto: BTC-USD → BTCUSDT para el caché WebSocket
+                    ws_key = t_up.replace("-USD", "USDT").replace("-", "")
+                    datos_ws = websocket_client.cache_precios.get(ws_key) or websocket_client.cache_precios.get(t_up)
                     if datos_ws:
                         precio = datos_ws.get("regularMarketPrice", "N/D")
                         fuente_csv = "RealTime_WS"
@@ -2614,25 +2683,30 @@ async def manejador_botones(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         datos_bd = await db.obtener_yf_cache_bulk([t_up], allow_stale=True)
                         datos_t = datos_bd.get(t_up, {})
                         precio = datos_t.get("regularMarketPrice", datos_t.get("price", "N/D"))
-                        fuente_csv = "Cache_DB"
+                        fuente_csv = "Cache_BD"
                         age = int(ahora - datos_t.get("updated_at", ahora)) if datos_t.get("updated_at") else "N/D"
                     writer.writerow([t_up, precio, fuente_csv, age])
-                
+
                 csv_bytes = output.getvalue().encode("utf-8")
                 output.close()
-                
-                with io.BytesIO(csv_bytes) as bio:
-                    bio.name = "mi_cartera.csv"
-                    await query.message.reply_document(
-                        document=bio,
-                        filename="mi_cartera.csv",
-                        caption=f"📂 <b>Exportación Finalizada</b>\nSe han procesado {len(tickers_cartera)} activos de tu cartera.",
-                        parse_mode="HTML"
-                    )
+
+                # FIX: io.BytesIO no admite .name — usar InputFile con filename explícito
+                bio = io.BytesIO(csv_bytes)
+                await query.message.reply_document(
+                    document=InputFile(bio, filename="mi_cartera.csv"),
+                    caption=(
+                        f"📂 <b>Exportación Finalizada</b>\n"
+                        f"Procesados <b>{len(tickers_cartera)}</b> activos.\n"
+                        f"Fuente: ⚡ WebSocket tiempo real cuando disponible, 💾 caché BD en caso contrario."
+                    ),
+                    parse_mode="HTML"
+                )
+                bio.close()
             except Exception as e:
-                logger.error(f"[CSV] Error: {e}")
-                await query.answer("❌ Error al generar el archivo.", show_alert=True)
+                logger.error(f"[CSV] Error generando CSV: {e}")
+                await context.bot.send_message(chat_id=chat_id, text="❌ Error al generar el archivo CSV. Inténtalo de nuevo.")
             return
+
 
         # 2. Caso: Visualización Normal
         if not tickers_cartera:
@@ -2664,7 +2738,9 @@ async def manejador_botones(update: Update, context: ContextTypes.DEFAULT_TYPE):
         for clase, ticks in grupos.items():
             lineas.append(f"{CLASES_ICONOS.get(clase, '❓')} <b>{clase}</b>")
             for t in ticks:
-                datos_ws = websocket_client.cache_precios.get(t.upper())
+                # Mapeo: BTC-USD → BTCUSDT para buscar en caché WebSocket
+                ws_key = t.upper().replace("-USD", "USDT").replace("-", "")
+                datos_ws = websocket_client.cache_precios.get(ws_key) or websocket_client.cache_precios.get(t.upper())
                 if datos_ws:
                     precio = datos_ws.get("regularMarketPrice", "N/D")
                     fuente_ico = "⚡"
@@ -3239,16 +3315,30 @@ async def comando_alertas(update: Update, context: ContextTypes.DEFAULT_TYPE):
     alertas = await db.listar_alertas_usuario(user_id)
 
     if not alertas:
-        await update.message.reply_text("📭 No tienes ninguna alerta activa.\n\nPara crear una, haz una búsqueda y pulsa el botón '🔔 Crear Alerta Diaria' en los resultados.")
+        await update.message.reply_text(
+            "📭 No tienes ninguna alerta activa.\n\n"
+            "Para crear una, haz una búsqueda financiera y pulsa el botón\n"
+            "'🔔 Crear Alerta Diaria' en los resultados.\n\n"
+            "<i>Ejemplo: 'acciones con dividendo alto' → pulsar 🔔</i>",
+            parse_mode="HTML"
+        )
         return
 
     _IVL = {4: "⚡4h", 12: "🌅12h", 24: "📅24h", 168: "⏳Semanal"}
-    texto = "📋 <b>Tus Alertas Activas:</b>\n\n"
+    texto = "📋 <b>Tus Alertas de Inversión</b>\n\n"
     botones = []
     for i, a in enumerate(alertas, 1):
         req_resumen = a['solicitud_raw'][:35] + "..." if len(a['solicitud_raw']) > 35 else a['solicitud_raw']
         ivl = _IVL.get(a.get('intervalo', 24), f"{a.get('intervalo','?')}h")
-        texto += f"<b>{i}.</b> <i>{req_resumen}</i> — {ivl}\n"
+        # Mostrar estado activo/inactivo y fallos
+        estado_icono = "🟢 Activa" if a.get('activa', True) else "🔴 Inactiva"
+        fallos = a.get('fallos_consecutivos', 0)
+        fallos_str = f" ⚠️ ({fallos} fallos)" if fallos > 0 else ""
+        texto += (
+            f"<b>{i}. {estado_icono}</b>{fallos_str}\n"
+            f"   🔍 <i>{req_resumen}</i>\n"
+            f"   📅 Frecuencia: {ivl}\n\n"
+        )
         botones.append([
             InlineKeyboardButton(f"⚙️ Editar {i}", callback_data=f"edit_alerta_{a['id']}"),
             InlineKeyboardButton(f"🗑️ Borrar {i}", callback_data=f"del_alerta_{a['id']}"),
@@ -3494,6 +3584,72 @@ telegram_app.add_handler(CommandHandler("valor", comando_valor))
 telegram_app.add_handler(CommandHandler("insider", comando_insider))
 telegram_app.add_handler(CommandHandler("plan", comando_plan))
 
+# ── COMANDO /help ─────────────────────────────────────────────────────────────
+
+async def comando_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Muestra una guía completa de todos los comandos y funcionalidades del bot."""
+    texto = (
+        "📖 <b>Guía Completa del Bot Quant</b>\n\n"
+
+        "━━━ 🔍 <b>ANÁLISIS Y BÚSQUEDA</b> ━━━\n"
+        "💬 <b>Texto libre</b> — Escribe lo que buscas en lenguaje natural:\n"
+        "  <i>Ejemplo: 'acciones de dividendos estables sector energía'</i>\n"
+        "  <i>Ejemplo: 'ETFs tecnológicos baratos'</i>\n"
+        "  <i>Ejemplo: 'criptos con gran capitalización'</i>\n\n"
+
+        "━━━ 📊 <b>SCREENERS RÁPIDOS</b> ━━━\n"
+        "/menu → Panel con screeners de 1 clic:\n"
+        "  • 💰 Mejores Dividendos\n"
+        "  • 🚀 Mejores Tecnológicas\n"
+        "  • 🏛️ Empresas Más Seguras (Blue Chips)\n"
+        "  • 💎 Acciones Infravaloradas\n"
+        "  • 📊 Análisis por Tabla (filtros sin IA)\n"
+        "  • 🔎 Analizar Ticker específico\n\n"
+
+        "━━━ 🔔 <b>ALERTAS</b> ━━━\n"
+        "/alertas → Ver y gestionar tus alertas activas\n"
+        "  🟢 = Activa · 🔴 = Inactiva · ⚠️ = Con errores\n"
+        "  Cada alerta consume 1 crédito por disparo\n"
+        "  Intervalos: ⚡4h · 🌅12h · 📅24h · ⏳Semanal\n\n"
+        "/alerta_precio TICKER stop_loss PRECIO\n"
+        "/alerta_precio TICKER take_profit PRECIO\n"
+        "  <i>Ejemplo: /alerta_precio AAPL stop_loss 175</i> (Solo Plus/Pro)\n\n"
+
+        "━━━ 💼 <b>CARTERA</b> ━━━\n"
+        "Añade activos con el botón '💼 Añadir a Cartera' de cualquier análisis.\n"
+        "Free: hasta 5 activos · Plus/Pro: ilimitado + CSV\n\n"
+
+        "━━━ 🏆 <b>ANÁLISIS AVANZADO</b> (Plus/Pro) ━━━\n"
+        "/valor TICKER → Valoración por DCF (Descuento de Flujo de Caja)\n"
+        "  <i>Ejemplo: /valor MSFT</i>\n\n"
+        "/prediccion TICKER → Análisis técnico IA (RSI, MACD, Bollinger) (Pro)\n"
+        "  <i>Ejemplo: /prediccion TSLA</i>\n\n"
+        "/insider TICKER → Movimientos de directivos e insiders (Pro)\n"
+        "  <i>Ejemplo: /insider NVDA</i>\n\n"
+
+        "━━━ 💳 <b>CRÉDITOS Y PLANES</b> ━━━\n"
+        "/comprar → Recargar créditos y ver planes\n"
+        "/plan → Ver tu plan activo y fecha de renovación\n"
+        "  🆓 Free: 3 créditos iniciales\n"
+        "  ⭐ Plus: cartera ilimitada, alertas 4h, CSV\n"
+        "  💎 Pro: todo Plus + predicciones IA + insider trading\n\n"
+
+        "━━━ ⚙️ <b>CONFIGURACIÓN</b> ━━━\n"
+        "/menu → Sección ⚙️ Configuración:\n"
+        "  • 🔗 Conectar broker propio (URL con {ticker})\n"
+        "  • 🌐 Fuente de datos para los informes\n"
+        "  • 📋 Gestionar alertas\n\n"
+
+        "━━━ 📚 <b>EDUCACIÓN</b> ━━━\n"
+        "/menu → Sección 📚 Educación:\n"
+        "  Tutoriales sobre Acciones, ETFs, REITs, Cripto y Bonos\n\n"
+
+        "<i>💡 Consejo: El bot aprende lenguaje natural. Sé descriptivo y específico para obtener mejores resultados.</i>"
+    )
+    await update.message.reply_text(texto, parse_mode="HTML")
+
+telegram_app.add_handler(CommandHandler("help", comando_help))
+
 # ── COMANDO /prediccion (Análisis Técnico IA — Plan Pro) ──────────────────────
 
 async def comando_prediccion(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -3558,27 +3714,65 @@ telegram_app.add_handler(CommandHandler("prediccion", comando_prediccion))
 # ── COMANDO /comprar ──────────────────────────────────────────────────────────
 
 async def comando_comprar(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Genera un enlace de pago de Stripe personalizado con el telegram_id del usuario."""
-    user_id  = update.effective_user.id
-    if not STRIPE_PAYMENT_LINK:
+    """Muestra los planes disponibles con botones diferenciados: Créditos / Plus / Pro."""
+    user_id = update.effective_user.id
+    creditos = await db.obtener_creditos(user_id)
+    plan_actual = await db.obtener_plan(user_id)
+
+    plan_emoji = {"free": "🆓 Free", "plus": "⭐ Plus", "pro": "💎 Pro"}.get(plan_actual, "🆓 Free")
+
+    texto = (
+        f"🛒 <b>Tienda Quant</b>\n\n"
+        f"📊 Tu plan actual: <b>{plan_emoji}</b>\n"
+        f"💳 Créditos disponibles: <b>{creditos}</b>\n\n"
+        "Elige lo que necesitas:"
+    )
+
+    botones = []
+
+    # Botón 1: Compra de créditos (50 créditos)
+    if STRIPE_PAYMENT_LINK:
+        url_creditos = f"{STRIPE_PAYMENT_LINK}?client_reference_id={user_id}"
+        botones.append([InlineKeyboardButton(
+            f"💳 +50 Créditos de Análisis → 4.99€",
+            url=url_creditos
+        )])
+
+    # Botón 2: Plan Plus
+    if plan_actual != "plus" and plan_actual != "pro":
+        url_plus = os.getenv("STRIPE_LINK_PLUS", STRIPE_PAYMENT_LINK)
+        if url_plus:
+            botones.append([InlineKeyboardButton(
+                "⭐ Plan Plus → 7.99€/mes (cartera ilimitada + alertas 4h)",
+                url=f"{url_plus}?client_reference_id={user_id}"
+            )])
+
+    # Botón 3: Plan Pro
+    if plan_actual != "pro":
+        url_pro = os.getenv("STRIPE_LINK_PRO", STRIPE_PAYMENT_LINK)
+        if url_pro:
+            botones.append([InlineKeyboardButton(
+                "💎 Plan Pro → 19.99€/mes (análisis técnico IA + insider trading)",
+                url=f"{url_pro}?client_reference_id={user_id}"
+            )])
+
+    # Botón 4: Ver ventajas de cada plan
+    botones.append([InlineKeyboardButton(
+        "📋 Ver ventajas de cada plan",
+        callback_data="ver_planes_detalle"
+    )])
+
+    if not botones:
         await update.message.reply_text(
             "💳 <b>Sistema de pagos en configuración.</b>\nPronto podrás recargar créditos, disculpa las molestias.",
             parse_mode="HTML"
         )
         return
-        
-    creditos = await db.obtener_creditos(user_id)
-    url_pago = f"{STRIPE_PAYMENT_LINK}?client_reference_id={user_id}"
-    teclado  = InlineKeyboardMarkup([[
-        InlineKeyboardButton(f"💳 Comprar {CREDITOS_POR_COMPRA} créditos →", url=url_pago)
-    ]])
+
     await update.message.reply_text(
-        f"💎 <b>Recarga de Créditos</b>\n\n"
-        f"Tienes <b>{creditos}</b> análisis disponibles.\n\n"
-        "Cada paquete añade créditos automáticamente a tu cuenta para que puedas seguir escaneando todo el mercado con un solo clic.\n\n"
-        f"⚡ <b>+{CREDITOS_POR_COMPRA} créditos (Apple Pay / Google Pay / Tarjeta).</b>",
+        texto,
         parse_mode="HTML",
-        reply_markup=teclado
+        reply_markup=InlineKeyboardMarkup(botones)
     )
 
 telegram_app.add_handler(CommandHandler("comprar", comando_comprar))
@@ -3628,9 +3822,12 @@ async def lifespan(app: FastAPI):
     logger.info("[LIFESPAN] Inicializando bot de Telegram...")
     await telegram_app.initialize()
     comandos = [
-        BotCommand("start",   "Datos del bot"),
-        BotCommand("menu",    "Configuración de fuentes y alertas"),
-        BotCommand("comprar", "Recargar créditos de análisis"),
+        BotCommand("start",   "Iniciar el bot y ver saldo"),
+        BotCommand("menu",    "Panel de screeners y configuración"),
+        BotCommand("alertas", "Ver y gestionar tus alertas activas"),
+        BotCommand("comprar", "Recargar créditos y ver planes"),
+        BotCommand("plan",    "Ver tu plan activo"),
+        BotCommand("help",    "Guía completa de funcionalidades"),
     ]
     await telegram_app.bot.set_my_commands(comandos, scope=BotCommandScopeDefault())
 
@@ -3901,14 +4098,18 @@ async def procesar_todas_las_alertas():
         
         logger.info(f"[CRON MULTI] Procesando Hash: {hash_firma} para {len(user_ids)} usuarios.")
         
-        # 1. Pipeline Cuantitativo Lote (Saltando Gemini)
+        # ultimo_ticker enviado para este grupo (anti-repetición)
+        ticker_previo = g.get("ultimo_ticker")
+
+        # 1. Pipeline Cuantitativo Lote (Saltando Gemini, excluye ticker previo)
         try:
             texto_final, grafico_bytes, url_compra, ticker = await _pipeline_hibrido_interno(
                 extraccion=extraccion,
                 solicitud=solicitud_repr,
                 msg_espera=None,
                 fuente_datos="yahoo",
-                tid=user_ids[0]
+                tid=user_ids[0],
+                ticker_excluido=ticker_previo   # <-- anti-repetición
             )
         except Exception as e:
             logger.error(f"[CRON MULTI] Error pipeline en Hash {hash_firma}: {e}")
@@ -3918,13 +4119,12 @@ async def procesar_todas_las_alertas():
         # 2. Distribución y Cobro
         if url_compra:
             for tid in set(user_ids):
-                # Jitter aleatorio
                 await asyncio.sleep(random.uniform(0, 1.5))
                 fuente = await db.obtener_fuente_datos(tid)
                 await _enviar_resultado_cron(tid, texto_final, grafico_bytes, url_compra, ticker, fuente)
             
-            # Marcar enviadas para no repetir
-            await db.marcar_alertas_enviadas(alert_ids)
+            # Marcar enviadas, guardando el ticker para evitar repetición en el siguiente ciclo
+            await db.marcar_alertas_enviadas(alert_ids, ticker_enviado=ticker)
         else:
             logger.warning(f"[CRON MULTI] Sin resultados validos para Hash {hash_firma}.")
             await db.incrementar_fallos_alerta(alert_ids)
@@ -3965,22 +4165,31 @@ async def verificar_alertas_precio():
     tickers = list(set(a["ticker"] for a in alertas))
     precios = {}
     
-    # Obtener precios actuales (intentar caché primero, luego API)
+    # Obtener precios actuales: 1º WebSocket (gratis, tiempo real), 2º cache BD, 3º API FMP
     for t in tickers:
+        # Prioridad 1: WebSocket cache (no consume API)
+        datos_ws = websocket_client.cache_precios.get(t)
+        if datos_ws and datos_ws.get("regularMarketPrice"):
+            precios[t] = datos_ws["regularMarketPrice"]
+            continue
+        # Prioridad 2: Cache DB (no consume API)
         data = await db.obtener_yf_cache(t)
         if data and "regularMarketPrice" in data:
             precios[t] = data["regularMarketPrice"]
-        else:
-            # Fallback a API si no hay caché reciente
-            keys = [k.strip() for k in FMP_API_KEYS.split(',') if k.strip()]
-            for key in keys:
+            continue
+        # Prioridad 3: FMP API (solo si las dos anteriores fallan)
+        keys = [k.strip() for k in FMP_API_KEYS.split(',') if k.strip()]
+        for key in keys:
+            try:
                 url = f"https://financialmodelingprep.com/api/v3/quote/{t}?apikey={key}"
-                resp = await http_client.get(url, timeout=10.0)
+                resp = await http_client.get(url, timeout=8.0)
                 if resp.status_code == 200:
                     d = resp.json()
                     if d:
                         precios[t] = d[0].get("price")
                         break
+            except Exception:
+                pass
     
     for alerta in alertas:
         ticker = alerta["ticker"]

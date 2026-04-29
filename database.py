@@ -170,6 +170,7 @@ async def inicializar_db():
         try:
             await conn.execute("ALTER TABLE alertas_inversion ADD COLUMN IF NOT EXISTS intervalo INTEGER NOT NULL DEFAULT 24")
             await conn.execute("ALTER TABLE alertas_inversion ADD COLUMN IF NOT EXISTS fallos_consecutivos INTEGER NOT NULL DEFAULT 0")
+            await conn.execute("ALTER TABLE alertas_inversion ADD COLUMN IF NOT EXISTS ultimo_ticker TEXT")  # anti-repetición
         except Exception:
             pass
 
@@ -801,6 +802,17 @@ async def precargar_semillas_basicas():
         ("COST",  "ACCION", "consumo"),
         ("T",     "ACCION", "general"),
         ("VZ",    "ACCION", "general"),
+        # Dividend Aristocrats y Blue Chips estables (sector general)
+        ("JNJ",   "ACCION", "general"),   # Johnson & Johnson — salud diversificada
+        ("KO",    "ACCION", "general"),   # Coca-Cola — consumo defensivo
+        ("PEP",   "ACCION", "general"),   # PepsiCo — consumo + snacks
+        ("MMM",   "ACCION", "general"),   # 3M — industrial diversificado
+        ("O",     "ACCION", "general"),   # Realty Income — REIT mensual
+        ("ED",    "ACCION", "general"),   # Consolidated Edison — utilities
+        ("SO",    "ACCION", "general"),   # Southern Company — utilities
+        ("D",     "ACCION", "general"),   # Dominion Energy — utilities
+        ("XOM",   "ACCION", "general"),   # ExxonMobil — energía+dividendo
+        ("CVX",   "ACCION", "general"),   # Chevron — energía+dividendo
         ("IBM",   "ACCION", "tecnologia"),
         ("ORCL",  "ACCION", "tecnologia"),
         # ── ETFs ──
@@ -1056,7 +1068,9 @@ async def obtener_alertas_agrupadas_pendientes() -> list[dict]:
     async with pool.acquire() as conn:
         rows = await conn.fetch(
             """
-            SELECT hash_firma, extraccion_json, array_agg(id) as alert_ids, array_agg(user_id) as user_ids, MAX(solicitud_raw) as solicitud_repr
+            SELECT hash_firma, extraccion_json, array_agg(id) as alert_ids, array_agg(user_id) as user_ids,
+                   MAX(solicitud_raw) as solicitud_repr,
+                   MAX(ultimo_ticker) as ultimo_ticker
             FROM alertas_inversion
             WHERE activa = TRUE 
               AND fallos_consecutivos < 3
@@ -1074,12 +1088,17 @@ async def obtener_alertas_agrupadas_pendientes() -> list[dict]:
             resultado.append(d)
         return resultado
 
-async def marcar_alertas_enviadas(alert_ids: list[int]):
+async def marcar_alertas_enviadas(alert_ids: list[int], ticker_enviado: str | None = None):
+    """Actualiza el timestamp de último envío y guarda el ticker enviado (anti-repetición)."""
     if not alert_ids: return
     pool = _get_pool()
     ahora = time.time()
     async with pool.acquire() as conn:
-        await conn.execute("UPDATE alertas_inversion SET ultimo_envio = $1, fallos_consecutivos = 0 WHERE id = ANY($2::int[])", ahora, alert_ids)
+        await conn.execute(
+            "UPDATE alertas_inversion SET ultimo_envio = $1, fallos_consecutivos = 0"
+            + (f", ultimo_ticker = $3 WHERE id = ANY($2::int[])" if ticker_enviado else " WHERE id = ANY($2::int[])"),
+            *([ahora, alert_ids, ticker_enviado] if ticker_enviado else [ahora, alert_ids])
+        )
 
 async def incrementar_fallos_alerta(alert_ids: list[int]):
     if not alert_ids: return

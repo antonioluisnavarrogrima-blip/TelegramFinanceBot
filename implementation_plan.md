@@ -60,3 +60,14 @@ El objetivo es optimizar el sistema de alertas ("cron") actual para aprovechar a
 > [!IMPORTANT]
 > **User Review Required**
 > ¿Estás de acuerdo con el esquema multi-alerta y el almacenamiento del JSON pre-procesado para evitar llamar a Gemini en cada ejecución del cron? Si te parece bien, procedo a escribir el código para la base de datos y la reestructuración del CRON.
+
+
+
+El anterior proceso se quedó a medias de hacer los siguientes arreglos, verifica que se hayan cumplido todas y de no hacerlo, arréglalas:
+Quiero que salga por defecto cual alerta está activada para cada configuracion.
+No uses api si tienes datos correctos desde el socket
+Cuando mandemos alerta debemos tener cuidado de no repetir siempre la misma empresa.
+SI no tenemos datos como pasa el filtro? Si devolvemos empresa debemos pasarle un análisis de los datos que tenemos.
+El CSV no se genera cuando pulsas el boton.
+Estaría bien que añadieramos un /help para definir todas las funcionalidades de opciones del bot y en el comprar debemos diferenciar la compra de 50 creditos (lo cual viene mal escrito),
+el pro, y el plus, y debemos Además de que en el comprar debemos tener un boton de visualizar planes con las ventajas de cada uno

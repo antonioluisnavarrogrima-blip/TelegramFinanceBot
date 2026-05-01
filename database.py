@@ -54,7 +54,7 @@ async def inicializar_pool():
     _pool = await asyncpg.create_pool(
         db_url,
         min_size=2,
-        max_size=10,
+        max_size=20,
         command_timeout=30,
         ssl="require",
     )
@@ -124,6 +124,8 @@ async def inicializar_db():
             ("stripe_customer_id",       "ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS stripe_customer_id TEXT"),
             ("stripe_subscription_id",   "ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS stripe_subscription_id TEXT"),
             ("plan_expira",              "ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS plan_expira FLOAT"),
+            ("webhook_url",              "ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS webhook_url TEXT"),
+            ("webhook_token",            "ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS webhook_token TEXT"),
         ]
         for _col, ddl in columnas_extra:
             try:
@@ -1045,6 +1047,12 @@ async def listar_alertas_usuario(tid: int) -> list[dict]:
         rows = await conn.fetch("SELECT id, solicitud_raw, activa, ultimo_envio, intervalo, fallos_consecutivos FROM alertas_inversion WHERE user_id = $1 ORDER BY id ASC", tid)
         return [dict(r) for r in rows]
 
+async def obtener_alerta(alerta_id: int, tid: int) -> dict | None:
+    pool = _get_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow("SELECT * FROM alertas_inversion WHERE id = $1 AND user_id = $2", alerta_id, tid)
+        return dict(row) if row else None
+
 async def eliminar_alerta_inversion(alerta_id: int, tid: int) -> bool:
     pool = _get_pool()
     async with pool.acquire() as conn:
@@ -1169,9 +1177,27 @@ async def obtener_plan(tid: int) -> str:
         return plan
 
 async def es_plus(tid: int) -> bool:
-    """Comprueba si el usuario tiene plan Plus o Pro activo."""
+    """Comprueba si el usuario tiene plan Plus, Pro o Ultra activo."""
     plan = await obtener_plan(tid)
-    return plan in ('plus', 'pro')
+    return plan in ('plus', 'pro', 'ultra')
+
+async def es_ultra(tid: int) -> bool:
+    plan = await obtener_plan(tid)
+    return plan == 'ultra'
+
+async def actualizar_webhook(tid: int, url: str | None, token: str | None = None) -> bool:
+    pool = _get_pool()
+    async with pool.acquire() as conn:
+        res = await conn.execute("UPDATE usuarios SET webhook_url = $1, webhook_token = $2 WHERE id = $3", url, token, tid)
+        return res != "UPDATE 0"
+
+async def obtener_webhook_config(tid: int) -> dict:
+    pool = _get_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow("SELECT webhook_url, webhook_token FROM usuarios WHERE id = $1", tid)
+        if row:
+            return {"url": row["webhook_url"], "token": row["webhook_token"]}
+        return {"url": None, "token": None}
 
 async def activar_suscripcion(tid: int, plan: str, stripe_customer_id: str,
                                stripe_subscription_id: str, expira_ts: float | None = None) -> None:

@@ -960,6 +960,19 @@ _CLASES_CON_FUNDAMENTALES = {"ACCION", "REIT", "ETF", "BONO"}
 async def _obtener_info_bulk(tickers: list[str], clase: str) -> dict:
     require_fundamentals = clase.upper() in _CLASES_CON_FUNDAMENTALES
     cached = await db.obtener_yf_cache_bulk(tickers, require_fundamentals=require_fundamentals)
+    
+    # Inyectar datos en tiempo real del WebSocket si están disponibles
+    import websocket_client
+    for t in tickers:
+        ws_key = t.upper().replace("-USD", "USDT").replace("-", "")
+        datos_ws = websocket_client.cache_precios.get(ws_key) or websocket_client.cache_precios.get(t.upper())
+        if datos_ws:
+            precio = datos_ws.get("regularMarketPrice")
+            if t.upper() in cached:
+                cached[t.upper()]["regularMarketPrice"] = precio
+            elif not require_fundamentals:
+                cached[t.upper()] = {"regularMarketPrice": precio, "price": precio, "_fuente": "WebSocket"}
+
     faltantes = [t for t in tickers if t.upper() not in cached]
     if faltantes:
         extractores = [ExtractorFMP(k) for k in FMP_API_KEYS.split(',')] if FMP_API_KEYS else []
@@ -2139,11 +2152,10 @@ async def manejador_botones(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "  • Búsquedas en lenguaje natural con IA\n"
             "  • Screeners de 1 clic\n"
             "  • Cartera: hasta 5 activos\n"
-            "  • Alertas: máx. cada 24h\n\n"
+            "  • Alertas configurables (4h, 12h, 24h, semanal)\n\n"
             "⭐ <b>Plan Plus — 7.99€/mes</b>\n"
             "  ✅ TODO lo de Free, más:\n"
             "  • Cartera <b>ilimitada</b>\n"
-            "  • Alertas cada <b>4h, 12h o 24h</b>\n"
             "  • Exportar cartera a <b>CSV</b>\n"
             "  • Precios en <b>tiempo real</b> vía WebSocket\n"
             "  • Alertas Stop-Loss / Take-Profit\n"
@@ -2153,6 +2165,12 @@ async def manejador_botones(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "  • <b>Análisis Técnico IA</b> (RSI, MACD, Bollinger)\n"
             "  • <b>Seguimiento de Insiders</b> (directivos SEC)\n"
             "  • <b>Informe semanal</b> de salud de cartera\n\n"
+            "🏦 <b>Plan Ultra — 49.99€/mes</b>\n"
+            "  ✅ TODO lo de Pro, más:\n"
+            "  • <b>Webhooks</b> para Auto-Trading (/webhook)\n"
+            "  • <b>Sentimiento IA</b> en tiempo real (/sentimiento)\n"
+            "  • <b>Motor Backtesting</b> histórico (/backtest)\n"
+            "  • Alertas proxy de <b>Dark Pools</b>\n\n"
             "<i>💡 Los créditos son válidos para todos los planes y no caducan.</i>"
         )
         botones_planes = []
@@ -2580,8 +2598,10 @@ async def manejador_botones(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # --- Editar Frecuencia de Alerta (disponible para todos) ---
     if query.data.startswith("edit_alerta_"):
         alerta_id = int(query.data.replace("edit_alerta_", ""))
+        alerta = await db.obtener_alerta(alerta_id, chat_id)
+        current_interval = alerta.get('intervalo', 24) if alerta else 24
         opciones = [("⚡ Cada 4h", 4), ("🌅 Cada 12h", 12), ("📅 Diario (24h)", 24), ("⏳ Semanal (168h)", 168)]
-        botones = [[InlineKeyboardButton(txt, callback_data=f"set_intervalo_{alerta_id}_{h}")] for txt, h in opciones]
+        botones = [[InlineKeyboardButton(f"✅ {txt}" if h == current_interval else txt, callback_data=f"set_intervalo_{alerta_id}_{h}")] for txt, h in opciones]
         botones.append([InlineKeyboardButton("🔙 Cancelar", callback_data="gestionar_alertas")])
         await query.edit_message_text(
             "⚙️ <b>Cambiar Frecuencia de Alerta</b>\n\n¿Con qué frecuencia quieres recibir esta alerta?\n<i>(Cada disparo consume 1 crédito)</i>",
@@ -2593,6 +2613,7 @@ async def manejador_botones(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if query.data.startswith("set_intervalo_"):
         partes = query.data.replace("set_intervalo_", "").split("_")
         alerta_id, horas = int(partes[0]), int(partes[1])
+
         exito = await db.actualizar_intervalo_alerta(alerta_id, horas, chat_id)
         _IVL = {4: "⚡4h", 12: "🌅12h", 24: "📅24h", 168: "⏳Semanal"}
         if exito:
@@ -2690,10 +2711,11 @@ async def manejador_botones(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 csv_bytes = output.getvalue().encode("utf-8")
                 output.close()
 
-                # FIX: io.BytesIO no admite .name — usar InputFile con filename explícito
-                bio = io.BytesIO(csv_bytes)
-                await query.message.reply_document(
-                    document=InputFile(bio, filename="mi_cartera.csv"),
+                # FIX: usar document=csv_bytes directamente en vez de io.BytesIO
+                await context.bot.send_document(
+                    chat_id=chat_id,
+                    document=csv_bytes,
+                    filename="mi_cartera.csv",
                     caption=(
                         f"📂 <b>Exportación Finalizada</b>\n"
                         f"Procesados <b>{len(tickers_cartera)}</b> activos.\n"
@@ -2701,7 +2723,6 @@ async def manejador_botones(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     ),
                     parse_mode="HTML"
                 )
-                bio.close()
             except Exception as e:
                 logger.error(f"[CSV] Error generando CSV: {e}")
                 await context.bot.send_message(chat_id=chat_id, text="❌ Error al generar el archivo CSV. Inténtalo de nuevo.")
@@ -3584,6 +3605,137 @@ telegram_app.add_handler(CommandHandler("valor", comando_valor))
 telegram_app.add_handler(CommandHandler("insider", comando_insider))
 telegram_app.add_handler(CommandHandler("plan", comando_plan))
 
+# ── COMANDOS ULTRA ─────────────────────────────────────────────────────────────
+
+async def comando_webhook(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    tid = update.effective_user.id
+    if not await db.es_ultra(tid):
+        await update.message.reply_text("⭐ <b>Funcionalidad Ultra</b>\n\nLos Webhooks de Auto-Trading están reservados para el Plan Ultra.", parse_mode="HTML")
+        return
+        
+    args = context.args
+    if not args:
+        config = await db.obtener_webhook_config(tid)
+        actual = config.get("url")
+        txt = f"🔗 Webhook actual: <code>{actual}</code>" if actual else "Ningún webhook configurado."
+        await update.message.reply_text(f"❌ Formato: <code>/webhook [URL]</code>\n\n{txt}\n\nUsa <code>/webhook clear</code> para borrarlo.", parse_mode="HTML")
+        return
+        
+    url = args[0]
+    if url.lower() == "clear":
+        await db.actualizar_webhook(tid, None, None)
+        await update.message.reply_text("✅ Webhook eliminado.", parse_mode="HTML")
+    else:
+        if not url.startswith("http"):
+            await update.message.reply_text("❌ La URL debe empezar por http:// o https://")
+            return
+            
+        import urllib.parse, uuid
+        hostname = urllib.parse.urlparse(url).hostname
+        if not hostname or hostname in ("localhost", "127.0.0.1", "0.0.0.0") or hostname.startswith("192.168.") or hostname.startswith("10.") or hostname.startswith("172.") or hostname.startswith("169.254."):
+            await update.message.reply_text("❌ URL no permitida por seguridad (SSRF). Usa un dominio/IP público.")
+            return
+            
+        token = uuid.uuid4().hex
+        await db.actualizar_webhook(tid, url, token)
+        msg = (
+            f"✅ <b>Webhook configurado exitosamente.</b>\n\n"
+            f"URL: <code>{url}</code>\n"
+            f"<b>Secret Token:</b> <code>{token}</code>\n\n"
+            f"⚠️ <i>Por seguridad, valida este token en el JSON recibido para confirmar que la petición viene del bot Quant.</i>"
+        )
+        await update.message.reply_text(msg, parse_mode="HTML")
+
+CACHE_SENTIMIENTOS = {}
+
+async def comando_sentimiento(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    tid = update.effective_user.id
+    if not await db.es_ultra(tid):
+        await update.message.reply_text("⭐ <b>Funcionalidad Ultra</b>\n\nEl análisis de sentimiento IA en tiempo real está reservado para el Plan Ultra.", parse_mode="HTML")
+        return
+        
+    creditos = await db.obtener_creditos(tid)
+    if creditos < 1:
+        await update.message.reply_text("❌ No tienes créditos suficientes. Compra más con /comprar.")
+        return
+        
+    args = context.args
+    if not args:
+        await update.message.reply_text("❌ Formato: <code>/sentimiento TICKER</code>", parse_mode="HTML")
+        return
+        
+    ticker = args[0].upper()
+    
+    import time
+    ahora = time.time()
+    if ticker in CACHE_SENTIMIENTOS and (ahora - CACHE_SENTIMIENTOS[ticker][0]) < 3600:
+        res = CACHE_SENTIMIENTOS[ticker][1]
+        await db.restar_credito(tid)
+        await update.message.reply_text(f"{res}\n\n<i>(Caché: 1 hora)</i>", parse_mode="HTML")
+        return
+        
+    await update.message.reply_text(f"📰 Analizando sentimiento de <b>{ticker}</b> (noticias recientes)...", parse_mode="HTML")
+    
+    from predictor import analizar_sentimiento
+    res = await analizar_sentimiento(ticker, fmp_api_keys, http_client, gemini_client)
+    CACHE_SENTIMIENTOS[ticker] = (ahora, res)
+    await db.restar_credito(tid)
+    await update.message.reply_text(res, parse_mode="HTML")
+
+CACHE_BACKTESTS = {}
+
+async def comando_backtest(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    tid = update.effective_user.id
+    if not await db.es_ultra(tid):
+        await update.message.reply_text("⭐ <b>Funcionalidad Ultra</b>\n\nEl motor de Backtesting está reservado para el Plan Ultra.", parse_mode="HTML")
+        return
+        
+    creditos = await db.obtener_creditos(tid)
+    if creditos < 1:
+        await update.message.reply_text("❌ No tienes créditos suficientes. Compra más con /comprar.")
+        return
+        
+    args = context.args
+    if not args:
+        await update.message.reply_text("❌ Formato: <code>/backtest TICKER</code>", parse_mode="HTML")
+        return
+        
+    ticker = args[0].upper()
+    
+    import time
+    ahora = time.time()
+    if ticker in CACHE_BACKTESTS and (ahora - CACHE_BACKTESTS[ticker][0]) < 3600:
+        msg = CACHE_BACKTESTS[ticker][1]
+        await db.restar_credito(tid)
+        await update.message.reply_text(f"{msg}\n\n<i>(Caché: 1 hora)</i>", parse_mode="HTML")
+        return
+        
+    await update.message.reply_text(f"⏱ Simulando estrategia algorítmica (RSI<30) para <b>{ticker}</b> en el último año...", parse_mode="HTML")
+    
+    from predictor import simular_backtest_rsi, obtener_datos_historicos_completos
+    datos = await obtener_datos_historicos_completos(ticker, fmp_api_keys, http_client, dias=252)
+        
+    precios = [d["close"] for d in datos]
+    if len(precios) < 50:
+        await update.message.reply_text(f"❌ Datos insuficientes para simular {ticker}.")
+        return
+        
+    res = simular_backtest_rsi(precios)
+    msg = (
+        f"📊 <b>Resultados Backtest: {ticker} (1 Año)</b>\n\n"
+        f"Estrategia: Comprar RSI < 30, Vender RSI > 70\n"
+        f"Operaciones: <b>{res['operaciones']}</b>\n"
+        f"Win Rate: <b>{res['win_rate']}%</b>\n"
+        f"Rentabilidad Total: <b>{res['roi_pct']}%</b>"
+    )
+    CACHE_BACKTESTS[ticker] = (ahora, msg)
+    await db.restar_credito(tid)
+    await update.message.reply_text(msg, parse_mode="HTML")
+
+telegram_app.add_handler(CommandHandler("webhook", comando_webhook))
+telegram_app.add_handler(CommandHandler("sentimiento", comando_sentimiento))
+telegram_app.add_handler(CommandHandler("backtest", comando_backtest))
+
 # ── COMANDO /help ─────────────────────────────────────────────────────────────
 
 async def comando_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -3627,12 +3779,18 @@ async def comando_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/insider TICKER → Movimientos de directivos e insiders (Pro)\n"
         "  <i>Ejemplo: /insider NVDA</i>\n\n"
 
+        "━━━ 🏆 <b>ANÁLISIS ULTRA</b> (Institucional) ━━━\n"
+        "/webhook URL → Auto-Trading\n"
+        "/sentimiento TICKER → Miedo/Codicia IA\n"
+        "/backtest TICKER → Simular estrategia\n\n"
+
         "━━━ 💳 <b>CRÉDITOS Y PLANES</b> ━━━\n"
         "/comprar → Recargar créditos y ver planes\n"
         "/plan → Ver tu plan activo y fecha de renovación\n"
         "  🆓 Free: 3 créditos iniciales\n"
         "  ⭐ Plus: cartera ilimitada, alertas 4h, CSV\n"
-        "  💎 Pro: todo Plus + predicciones IA + insider trading\n\n"
+        "  💎 Pro: todo Plus + predicciones IA + insider trading\n"
+        "  🏦 Ultra: todo Pro + webhooks + sentimiento + backtest\n\n"
 
         "━━━ ⚙️ <b>CONFIGURACIÓN</b> ━━━\n"
         "/menu → Sección ⚙️ Configuración:\n"
@@ -3651,6 +3809,8 @@ async def comando_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
 telegram_app.add_handler(CommandHandler("help", comando_help))
 
 # ── COMANDO /prediccion (Análisis Técnico IA — Plan Pro) ──────────────────────
+
+CACHE_PREDICCIONES = {}
 
 async def comando_prediccion(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Análisis técnico con IA constreñida. Solo accesible a usuarios Pro. Consume 1 crédito."""
@@ -3682,6 +3842,21 @@ async def comando_prediccion(update: Update, context: ContextTypes.DEFAULT_TYPE)
         return
 
     ticker = args[0].upper()
+    
+    import time
+    ahora = time.time()
+    if ticker in CACHE_PREDICCIONES and (ahora - CACHE_PREDICCIONES[ticker][0]) < 3600:
+        analisis = CACHE_PREDICCIONES[ticker][1]
+        await db.restar_credito(tid)
+        creditos_restantes = creditos - 1
+        texto_final = (
+            f"📊 <b>Análisis Técnico IA: {ticker}</b>\n\n"
+            f"{analisis}\n\n"
+            f"<i>Créditos restantes: {creditos_restantes} (Caché: 1h)</i>"
+        )
+        await update.message.reply_text(texto_final, parse_mode="HTML")
+        return
+        
     msg = await update.message.reply_text(
         f"⚙️ Calculando indicadores técnicos para <b>{ticker}</b>...",
         parse_mode="HTML"
@@ -3692,6 +3867,8 @@ async def comando_prediccion(update: Update, context: ContextTypes.DEFAULT_TYPE)
         fmp_keys = [k.strip() for k in FMP_API_KEYS.split(',') if k.strip()] if FMP_API_KEYS else []
         analisis = await pred.generar_prediccion_tecnica(ticker, fmp_keys, http_client, client)
         analisis = _limpiar_html_telegram(analisis)
+        
+        CACHE_PREDICCIONES[ticker] = (ahora, analisis)
 
         await db.restar_credito(tid)
         creditos_restantes = creditos - 1
@@ -3748,12 +3925,21 @@ async def comando_comprar(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )])
 
     # Botón 3: Plan Pro
-    if plan_actual != "pro":
+    if plan_actual != "pro" and plan_actual != "ultra":
         url_pro = os.getenv("STRIPE_LINK_PRO", STRIPE_PAYMENT_LINK)
         if url_pro:
             botones.append([InlineKeyboardButton(
                 "💎 Plan Pro → 19.99€/mes (análisis técnico IA + insider trading)",
                 url=f"{url_pro}?client_reference_id={user_id}"
+            )])
+
+    # Botón Ultra
+    if plan_actual != "ultra":
+        url_ultra = os.getenv("STRIPE_LINK_ULTRA", STRIPE_PAYMENT_LINK)
+        if url_ultra:
+            botones.append([InlineKeyboardButton(
+                "🏦 Plan Ultra → 49.99€/mes (webhooks, sentimiento IA, backtesting)",
+                url=f"{url_ultra}?client_reference_id={user_id}"
             )])
 
     # Botón 4: Ver ventajas de cada plan
@@ -4164,6 +4350,7 @@ async def verificar_alertas_precio():
     # Agrupar por ticker para optimizar llamadas a API
     tickers = list(set(a["ticker"] for a in alertas))
     precios = {}
+    tickers_sin_precio = []
     
     # Obtener precios actuales: 1º WebSocket (gratis, tiempo real), 2º cache BD, 3º API FMP
     for t in tickers:
@@ -4177,20 +4364,32 @@ async def verificar_alertas_precio():
         if data and "regularMarketPrice" in data:
             precios[t] = data["regularMarketPrice"]
             continue
-        # Prioridad 3: FMP API (solo si las dos anteriores fallan)
+            
+        tickers_sin_precio.append(t)
+
+    # Prioridad 3: FMP API en paralelo (solo si fallan anteriores)
+    if tickers_sin_precio:
         keys = [k.strip() for k in FMP_API_KEYS.split(',') if k.strip()]
-        for key in keys:
-            try:
-                url = f"https://financialmodelingprep.com/api/v3/quote/{t}?apikey={key}"
-                resp = await http_client.get(url, timeout=8.0)
-                if resp.status_code == 200:
-                    d = resp.json()
-                    if d:
-                        precios[t] = d[0].get("price")
-                        break
-            except Exception:
-                pass
-    
+        if keys:
+            key_principal = keys[0]
+            
+            async def _fetch_fmp(t):
+                url = f"https://financialmodelingprep.com/api/v3/quote/{t}?apikey={key_principal}"
+                try:
+                    resp = await http_client.get(url, timeout=8.0)
+                    if resp.status_code == 200:
+                        d = resp.json()
+                        if d:
+                            return t, d[0].get("price")
+                except Exception:
+                    pass
+                return t, None
+
+            tareas = [_fetch_fmp(t) for t in tickers_sin_precio]
+            resultados = await asyncio.gather(*tareas)
+            for t, price in resultados:
+                if price is not None:
+                    precios[t] = price
     for alerta in alertas:
         ticker = alerta["ticker"]
         precio_actual = precios.get(ticker)
@@ -4220,6 +4419,25 @@ async def verificar_alertas_precio():
             try:
                 await telegram_app.bot.send_message(chat_id=alerta["user_id"], text=msg, parse_mode="HTML")
                 await db.desactivar_alerta_precio(alerta["id"])
+                
+                if await db.es_ultra(alerta["user_id"]):
+                    wh_config = await db.obtener_webhook_config(alerta["user_id"])
+                    wh_url = wh_config.get("url")
+                    if wh_url:
+                        import time
+                        payload = {
+                            "ticker": ticker, 
+                            "precio": precio_actual, 
+                            "objetivo": objetivo, 
+                            "tipo_alerta": tipo, 
+                            "accion": "EJECUTAR",
+                            "timestamp": int(time.time()),
+                            "secret_token": wh_config.get("token")
+                        }
+                        try:
+                            asyncio.create_task(http_client.post(wh_url, json=payload, timeout=5.0))
+                        except Exception as e_wh:
+                            logger.error(f"[WEBHOOK] Error: {e_wh}")
             except Exception as e:
                 logger.error(f"[ALERTA PRECIO] Error enviando mensaje a {alerta['user_id']}: {e}")
 

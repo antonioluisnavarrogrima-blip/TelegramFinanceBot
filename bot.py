@@ -991,8 +991,8 @@ async def _obtener_info_bulk(tickers: list[str], clase: str) -> dict:
                     await asyncio.sleep(1.5)
                 if res: break
             if not res:
-                logger.warning(f"[FAST-FAIL] FMP no devolvió datos para el lote. Abortando restantes.")
-                break
+                logger.warning(f"[FAST-FAIL] FMP no devolvió datos para el lote. Continuando con el siguiente lote.")
+                continue
             for t, info in res.items():
                 if info and info.get('regularMarketPrice'):
                     nuevos_datos[t] = info
@@ -2689,6 +2689,7 @@ async def manejador_botones(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             try:
                 import csv
+                import io
                 output = io.StringIO()
                 writer = csv.writer(output)
                 writer.writerow(["Ticker", "Precio", "Fuente", "Antiguedad_Segundos"])

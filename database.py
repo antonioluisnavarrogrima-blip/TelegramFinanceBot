@@ -1181,6 +1181,11 @@ async def es_plus(tid: int) -> bool:
     plan = await obtener_plan(tid)
     return plan in ('plus', 'pro', 'ultra')
 
+async def es_pro(tid: int) -> bool:
+    """Comprueba si el usuario tiene plan Pro o Ultra activo."""
+    plan = await obtener_plan(tid)
+    return plan in ('pro', 'ultra')
+
 async def es_ultra(tid: int) -> bool:
     plan = await obtener_plan(tid)
     return plan == 'ultra'

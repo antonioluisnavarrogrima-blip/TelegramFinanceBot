@@ -881,12 +881,15 @@ def _chequear_fundamentales_cripto(ticker: str, info: dict, filtros_extra: list)
     try:
         if not info: return None
         market_cap = info.get('marketCap', 0) or 0
+        
         for f in filtros_extra:
-            if f["metrica"] == "market_cap" and not OPS.get(f["operador"], operator.ge)(market_cap, f["valor"]): return None
-        if market_cap <= 0: return None
+            if f["metrica"] == "market_cap":
+                if market_cap <= 0: return None
+                if not OPS.get(f["operador"], operator.ge)(market_cap, f["valor"]): return None
+                
         return {
             "ticker": ticker,
-            "market_cap_bn": round(market_cap / 1e9, 2),
+            "market_cap_bn": round(market_cap / 1e9, 2) if market_cap > 0 else 0,
             "nombre": info.get("shortName", ticker),
         }
     except Exception as e: logger.debug(f"[YF] Error {ticker} (Cripto): {e}")
@@ -3498,8 +3501,7 @@ async def comando_valor(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def comando_insider(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Muestra movimientos de insiders/ballenas. Requiere plan Pro."""
     tid = update.effective_user.id
-    plan = await db.obtener_plan(tid)
-    if plan != 'pro':
+    if not await db.es_pro(tid):
         await update.message.reply_text(
             "🐳 <b>Caza de Ballenas — Plan Pro</b>\n\nEl seguimiento de movimientos de directivos (insider trading) es exclusivo del plan Pro.\n\n"
             "Actualiza tu plan con /plan.",
@@ -3815,8 +3817,7 @@ CACHE_PREDICCIONES = {}
 async def comando_prediccion(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Análisis técnico con IA constreñida. Solo accesible a usuarios Pro. Consume 1 crédito."""
     tid = update.effective_user.id
-    plan = await db.obtener_plan(tid)
-    if plan != 'pro':
+    if not await db.es_pro(tid):
         await update.message.reply_text(
             "📈 <b>Análisis Técnico IA — Plan Pro</b>\n\n"
             "El módulo de predicción técnica (RSI, MACD, Bollinger + IA) es exclusivo del plan Pro.\n\n"

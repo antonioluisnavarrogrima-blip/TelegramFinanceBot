@@ -257,9 +257,10 @@ async def obtener_yf_cache(ticker: str) -> dict | None:
         if age > ttl:
             logger.debug(f"[YF-CACHE] MISS (expirado {age:.0f}s > TTL {ttl}s): {ticker}")
             return None
-
         logger.debug(f"[YF-CACHE] HIT ({age:.0f}s de antigüedad): {ticker}")
-        return json.loads(row["data"]) if isinstance(row["data"], str) else dict(row["data"])
+        data = json.loads(row["data"]) if isinstance(row["data"], str) else dict(row["data"])
+        data["updated_at"] = row["updated_at"]
+        return data
 
     except Exception as e:
         logger.warning(f"[YF-CACHE] Error leyendo caché para {ticker}: {e}")
@@ -962,6 +963,7 @@ async def obtener_yf_cache_bulk(tickers: list[str], require_fundamentals: bool =
             if not allow_stale and age > ttl:
                 continue  # Entrada expirada
             data = json.loads(row["data"]) if isinstance(row["data"], str) else dict(row["data"])
+            data["updated_at"] = row["updated_at"]
             # Excluir datos legados sin fundamentales (datos pre-YahooV11 o degradados).
             if require_fundamentals and data.get("_fuente") in ("YahooV8_Degradado", "FMP", "AlphaVantage") and not data.get("trailingPE") and not data.get("dividendYield"):
                 logger.debug(f"[YF-CACHE] SKIP sin fundamentales (require_fundamentals=True): {ticker}")

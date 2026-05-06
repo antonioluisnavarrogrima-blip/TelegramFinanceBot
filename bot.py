@@ -535,7 +535,8 @@ async def fabricante_de_graficos(ticker: str, periodo: str = "3mo") -> tuple[byt
         keys = [k.strip() for k in FMP_API_KEYS.split(',') if k.strip()] if FMP_API_KEYS else []
         if not _FMP_HIST_DEAD and keys:
             for fmp_key in keys:
-                url = f"https://financialmodelingprep.com/api/v3/historical-price-full/{ticker}?apikey={fmp_key}"
+                fmp_ticker = ticker.replace("-USD", "USD") if ticker.endswith("-USD") else ticker
+                url = f"https://financialmodelingprep.com/api/v3/historical-price-full/{fmp_ticker}?apikey={fmp_key}"
                 try:
                     resp = await http_client.get(url, timeout=10.0)
                     if resp.status_code == 200:
@@ -550,45 +551,8 @@ async def fabricante_de_graficos(ticker: str, periodo: str = "3mo") -> tuple[byt
                 except Exception:
                     pass
         
-        # Fallback 1 a RapidAPI (yh-finance) si está configurado
-        if not hist and RAPIDAPI_KEY:
-            range_str = "3mo"
-            if limit <= 25: range_str = "1mo"
-            elif limit <= 130: range_str = "6mo"
-            elif limit <= 260: range_str = "1y"
-            url = f"https://apidojo-yahoo-finance-v1.p.rapidapi.com/stock/v3/get-chart?symbol={ticker}&interval=1d&range={range_str}"
-            headers = {"x-rapidapi-key": RAPIDAPI_KEY, "x-rapidapi-host": "apidojo-yahoo-finance-v1.p.rapidapi.com"}
-            resp = await http_client.get(url, headers=headers, timeout=10.0)
-            if resp.status_code == 200:
-                result = resp.json().get("chart", {}).get("result", [])
-                if result:
-                    timestamps = result[0].get("timestamp", [])
-                    closes = result[0].get("indicators", {}).get("quote", [{}])[0].get("close", [])
-                    for t, c in zip(timestamps, closes):
-                        if c is not None:
-                            dt = datetime.datetime.fromtimestamp(t).strftime('%Y-%m-%d')
-                            hist.append({"date": dt, "close": c})
-                    hist.reverse() # Invertir para que sea descendente
-            else:
-                logger.warning(f"[CHART] RapidAPI fallida: {resp.status_code} - {resp.text[:100]}")
-
-        # Fallback 2 a Alpha Vantage si FMP y RapidAPI fallan
-        if not hist:
-            av_keys = [k.strip() for k in ALPHAVANTAGE_API_KEYS.split(',') if k.strip()] if ALPHAVANTAGE_API_KEYS else []
-            for av_key in av_keys:
-                outputsize = "full" if limit > 100 else "compact"
-                url = f"https://www.alphavantage.co/query?function=TIME_SERIES_DAILY&symbol={ticker}&apikey={av_key}&outputsize={outputsize}"
-                resp = await http_client.get(url, timeout=10.0)
-                if resp.status_code == 200:
-                    ts = resp.json().get("Time Series (Daily)", {})
-                    if ts:
-                        for date, vals in ts.items():
-                            hist.append({"date": date, "close": vals.get("4. close", 0)})
-                        break
-                else:
-                    logger.warning(f"[CHART] AV Key fallida: {resp.status_code} - {resp.text[:100]}")
-
-        # Fallback 3 a Yahoo V8 (by-pass Cloudflare WAF usando curl_cffi)
+        # Fallback 1 a Yahoo V8 (by-pass Cloudflare WAF usando curl_cffi)
+        # Se prioriza sobre RapidAPI porque RapidAPI a veces devuelve datos de hace 1 mes (stale)
         if not hist:
             from curl_cffi.requests import AsyncSession
             range_str = "3mo"
@@ -611,6 +575,44 @@ async def fabricante_de_graficos(ticker: str, periodo: str = "3mo") -> tuple[byt
                             hist.reverse() # Invertir para que sea descendente como FMP
             except Exception as e:
                 logger.warning(f"[CHART] Yahoo Fallback falló para {ticker}: {e}")
+
+        # Fallback 2 a RapidAPI (yh-finance) si está configurado y falló Yahoo
+        if not hist and RAPIDAPI_KEY:
+            range_str = "3mo"
+            if limit <= 25: range_str = "1mo"
+            elif limit <= 130: range_str = "6mo"
+            elif limit <= 260: range_str = "1y"
+            url = f"https://apidojo-yahoo-finance-v1.p.rapidapi.com/stock/v3/get-chart?symbol={ticker}&interval=1d&range={range_str}"
+            headers = {"x-rapidapi-key": RAPIDAPI_KEY, "x-rapidapi-host": "apidojo-yahoo-finance-v1.p.rapidapi.com"}
+            resp = await http_client.get(url, headers=headers, timeout=10.0)
+            if resp.status_code == 200:
+                result = resp.json().get("chart", {}).get("result", [])
+                if result:
+                    timestamps = result[0].get("timestamp", [])
+                    closes = result[0].get("indicators", {}).get("quote", [{}])[0].get("close", [])
+                    for t, c in zip(timestamps, closes):
+                        if c is not None:
+                            dt = datetime.datetime.fromtimestamp(t).strftime('%Y-%m-%d')
+                            hist.append({"date": dt, "close": c})
+                    hist.reverse() # Invertir para que sea descendente
+            else:
+                logger.warning(f"[CHART] RapidAPI fallida: {resp.status_code} - {resp.text[:100]}")
+
+        # Fallback 3 a Alpha Vantage
+        if not hist:
+            av_keys = [k.strip() for k in ALPHAVANTAGE_API_KEYS.split(',') if k.strip()] if ALPHAVANTAGE_API_KEYS else []
+            for av_key in av_keys:
+                outputsize = "full" if limit > 100 else "compact"
+                url = f"https://www.alphavantage.co/query?function=TIME_SERIES_DAILY&symbol={ticker}&apikey={av_key}&outputsize={outputsize}"
+                resp = await http_client.get(url, timeout=10.0)
+                if resp.status_code == 200:
+                    ts = resp.json().get("Time Series (Daily)", {})
+                    if ts:
+                        for date, vals in ts.items():
+                            hist.append({"date": date, "close": vals.get("4. close", 0)})
+                        break
+                else:
+                    logger.warning(f"[CHART] AV Key fallida: {resp.status_code} - {resp.text[:100]}")
 
         if not hist:
             logger.warning(f"[CHART] Error GRAPH para {ticker}: Fallaron FMP, AV y Yahoo.")
@@ -927,7 +929,14 @@ class ExtractorFMP(ExtractorBase):
     async def fetch_batch(self, tickers: list[str]) -> dict:
         if self._dead: return {}
         if not self.key or not tickers: return {}
-        simbolos = ",".join(t.upper() for t in tickers)
+        
+        mapa_simbolos = {}
+        for t in tickers:
+            t_up = t.upper()
+            fmp_sym = t_up.replace("-USD", "USD") if t_up.endswith("-USD") else t_up
+            mapa_simbolos[fmp_sym] = t_up
+            
+        simbolos = ",".join(mapa_simbolos.keys())
         url = f"https://financialmodelingprep.com/api/v3/quote/{simbolos}?apikey={self.key}"
         try:
             resp = await http_client.get(url, timeout=12.0)
@@ -939,8 +948,9 @@ class ExtractorFMP(ExtractorBase):
             if not isinstance(data, list): return {}
             res = {}
             for item in data:
-                sym = item.get('symbol', '').upper()
-                if not sym: continue
+                fmp_sym = item.get('symbol', '').upper()
+                if not fmp_sym: continue
+                sym = mapa_simbolos.get(fmp_sym, fmp_sym)
                 precio = item.get('price') or 0
                 div_anual = item.get('lastDiv') or 0
                 res[sym] = {
@@ -1261,7 +1271,8 @@ async def _pipeline_hibrido_interno(
             keys = [k.strip() for k in FMP_API_KEYS.split(',') if k.strip()] if FMP_API_KEYS else []
             if not _FMP_HIST_DEAD and keys:
                 for fmp_key in keys:
-                    url = f"https://financialmodelingprep.com/api/v3/historical-price-full/{gan['ticker']}?apikey={fmp_key}"
+                    fmp_ticker = gan['ticker'].replace("-USD", "USD") if gan['ticker'].endswith("-USD") else gan['ticker']
+                    url = f"https://financialmodelingprep.com/api/v3/historical-price-full/{fmp_ticker}?apikey={fmp_key}"
                     try:
                         resp = await http_client.get(url, timeout=10.0)
                         if resp.status_code == 200:
@@ -1276,43 +1287,7 @@ async def _pipeline_hibrido_interno(
                     except Exception:
                         pass
             
-            # Fallback 1 a RapidAPI (yh-finance)
-            if not hist and RAPIDAPI_KEY:
-                range_str = "3mo"
-                if limit <= 25: range_str = "1mo"
-                elif limit <= 130: range_str = "6mo"
-                elif limit <= 260: range_str = "1y"
-                url = f"https://apidojo-yahoo-finance-v1.p.rapidapi.com/stock/v3/get-chart?symbol={gan['ticker']}&interval=1d&range={range_str}"
-                headers = {"x-rapidapi-key": RAPIDAPI_KEY, "x-rapidapi-host": "apidojo-yahoo-finance-v1.p.rapidapi.com"}
-                resp = await http_client.get(url, headers=headers, timeout=10.0)
-                if resp.status_code == 200:
-                    result = resp.json().get("chart", {}).get("result", [])
-                    if result:
-                        closes = result[0].get("indicators", {}).get("quote", [{}])[0].get("close", [])
-                        for c in closes:
-                            if c is not None:
-                                hist.append({"close": c})
-                        hist.reverse() # Invertir a descendente
-                else:
-                    logger.warning(f"[REND] RapidAPI fallida para {gan['ticker']}: {resp.status_code}")
-
-            # Fallback 2 a Alpha Vantage
-            if not hist:
-                av_keys = [k.strip() for k in ALPHAVANTAGE_API_KEYS.split(',') if k.strip()] if ALPHAVANTAGE_API_KEYS else []
-                for av_key in av_keys:
-                    outputsize = "full" if limit > 100 else "compact"
-                    url = f"https://www.alphavantage.co/query?function=TIME_SERIES_DAILY&symbol={gan['ticker']}&apikey={av_key}&outputsize={outputsize}"
-                    resp = await http_client.get(url, timeout=10.0)
-                    if resp.status_code == 200:
-                        ts = resp.json().get("Time Series (Daily)", {})
-                        if ts:
-                            for date, vals in ts.items():
-                                hist.append({"close": vals.get("4. close", 0)})
-                            break
-                    else:
-                        logger.warning(f"[REND] AV Key fallida para {gan['ticker']}: HTTP {resp.status_code} - {resp.text[:100]}")
-            
-            # Fallback 3 a Yahoo V8 (by-pass WAF)
+            # Fallback 1 a Yahoo V8 (by-pass WAF) - Se prioriza sobre RapidAPI
             if not hist:
                 from curl_cffi.requests import AsyncSession
                 range_str = "3mo"
@@ -1333,6 +1308,42 @@ async def _pipeline_hibrido_interno(
                                 hist.reverse() # Invertir a descendente
                 except Exception as e:
                     logger.warning(f"[REND] Yahoo Fallback falló para {gan['ticker']}: {e}")
+
+            # Fallback 2 a RapidAPI (yh-finance)
+            if not hist and RAPIDAPI_KEY:
+                range_str = "3mo"
+                if limit <= 25: range_str = "1mo"
+                elif limit <= 130: range_str = "6mo"
+                elif limit <= 260: range_str = "1y"
+                url = f"https://apidojo-yahoo-finance-v1.p.rapidapi.com/stock/v3/get-chart?symbol={gan['ticker']}&interval=1d&range={range_str}"
+                headers = {"x-rapidapi-key": RAPIDAPI_KEY, "x-rapidapi-host": "apidojo-yahoo-finance-v1.p.rapidapi.com"}
+                resp = await http_client.get(url, headers=headers, timeout=10.0)
+                if resp.status_code == 200:
+                    result = resp.json().get("chart", {}).get("result", [])
+                    if result:
+                        closes = result[0].get("indicators", {}).get("quote", [{}])[0].get("close", [])
+                        for c in closes:
+                            if c is not None:
+                                hist.append({"close": c})
+                        hist.reverse() # Invertir a descendente
+                else:
+                    logger.warning(f"[REND] RapidAPI fallida para {gan['ticker']}: {resp.status_code}")
+
+            # Fallback 3 a Alpha Vantage
+            if not hist:
+                av_keys = [k.strip() for k in ALPHAVANTAGE_API_KEYS.split(',') if k.strip()] if ALPHAVANTAGE_API_KEYS else []
+                for av_key in av_keys:
+                    outputsize = "full" if limit > 100 else "compact"
+                    url = f"https://www.alphavantage.co/query?function=TIME_SERIES_DAILY&symbol={gan['ticker']}&apikey={av_key}&outputsize={outputsize}"
+                    resp = await http_client.get(url, timeout=10.0)
+                    if resp.status_code == 200:
+                        ts = resp.json().get("Time Series (Daily)", {})
+                        if ts:
+                            for date, vals in ts.items():
+                                hist.append({"close": vals.get("4. close", 0)})
+                            break
+                    else:
+                        logger.warning(f"[REND] AV Key fallida para {gan['ticker']}: HTTP {resp.status_code} - {resp.text[:100]}")
 
             if not hist:
                 return gan, None
@@ -1507,7 +1518,9 @@ async def _pipeline_por_tabla(
 
     elif clase_activo == "CRIPTO":
         mcap_min = float(filtros_tabla.get("market_cap_min_bn", 0)) * 1e9
-        fe = [{"metrica": "market_cap", "operador": ">=", "valor": mcap_min}]
+        fe = []
+        if mcap_min > 0:
+            fe.append({"metrica": "market_cap", "operador": ">=", "valor": mcap_min})
         datos_bulk = await _obtener_info_bulk(tickers, "CRIPTO")
         if datos_bulk.get("_RATE_LIMIT_HIT"):
             return "⚠️ Servicio de datos temporalmente no disponible. Por favor, espere.", None, None, None
@@ -1607,7 +1620,8 @@ def _formatear_resultado_tabla(datos: dict, clase_activo: str) -> str:
             lineas.append(f"  • Nombre: <b>{datos['nombre']}</b>")
 
     rend_str = f"+{rend}%" if rend >= 0 else f"{rend}%"
-    lineas.append(f"  • Momentum 3m: <b>{rend_str}</b>")
+    label_rend = "Momentum Precio 3m" if clase_activo == "BONO" else "Momentum 3m"
+    lineas.append(f"  • {label_rend}: <b>{rend_str}</b>")
     lineas.append("")
     lineas.append("<i>ℹ️ Análisis determinístico sin IA. Para un informe Goldman Sachs completo, usa la búsqueda libre.</i>")
     return "\n".join(lineas)
@@ -2207,16 +2221,21 @@ async def manejador_botones(update: Update, context: ContextTypes.DEFAULT_TYPE):
             [InlineKeyboardButton("⚙️ Configuración", callback_data="menu_configuracion")],
             [InlineKeyboardButton("📚 Educación", callback_data="menu_educacion")]
         ])
-        await query.edit_message_text(
-            text=(
-                f"⚙️ <b>Tu Panel de Inversiones</b>\n\n"
-                f"💳 Créditos disponibles: <b>{creditos}</b>\n\n"
-                "Gestiona tu configuración, tu cartera y encuentra oportunidades con un solo clic.\n"
-                "<i>Los análisis son ultrarrápidos y se basan en datos reales del mercado.</i>"
-            ),
-            reply_markup=teclado,
-            parse_mode="HTML"
-        )
+        try:
+            from telegram.error import BadRequest
+            await query.edit_message_text(
+                text=(
+                    f"⚙️ <b>Tu Panel de Inversiones</b>\n\n"
+                    f"💳 Créditos disponibles: <b>{creditos}</b>\n\n"
+                    "Gestiona tu configuración, tu cartera y encuentra oportunidades con un solo clic.\n"
+                    "<i>Los análisis son ultrarrápidos y se basan en datos reales del mercado.</i>"
+                ),
+                reply_markup=teclado,
+                parse_mode="HTML"
+            )
+        except BadRequest as e:
+            if "Message is not modified" not in str(e):
+                raise
         return
 
     # --- Protocolo Salvavidas (Best Effort) ---

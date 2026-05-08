@@ -303,7 +303,7 @@ Prevención Filtro Aniquilador: Si el universo es de nicho (ETF, Cripto), relaja
 CLASES válidas: ACCION|REIT|ETF|CRIPTO|BONO
 MÉTRICAS: {"ACCION":["per","rendimiento","dividendo_porcentaje","dividendo_absoluto","roe","margen_beneficio","beta","deuda_capital","crecimiento_ingresos"],"REIT":["p_ffo","dividend_yield","ocupacion","ltv"],"ETF":["ter","aum","dividend_yield","rendimiento"],"CRIPTO":["rendimiento","market_cap"],"BONO":["dividend_yield","rendimiento","duracion"]}
 TRADUCCIONES: {"PER bajo":{"metrica":"per","operador":"<","valor":45},"dividendo alto":{"metrica":"dividendo_porcentaje","operador":">","valor":4},"dividendo estable":{"metrica":"dividendo_porcentaje","operador":">","valor":2},"alta rentabilidad":{"metrica":"roe","operador":">","valor":45},"deuda baja":{"metrica":"deuda_capital","operador":"<","valor":50},"estable":{"metrica":"beta","operador":"<","valor":0.8},"crecimiento agresivo":{"metrica":"crecimiento_ingresos","operador":">","valor":20},"alcista":{"metrica":"rendimiento","operador":">","valor":0},"bajista":{"metrica":"rendimiento","operador":"<","valor":0},"ETF barato":{"metrica":"ter","operador":"<","valor":0.2},"ETF grande":{"metrica":"aum","operador":">","valor":1000000000},"REIT ocupacion alta":{"metrica":"ocupacion","operador":">","valor":90},"REIT dividendo alto":{"metrica":"dividend_yield","operador":">","valor":4},"cripto cap grande":{"metrica":"market_cap","operador":">","valor":1000000000}}
-REGLAS: sector siempre lleno ("tecnologia","energia","general"...). Perfil: "Seguro"|"Riesgo"|"Balanceado". filtros_dinamicos como objeto por métrica(nunca con tickers)."""
+REGLAS: sector siempre lleno ("tecnologia","energia","general"...). Perfil: "Seguro"|"Riesgo"|"Balanceado". Extrae 'tickers_excluidos' si pide descartar o ignorar activos."""
 
 async def extractor_intenciones(prompt_del_inversor: str) -> dict | None:
     """Extrae parámetros para búsqueda determínistica v4.5 — prompt compacto (-60% tokens)."""
@@ -336,6 +336,10 @@ async def extractor_intenciones(prompt_del_inversor: str) -> dict | None:
                         "perfil":       {"type": "STRING"},
                         "sector":       {"type": "STRING"},
                         "tickers_manuales": {
+                            "type": "ARRAY",
+                            "items": {"type": "STRING"}
+                        },
+                        "tickers_excluidos": {
                             "type": "ARRAY",
                             "items": {"type": "STRING"}
                         },
@@ -526,17 +530,18 @@ async def fabricante_de_graficos(ticker: str, periodo: str = "3mo") -> tuple[byt
     labels = []
     prices = []
     try:
-        limit = 63
-        if '1mo' in periodo: limit = 21
-        elif '6mo' in periodo: limit = 126
-        elif '1y' in periodo: limit = 252
+        es_cripto = ticker.endswith("-USD") or ticker.endswith("USDT")
+        limit = 90 if es_cripto else 63
+        if '1mo' in periodo: limit = 30 if es_cripto else 21
+        elif '6mo' in periodo: limit = 180 if es_cripto else 126
+        elif '1y' in periodo: limit = 365 if es_cripto else 252
 
         hist = []
         keys = [k.strip() for k in FMP_API_KEYS.split(',') if k.strip()] if FMP_API_KEYS else []
         if not _FMP_HIST_DEAD and keys:
             for fmp_key in keys:
                 fmp_ticker = ticker.replace("-USD", "USD") if ticker.endswith("-USD") else ticker
-                url = f"https://financialmodelingprep.com/api/v3/historical-price-full/{fmp_ticker}?apikey={fmp_key}"
+                url = f"https://financialmodelingprep.com/api/v3/historical-price-full/{fmp_ticker}?apikey={fmp_key}&timeseries=365"
                 try:
                     resp = await http_client.get(url, timeout=10.0)
                     if resp.status_code == 200:
@@ -617,9 +622,9 @@ async def fabricante_de_graficos(ticker: str, periodo: str = "3mo") -> tuple[byt
         if not hist:
             logger.warning(f"[CHART] Error GRAPH para {ticker}: Fallaron FMP, AV y Yahoo.")
             return None, 0.0
-        if '1mo' in periodo: limit = 21
-        elif '6mo' in periodo: limit = 126
-        elif '1y' in periodo: limit = 252
+        if '1mo' in periodo: limit = 30 if es_cripto else 21
+        elif '6mo' in periodo: limit = 180 if es_cripto else 126
+        elif '1y' in periodo: limit = 365 if es_cripto else 252
         hist = hist[:limit]
         hist.reverse()
         for item in hist:
@@ -650,7 +655,10 @@ async def fabricante_de_graficos(ticker: str, periodo: str = "3mo") -> tuple[byt
             },
             "options": {
                 "legend": {"display": False},
-                "title": {"display": True, "text": f"{ticker} ({periodo})"}
+                "title": {"display": True, "text": f"{ticker} ({periodo})"},
+                "scales": {
+                    "yAxes": [{"ticks": {"beginAtZero": False}}]
+                }
             }
         },
         "width": 600, "height": 300, "format": "webp"
@@ -1069,6 +1077,7 @@ async def _pipeline_hibrido_interno(
 
     _t_manuales = extraccion.get("tickers_manuales") if extraccion else None
     _t_legacy   = extraccion.get("tickers") if extraccion else None
+    _t_excluidos = extraccion.get("tickers_excluidos", []) if extraccion else []
     _hay_clase  = extraccion.get("clase_activo") if extraccion else None
     if not extraccion or not (_t_manuales or _t_legacy or _hay_clase):
         logger.error(f"[PIPELINE] Extractor devolvio resultado invalido: {extraccion}")
@@ -1109,6 +1118,13 @@ async def _pipeline_hibrido_interno(
             logger.info(f"[PIPELINE] Semillas fallback para {clase_activo}: {tickers}")
     else:
         logger.info(f"[PIPELINE] Tickers manuales/extractados: {tickers}")
+
+    if _t_excluidos:
+        tickers = [t for t in tickers if t not in _t_excluidos and not any(excl.lower() in t.lower() for excl in _t_excluidos)]
+        logger.info(f"[PIPELINE] Tickers después de excluir {_t_excluidos}: {tickers}")
+
+    if ticker_excluido and ticker_excluido in tickers:
+        tickers.remove(ticker_excluido)
 
     if not tickers:
         logger.error(f"[PIPELINE] Sin tickers candidatos para clase={clase_activo} sector={sector_ia}")
@@ -1262,10 +1278,11 @@ async def _pipeline_hibrido_interno(
         try:
             import random
             await asyncio.sleep(random.uniform(0.1, 1.5))
-            limit = 63
-            if '1mo' in temporalidad: limit = 21
-            elif '6mo' in temporalidad: limit = 126
-            elif '1y' in temporalidad: limit = 252
+            es_cripto = gan['ticker'].endswith("-USD") or gan['ticker'].endswith("USDT")
+            limit = 90 if es_cripto else 63
+            if '1mo' in temporalidad: limit = 30 if es_cripto else 21
+            elif '6mo' in temporalidad: limit = 180 if es_cripto else 126
+            elif '1y' in temporalidad: limit = 365 if es_cripto else 252
 
             hist = []
             keys = [k.strip() for k in FMP_API_KEYS.split(',') if k.strip()] if FMP_API_KEYS else []
@@ -1553,7 +1570,7 @@ async def _pipeline_por_tabla(
 
     mejor = None
     grafico_bytes = None
-    temporalidad  = "1mo" if clase_activo == "CRIPTO" else "3mo"
+    temporalidad = "3mo"  # Usar siempre 3 meses para comparar con Google Finance / TradingView
     # Evaluación perezosa (Lazy Load): Solo pedimos el gráfico que necesitamos
     for gan in ganadores:
         buf_graf, rend = await fabricante_de_graficos(gan["ticker"], temporalidad)
@@ -1565,6 +1582,7 @@ async def _pipeline_por_tabla(
     if not mejor:
         mejor = ganadores[0]
         mejor["rendimiento_real"] = 0.0
+    mejor["temporalidad"] = temporalidad  # Para que la etiqueta refleje el período real
 
     texto = _formatear_resultado_tabla(mejor, clase_activo)
     return texto, grafico_bytes, mejor["ticker"]
@@ -1620,7 +1638,9 @@ def _formatear_resultado_tabla(datos: dict, clase_activo: str) -> str:
             lineas.append(f"  • Nombre: <b>{datos['nombre']}</b>")
 
     rend_str = f"+{rend}%" if rend >= 0 else f"{rend}%"
-    label_rend = "Momentum Precio 3m" if clase_activo == "BONO" else "Momentum 3m"
+    periodo_labels = {"1mo": "1 mes", "3mo": "3 meses", "6mo": "6 meses", "1y": "1 año"}
+    periodo_txt = periodo_labels.get(datos.get("temporalidad", "3mo"), "3 meses")
+    label_rend = f"Momentum Precio {periodo_txt}"
     lineas.append(f"  • {label_rend}: <b>{rend_str}</b>")
     lineas.append("")
     lineas.append("<i>ℹ️ Análisis determinístico sin IA. Para un informe Goldman Sachs completo, usa la búsqueda libre.</i>")
@@ -4092,8 +4112,23 @@ async def telegram_webhook(request: Request, background_tasks: BackgroundTasks):
 
 @web_app.get("/ping")
 async def ping():
-    """P6: Endpoint ultra-ligero para mantener Render despierto (cron-job.org cada 14 min)."""
-    return {"ok": True}
+    """Endpoint para mantener Render despierto y asegurar que Telegram no descarte el Webhook."""
+    try:
+        if telegram_app and telegram_app.bot:
+            webhook_info = await telegram_app.bot.get_webhook_info()
+            if not webhook_info.url:
+                logger.warning("[PING] Webhook perdido o caído. Reconfigurando...")
+                webhook_url = f"{RENDER_EXTERNAL_URL}/webhook/telegram"
+                await telegram_app.bot.set_webhook(
+                    url=webhook_url,
+                    secret_token=TELEGRAM_WEBHOOK_SECRET or None,
+                    max_connections=5,
+                    allowed_updates=["message", "callback_query"]
+                )
+                logger.info(f"[PING] Webhook restaurado a: {webhook_url}")
+    except Exception as e:
+        logger.error(f"[PING] Error verificando webhook: {e}")
+    return {"ok": True, "ts": time.time()}
 
 @web_app.get("/health")
 async def health():

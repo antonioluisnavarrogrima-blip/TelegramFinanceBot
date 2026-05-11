@@ -1377,7 +1377,7 @@ async def _pipeline_hibrido_interno(
             return gan, None
 
     import random
-    max_candidatos = min(4, len(pre_ganadores))
+    max_candidatos = min(20, len(pre_ganadores))
     # Anti-repetición: excluir el ticker enviado en la última alerta si hay más candidatos
     if ticker_excluido and len(pre_ganadores) > 1:
         candidatos_sin_repetir = [g for g in pre_ganadores if g['ticker'].upper() != ticker_excluido.upper()]
@@ -1412,8 +1412,9 @@ async def _pipeline_hibrido_interno(
             None, None, None
         )
 
-    # Solicitamos el gráfico únicamente al ganador real (mejor rendimiento)
-    mejor_opcion, mejor_rend = candidatos_validos[0]
+    # Solicitamos el gráfico a uno de los mejores para aportar variedad
+    top_n = min(3, len(candidatos_validos))
+    mejor_opcion, mejor_rend = random.choice(candidatos_validos[:top_n])
     mejor_opcion = dict(mejor_opcion)  # copia defensiva antes de mutar
     mejor_opcion["rendimiento_real"] = round(mejor_rend, 2)
     ruta_captura_final, _ = await fabricante_de_graficos(mejor_opcion["ticker"], temporalidad)
@@ -1448,8 +1449,9 @@ async def _pipeline_hibrido_interno(
     signo   = "+" if rend_str >= 0 else ""
     aviso_grafico = "" if ruta_captura_final else "\n⚠️ <i>Gráfico no disponible en este momento.</i>"
 
+    nombre_empresa = mejor_opcion.get('shortName', mejor_opcion.get('name', ticker_final))
     texto_final = (
-        f"⚡ <b>Señal {emoji_clase} {clase_activo}: {ticker_final}</b>{aviso_grafico}\n"
+        f"⚡ <b>Señal {emoji_clase} {clase_activo}: {nombre_empresa} ({ticker_final})</b>{aviso_grafico}\n"
         f"📈 Rendimiento ({temporalidad}): <b>{signo}{rend_str}%</b>\n\n"
         f"🔍 <b>Análisis Quant:</b>\n"
         f"{informe_gs}"
@@ -1595,10 +1597,11 @@ def _formatear_resultado_tabla(datos: dict, clase_activo: str) -> str:
     EMOJIS = {"ACCION": "🏢", "REIT": "🏠", "ETF": "📈", "CRIPTO": "₿", "BONO": "📜"}
     emoji  = EMOJIS.get(clase_activo, "📊")
 
+    nombre_empresa = datos.get('shortName', datos.get('nombre', datos.get('name', ticker)))
     lineas = [
         f"📊 <b>RESULTADO — ANÁLISIS POR TABLA</b>",
         f"",
-        f"{emoji} <b>Ticker:</b> {ticker}",
+        f"{emoji} <b>Empresa:</b> {nombre_empresa} ({ticker})",
         f"🗂 <b>Clase:</b> {clase_activo}",
         f"",
         f"📈 <b>Métricas verificadas:</b>",

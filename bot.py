@@ -416,41 +416,36 @@ async def extractor_intenciones(prompt_del_inversor: str) -> dict | None:
 
 # --- CONSTANTES DEL GENERADOR GOLDMAN (Mover fuera de la función) ---
 _EJEMPLOS_POR_CLASE = {
-    "ACCION": """Ejemplo de Flash Note para ACCION:
- 🎯 <b>Tesis de Inversión:</b> Microsoft mantiene su foso económico...
- 📊 <b>Fundamentales:</b>
-   - Dividend Yield: 0.72%
-   - ROE: 38.5%
-   - Margen Neto: 36.2%
- ⚖️ <b>Veredicto:</b> Posición defensiva. Adecuada para perfil Seguro.""",
+    "ACCION": """🎯 <b>Tesis:</b> Microsoft mantiene su foso económico...
+📊 <b>Datos:</b>
+• Yield: 0.72%
+• ROE: 38.5%
+• Margen: 36.2%
+⚖️ <b>Veredicto:</b> Posición defensiva.""",
 
-    "ETF": """Ejemplo de Flash Note para ETF:
- 🎯 <b>Tesis de Inversión:</b> IWDA ofrece exposición diversificada a mercados desarrollados...
- 📊 <b>Fundamentales:</b>
-   - TER (Coste Anual): 0.20%
-   - AUM: 68.4 Bn USD
- ⚖️ <b>Veredicto:</b> Vehículo eficiente para indexación.""",
+    "ETF": """🎯 <b>Tesis:</b> IWDA ofrece exposición diversificada...
+📊 <b>Datos:</b>
+• TER: 0.20%
+• AUM: 68.4 Bn
+⚖️ <b>Veredicto:</b> Vehículo eficiente.""",
 
-    "REIT": """Ejemplo de Flash Note para REIT:
- 🎯 <b>Tesis de Inversión:</b> Realty Income es el referente de rentas...
- 📊 <b>Fundamentales:</b>
-   - Dividend Yield: 5.8%
-   - P/Book (proxy P/FFO): 1.3x
- ⚖️ <b>Veredicto:</b> Generador de rentas predecible.""",
+    "REIT": """🎯 <b>Tesis:</b> Realty Income es el referente de rentas...
+📊 <b>Datos:</b>
+• Yield: 5.8%
+• P/FFO: 14.2x
+⚖️ <b>Veredicto:</b> Generador de rentas.""",
 
-    "CRIPTO": """Ejemplo de Flash Note para CRIPTO:
- 🎯 <b>Tesis de Inversión:</b> Ethereum lidera el ecosistema DeFi...
- 📊 <b>Fundamentales:</b>
-   - Market Cap: 298.4 Bn USD
-   - Momentum 1m: +12.5%
- ⚖️ <b>Veredicto:</b> Activo especulativo. Perfil Riesgo.""",
+    "CRIPTO": """🎯 <b>Tesis:</b> Ethereum lidera el ecosistema DeFi...
+📊 <b>Datos:</b>
+• Cap: 298.4 Bn
+• Momentum: +12.5%
+⚖️ <b>Veredicto:</b> Activo especulativo.""",
 
-    "BONO": """Ejemplo de Flash Note para BONO:
- 🎯 <b>Tesis de Inversión:</b> TLT actúa como cobertura deflacionaria...
- 📊 <b>Fundamentales:</b>
-   - YTM / Cupón Proxy: 4.35%
-   - AUM: 41.2 Bn USD
- ⚖️ <b>Veredicto:</b> Instrumento de cobertura y renta fija."""
+    "BONO": """🎯 <b>Tesis:</b> TLT actúa como cobertura...
+📊 <b>Datos:</b>
+• YTM: 4.35%
+• AUM: 41.2 Bn
+⚖️ <b>Veredicto:</b> Instrumento de renta fija."""
 }
 
 _PROHIBICIONES_POR_CLASE = {
@@ -498,13 +493,15 @@ async def generador_informe_goldman(ticker: str, sector: str, datos: dict, perfi
 
     # 3. Prompt compacto (mínimo tokens, máximo precisión)
     prompt_sistema = (
-        f"Quant Director. Flash Note {clase_activo}. 3 bullets MAX. "
-        f"HTML solo <b><i>. SIN markdown/asteriscos. "
-        f"PROHIBIDO usar etiquetas <font>, <span>, <div> o atributos CSS. Utiliza EXCLUSIVAMENTE HTML básico soportado por Telegram (<b>, <i>, <u>, <s>). "
+        f"Quant Director. Flash Note {clase_activo}. Estilo sobrio. "
+        f"HTML solo <b><i>. SIN markdown. "
+        f"PROHIBIDO usar etiquetas <font>, <span>, <div>. "
+        f"REGLA CRUCIAL: Separa los tres bloques (Tesis, Datos, Veredicto) con DOBLE SALTO DE LÍNEA (\\n\\n). "
+        f"Cada dato en el bloque Datos debe ir en una línea nueva con el símbolo •. "
         f"REGLA CRUCIAL: Si los datos provistos en el json del contexto son vacíos parciales o nulos (ej. {{}}), DEBES NEGARTE a generar un veredicto de invencion. Responde estrictamente con: 'DATOS INSUFICIENTES'. "
         f"{restricciones} "
-        f"Estructura:\n🎯 <b>Tesis:</b> [1 frase]\n📊 <b>Datos:</b> [métricas clave]\n⚖️ <b>Veredicto:</b> [1 frase]\n"
-        f"{ejemplo}"
+        f"Estructura obligatoria:\n🎯 <b>Tesis:</b> [1 frase]\n\n📊 <b>Datos:</b>\n• [Dato 1]\n• [Dato 2]\n\n⚖️ <b>Veredicto:</b> [1 frase]\n"
+        f"Sigue este ejemplo:\n{ejemplo}"
     )
 
     try:
@@ -579,8 +576,8 @@ async def fabricante_de_graficos(ticker: str, periodo: str = "3mo") -> tuple[byt
             if limit <= 25: range_str = "1mo"
             elif limit <= 130: range_str = "6mo"
             elif limit <= 260: range_str = "1y"
-            url = f"https://apidojo-yahoo-finance-v1.p.rapidapi.com/stock/v3/get-chart?symbol={ticker}&interval=1d&range={range_str}"
-            headers = {"x-rapidapi-key": RAPIDAPI_KEY, "x-rapidapi-host": "apidojo-yahoo-finance-v1.p.rapidapi.com"}
+            url = f"https://apidojo-yahoo-finance-v1.rapidapi.com/stock/v3/get-chart?symbol={ticker}&interval=1d&range={range_str}"
+            headers = {"x-rapidapi-key": RAPIDAPI_KEY, "x-rapidapi-host": "apidojo-yahoo-finance-v1.rapidapi.com"}
             resp = await http_client.get(url, headers=headers, timeout=10.0)
             if resp.status_code == 200:
                 result = resp.json().get("chart", {}).get("result", [])
@@ -1018,10 +1015,19 @@ async def _obtener_info_bulk(tickers: list[str], clase: str) -> dict:
                             if not precio:
                                 continue
                             div_yield = info.get("dividendYield")
-                            # yfinance devuelve dividendYield como fracción (0.0088 = 0.88%)
-                            # pero a veces como porcentaje entero (0.88). Normalizar a fracción:
-                            if div_yield is not None and div_yield > 1:
-                                div_yield = div_yield / 100.0
+                            # yfinance es inconsistente: a veces devuelve 0.0088 (0.88%) y otras 0.88
+                            # Normalización robusta: comparamos con dividendRate si existe
+                            if div_yield is not None:
+                                rate = info.get("dividendRate")
+                                if rate and precio:
+                                    calc_yield = rate / precio
+                                    # Si el yield de yfinance es ~100 veces mayor al calculado, es un porcentaje
+                                    if div_yield > calc_yield * 10:
+                                        div_yield /= 100.0
+                                elif div_yield > 1.0:
+                                    # Fallback: si no hay rate, un valor > 1.0 suele ser porcentaje
+                                    div_yield /= 100.0
+
                             resultado[sym.upper()] = {
                                 "regularMarketPrice": precio,
                                 "previousClose":      info.get("previousClose"),

@@ -950,10 +950,18 @@ class ExtractorFMP(ExtractorBase):
             resp = await http_client.get(url, timeout=12.0)
             if resp.status_code == 403:
                 self._dead = True
+                logger.warning(f"[FMP] 403 Forbidden — API key inválida o plan caducado: {self.key[:8]}...")
                 return {}
-            if resp.status_code != 200: return {}
+            if resp.status_code == 429:
+                logger.warning(f"[FMP] 429 Rate Limit — demasiadas peticiones. Respuesta: {resp.text[:200]}")
+                return {}
+            if resp.status_code != 200:
+                logger.warning(f"[FMP] HTTP {resp.status_code} inesperado para {simbolos[:60]}. Body: {resp.text[:200]}")
+                return {}
             data = resp.json()
-            if not isinstance(data, list): return {}
+            if not isinstance(data, list):
+                logger.warning(f"[FMP] Respuesta no es lista para {simbolos[:60]}. Tipo={type(data).__name__}. Contenido: {str(data)[:300]}")
+                return {}
             res = {}
             for item in data:
                 fmp_sym = item.get('symbol', '').upper()
@@ -973,6 +981,7 @@ class ExtractorFMP(ExtractorBase):
                 }
             return res
         except Exception as e:
+            logger.warning(f"[FMP] Excepción en fetch_batch para {simbolos[:60]}: {type(e).__name__}: {e}")
             return {}
 
 # Clases de activo que REQUIEREN fundamentales (PER, dividendo...) para el filtrado
@@ -1009,8 +1018,69 @@ async def _obtener_info_bulk(tickers: list[str], clase: str) -> dict:
                     await asyncio.sleep(1.5)
                 if res: break
             if not res:
-                logger.warning(f"[FAST-FAIL] FMP no devolvió datos para el lote. Continuando con el siguiente lote.")
-                continue
+                logger.warning(f"[FAST-FAIL] FMP no devolvió datos para el lote {lote}. Intentando fallback Yahoo Finance v11...")
+                # Fallback: Yahoo Finance v11 via curl_cffi (anti-WAF)
+                try:
+                    from curl_cffi.requests import AsyncSession
+                    yahoo_res = {}
+                    for t_yf in lote:
+                        yf_url = f"https://query2.finance.yahoo.com/v11/finance/quoteSummary/{t_yf}?modules=summaryDetail%2CdefaultKeyStatistics%2CassetProfile%2CfinancialData%2CquoteType"
+                        try:
+                            async with AsyncSession(impersonate="chrome110") as sess:
+                                r = await sess.get(yf_url, timeout=10.0)
+                            if r.status_code == 200:
+                                qsr = r.json().get("quoteSummary", {}).get("result", [])
+                                if qsr:
+                                    sd  = qsr[0].get("summaryDetail", {})
+                                    ks  = qsr[0].get("defaultKeyStatistics", {})
+                                    fd  = qsr[0].get("financialData", {})
+                                    qt  = qsr[0].get("quoteType", {})
+                                    ap  = qsr[0].get("assetProfile", {})
+                                    precio = (fd.get("currentPrice") or {}).get("raw") or (sd.get("regularMarketPrice") or {}).get("raw")
+                                    if precio:
+                                        div_yield_raw = (sd.get("dividendYield") or {}).get("raw")
+                                        div_rate_raw  = (sd.get("dividendRate")  or {}).get("raw")
+                                        pe_trail       = (sd.get("trailingPE")    or ks.get("trailingPE") or {}).get("raw")
+                                        pe_fwd         = (sd.get("forwardPE")     or ks.get("forwardPE")  or {}).get("raw")
+                                        yahoo_res[t_yf.upper()] = {
+                                            'regularMarketPrice': precio,
+                                            'previousClose': (sd.get("previousClose") or {}).get("raw"),
+                                            'marketCap': (sd.get("marketCap") or {}).get("raw"),
+                                            'shortName': qt.get("shortName", t_yf),
+                                            'trailingPE': pe_trail,
+                                            'forwardPE': pe_fwd,
+                                            'dividendYield': div_yield_raw,
+                                            'dividendRate': div_rate_raw,
+                                            'returnOnEquity': (fd.get("returnOnEquity") or {}).get("raw"),
+                                            'profitMargins': (fd.get("profitMargins") or {}).get("raw"),
+                                            'debtToEquity': (fd.get("debtToEquity") or {}).get("raw"),
+                                            'revenueGrowth': (fd.get("revenueGrowth") or {}).get("raw"),
+                                            'earningsGrowth': (fd.get("earningsGrowth") or {}).get("raw"),
+                                            'beta': (sd.get("beta") or ks.get("beta") or {}).get("raw"),
+                                            'sector': ap.get("sector"),
+                                            '_fuente': 'YahooV11_Fallback',
+                                        }
+                                        logger.info(f"[YF-FALLBACK] {t_yf}: PER={pe_trail} DIV={div_yield_raw} OK (Yahoo v11)")
+                                    else:
+                                        logger.warning(f"[YF-FALLBACK] {t_yf}: sin precio en respuesta Yahoo v11")
+                                else:
+                                    logger.warning(f"[YF-FALLBACK] {t_yf}: result vacío en Yahoo v11 (posible delisting o símbolo inválido)")
+                            else:
+                                logger.warning(f"[YF-FALLBACK] {t_yf}: HTTP {r.status_code} en Yahoo v11")
+                        except Exception as e_yf:
+                            logger.warning(f"[YF-FALLBACK] {t_yf}: excepción Yahoo v11: {type(e_yf).__name__}: {e_yf}")
+                    if yahoo_res:
+                        res = yahoo_res
+                        logger.info(f"[YF-FALLBACK] Recuperados {len(yahoo_res)}/{len(lote)} tickers desde Yahoo v11")
+                    else:
+                        logger.warning(f"[FAST-FAIL] Fallback Yahoo v11 también vacío para lote {lote}. Continuando.")
+                        continue
+                except ImportError:
+                    logger.warning("[FAST-FAIL] curl_cffi no disponible para fallback Yahoo. Continuando.")
+                    continue
+                except Exception as e_fb:
+                    logger.warning(f"[FAST-FAIL] Error inesperado en fallback Yahoo: {e_fb}")
+                    continue
             for t, info in res.items():
                 if info and info.get('regularMarketPrice'):
                     nuevos_datos[t] = info

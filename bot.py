@@ -114,6 +114,7 @@ _QUICKCHART_SEMA:  asyncio.Semaphore | None = None
 _FMP_HIST_DEAD:    bool = False   # Se activa al primer 403 del endpoint legacy historical-price-full
 _CRON_SEMA:        asyncio.Semaphore | None = None
 _CRON_LOCK:        asyncio.Lock      | None = None
+_FMP_DEAD_KEYS:    set  = set()   # Keys FMP con 403 confirmado — se omiten en todas las llamadas siguientes
 
 def _normalizar_texto(texto: str) -> str:
     """Elimina diacríticos (tildes) para que el regex sea robusto ante inputs sin tilde."""
@@ -932,7 +933,8 @@ class ExtractorFMP(ExtractorBase):
     """Extractor basado en Financial Modeling Prep (FMP)."""
     def __init__(self, key: str):
         super().__init__(key)
-        self._dead = False
+        # Inicializar _dead desde el set global para no re-intentar keys ya confirmadas como 403
+        self._dead = key in _FMP_DEAD_KEYS
 
     async def fetch_batch(self, tickers: list[str]) -> dict:
         if self._dead: return {}
@@ -950,6 +952,7 @@ class ExtractorFMP(ExtractorBase):
             resp = await http_client.get(url, timeout=12.0)
             if resp.status_code == 403:
                 self._dead = True
+                _FMP_DEAD_KEYS.add(self.key)  # Persistir a nivel global para omitir en intentos futuros
                 logger.warning(f"[FMP] 403 Forbidden — API key inválida o plan caducado: {self.key[:8]}...")
                 return {}
             if resp.status_code == 429:
@@ -1024,7 +1027,8 @@ async def _obtener_info_bulk(tickers: list[str], clase: str) -> dict:
                     from curl_cffi.requests import AsyncSession
                     yahoo_res = {}
                     for t_yf in lote:
-                        yf_url = f"https://query2.finance.yahoo.com/v11/finance/quoteSummary/{t_yf}?modules=summaryDetail%2CdefaultKeyStatistics%2CassetProfile%2CfinancialData%2CquoteType"
+                        # v10 es el endpoint oficial de Yahoo Finance para quoteSummary (v11 no existe)
+                        yf_url = f"https://query2.finance.yahoo.com/v10/finance/quoteSummary/{t_yf}?modules=summaryDetail%2CdefaultKeyStatistics%2CassetProfile%2CfinancialData%2CquoteType"
                         try:
                             async with AsyncSession(impersonate="chrome110") as sess:
                                 r = await sess.get(yf_url, timeout=10.0)

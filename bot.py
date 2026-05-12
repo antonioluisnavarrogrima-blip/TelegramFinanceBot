@@ -526,7 +526,7 @@ async def generador_informe_goldman(ticker: str, sector: str, datos: dict, perfi
 
 # --- 2. HERRAMIENTAS MATEMÁTICAS LOCALES ---
 async def fabricante_de_graficos(ticker: str, periodo: str = "3mo") -> tuple[bytes | None, float]:
-    global _QUICKCHART_SEMA, http_client, _FMP_HIST_DEAD
+    global _QUICKCHART_SEMA, http_client
     import datetime
     labels = []
     prices = []
@@ -537,25 +537,7 @@ async def fabricante_de_graficos(ticker: str, periodo: str = "3mo") -> tuple[byt
         elif '6mo' in periodo: limit = 180 if es_cripto else 126
         elif '1y' in periodo: limit = 365 if es_cripto else 252
 
-        hist = []
-        keys = [k.strip() for k in FMP_API_KEYS.split(',') if k.strip()] if FMP_API_KEYS else []
-        if not _FMP_HIST_DEAD and keys:
-            for fmp_key in keys:
-                fmp_ticker = ticker.replace("-USD", "USD") if ticker.endswith("-USD") else ticker
-                url = f"https://financialmodelingprep.com/api/v3/historical-price-full/{fmp_ticker}?apikey={fmp_key}&timeseries=365"
-                try:
-                    resp = await http_client.get(url, timeout=10.0)
-                    if resp.status_code == 200:
-                        hist = resp.json().get("historical", [])
-                        if hist: break
-                    elif resp.status_code == 403:
-                        _FMP_HIST_DEAD = True
-                        logger.warning("[CHART] FMP historical-price-full marcado como Legacy (403). Bypass activado.")
-                        break
-                    else:
-                        logger.warning(f"[CHART] FMP Key fallida: {resp.status_code}")
-                except Exception:
-                    pass
+        hist = []  # FMP eliminado — directo a Yahoo V8
         
         # Fallback 1 a Yahoo V8 (by-pass Cloudflare WAF usando curl_cffi)
         # Se prioriza sobre RapidAPI porque RapidAPI a veces devuelve datos de hace 1 mes (stale)
@@ -1008,83 +990,101 @@ async def _obtener_info_bulk(tickers: list[str], clase: str) -> dict:
 
     faltantes = [t for t in tickers if t.upper() not in cached]
     if faltantes:
-        extractores = [ExtractorFMP(k) for k in FMP_API_KEYS.split(',')] if FMP_API_KEYS else []
         nuevos_datos = {}
         for i_chunk in range(0, len(faltantes), 50):
             lote = faltantes[i_chunk:i_chunk+50]
             res = {}
-            for ext in extractores:
-                max_intentos_ext = 1 if (hasattr(ext, '_dead') and ext._dead) else 2
-                for _ in range(max_intentos_ext):
-                    res = await ext.fetch_batch(lote)
-                    if res: break
-                    await asyncio.sleep(1.5)
-                if res: break
-            if not res:
-                logger.warning(f"[FAST-FAIL] FMP no devolvió datos para el lote {lote}. Intentando fallback Yahoo Finance v11...")
-                # Fallback: Yahoo Finance v11 via curl_cffi (anti-WAF)
-                try:
-                    from curl_cffi.requests import AsyncSession
-                    yahoo_res = {}
-                    for t_yf in lote:
-                        # v10 es el endpoint oficial de Yahoo Finance para quoteSummary (v11 no existe)
-                        yf_url = f"https://query2.finance.yahoo.com/v10/finance/quoteSummary/{t_yf}?modules=summaryDetail%2CdefaultKeyStatistics%2CassetProfile%2CfinancialData%2CquoteType"
-                        try:
-                            async with AsyncSession(impersonate="chrome110") as sess:
-                                r = await sess.get(yf_url, timeout=10.0)
-                            if r.status_code == 200:
-                                qsr = r.json().get("quoteSummary", {}).get("result", [])
-                                if qsr:
-                                    sd  = qsr[0].get("summaryDetail", {})
-                                    ks  = qsr[0].get("defaultKeyStatistics", {})
-                                    fd  = qsr[0].get("financialData", {})
-                                    qt  = qsr[0].get("quoteType", {})
-                                    ap  = qsr[0].get("assetProfile", {})
-                                    precio = (fd.get("currentPrice") or {}).get("raw") or (sd.get("regularMarketPrice") or {}).get("raw")
-                                    if precio:
-                                        div_yield_raw = (sd.get("dividendYield") or {}).get("raw")
-                                        div_rate_raw  = (sd.get("dividendRate")  or {}).get("raw")
-                                        pe_trail       = (sd.get("trailingPE")    or ks.get("trailingPE") or {}).get("raw")
-                                        pe_fwd         = (sd.get("forwardPE")     or ks.get("forwardPE")  or {}).get("raw")
-                                        yahoo_res[t_yf.upper()] = {
-                                            'regularMarketPrice': precio,
-                                            'previousClose': (sd.get("previousClose") or {}).get("raw"),
-                                            'marketCap': (sd.get("marketCap") or {}).get("raw"),
-                                            'shortName': qt.get("shortName", t_yf),
-                                            'trailingPE': pe_trail,
-                                            'forwardPE': pe_fwd,
-                                            'dividendYield': div_yield_raw,
-                                            'dividendRate': div_rate_raw,
-                                            'returnOnEquity': (fd.get("returnOnEquity") or {}).get("raw"),
-                                            'profitMargins': (fd.get("profitMargins") or {}).get("raw"),
-                                            'debtToEquity': (fd.get("debtToEquity") or {}).get("raw"),
-                                            'revenueGrowth': (fd.get("revenueGrowth") or {}).get("raw"),
-                                            'earningsGrowth': (fd.get("earningsGrowth") or {}).get("raw"),
-                                            'beta': (sd.get("beta") or ks.get("beta") or {}).get("raw"),
-                                            'sector': ap.get("sector"),
-                                            '_fuente': 'YahooV11_Fallback',
-                                        }
-                                        logger.info(f"[YF-FALLBACK] {t_yf}: PER={pe_trail} DIV={div_yield_raw} OK (Yahoo v11)")
-                                    else:
-                                        logger.warning(f"[YF-FALLBACK] {t_yf}: sin precio en respuesta Yahoo v11")
-                                else:
-                                    logger.warning(f"[YF-FALLBACK] {t_yf}: result vacío en Yahoo v11 (posible delisting o símbolo inválido)")
-                            else:
-                                logger.warning(f"[YF-FALLBACK] {t_yf}: HTTP {r.status_code} en Yahoo v11")
-                        except Exception as e_yf:
-                            logger.warning(f"[YF-FALLBACK] {t_yf}: excepción Yahoo v11: {type(e_yf).__name__}: {e_yf}")
-                    if yahoo_res:
-                        res = yahoo_res
-                        logger.info(f"[YF-FALLBACK] Recuperados {len(yahoo_res)}/{len(lote)} tickers desde Yahoo v11")
+
+            # --- Fuente 1: Yahoo Finance v7 quote bulk (curl_cffi, sin autenticación) ---
+            try:
+                from curl_cffi.requests import AsyncSession
+                simbolos_yf = ",".join(lote)
+                # v7 devuelve precio + fundamentales básicos en un solo request
+                yf7_url = (
+                    f"https://query1.finance.yahoo.com/v7/finance/quote"
+                    f"?symbols={simbolos_yf}"
+                    f"&fields=regularMarketPrice,trailingPE,forwardPE,dividendYield,dividendRate,"
+                    f"marketCap,shortName,beta,returnOnEquity,profitMargins,debtToEquity,"
+                    f"revenueGrowth,earningsGrowth,sector,previousClose"
+                )
+                async with AsyncSession(impersonate="chrome110") as sess:
+                    r7 = await sess.get(yf7_url, timeout=10.0)
+                if r7.status_code == 200:
+                    quote_response = r7.json().get("quoteResponse", {}).get("result", [])
+                    for item in quote_response:
+                        sym = item.get("symbol", "").upper()
+                        precio = item.get("regularMarketPrice")
+                        if sym and precio:
+                            div_yield = item.get("dividendYield")
+                            # Yahoo v7 devuelve dividendYield como fracción decimal (ej. 0.05 = 5%)
+                            res[sym] = {
+                                "regularMarketPrice":   precio,
+                                "previousClose":        item.get("regularMarketPreviousClose") or item.get("previousClose"),
+                                "marketCap":            item.get("marketCap"),
+                                "shortName":            item.get("shortName", sym),
+                                "trailingPE":           item.get("trailingPE"),
+                                "forwardPE":            item.get("forwardPE"),
+                                "dividendYield":        div_yield,
+                                "dividendRate":         item.get("dividendRate"),
+                                "returnOnEquity":       item.get("returnOnEquity"),
+                                "profitMargins":        item.get("profitMargins"),
+                                "debtToEquity":         item.get("debtToEquity"),
+                                "revenueGrowth":        item.get("revenueGrowth"),
+                                "earningsGrowth":       item.get("earningsGrowth"),
+                                "beta":                 item.get("beta"),
+                                "sector":               item.get("sector"),
+                                "_fuente":              "YahooV7",
+                            }
+                    if res:
+                        logger.info(f"[YF-V7] {len(res)}/{len(lote)} tickers OK desde Yahoo v7 bulk")
                     else:
-                        logger.warning(f"[FAST-FAIL] Fallback Yahoo v11 también vacío para lote {lote}. Continuando.")
-                        continue
-                except ImportError:
-                    logger.warning("[FAST-FAIL] curl_cffi no disponible para fallback Yahoo. Continuando.")
-                    continue
-                except Exception as e_fb:
-                    logger.warning(f"[FAST-FAIL] Error inesperado en fallback Yahoo: {e_fb}")
-                    continue
+                        logger.warning(f"[YF-V7] HTTP {r7.status_code} o sin resultados para lote {lote[:5]}")
+                else:
+                    logger.warning(f"[YF-V7] HTTP {r7.status_code} para lote {lote[:5]}. Body: {r7.text[:200]}")
+            except Exception as e_v7:
+                logger.warning(f"[YF-V7] Excepción en bulk Yahoo v7: {type(e_v7).__name__}: {e_v7}")
+
+            # --- Fuente 2: Alpha Vantage (fallback por ticker, si YF v7 falló o dejó tickers sin datos) ---
+            faltantes_lote = [t for t in lote if t.upper() not in res]
+            if faltantes_lote:
+                av_keys = [k.strip() for k in ALPHAVANTAGE_API_KEYS.split(',') if k.strip()] if ALPHAVANTAGE_API_KEYS else []
+                for t_av in faltantes_lote:
+                    for av_key in av_keys:
+                        try:
+                            av_url = f"https://www.alphavantage.co/query?function=OVERVIEW&symbol={t_av}&apikey={av_key}"
+                            r_av = await http_client.get(av_url, timeout=10.0)
+                            if r_av.status_code == 200:
+                                d = r_av.json()
+                                if d.get("Symbol"):  # AV devuelve {} si rate-limited
+                                    price_url = f"https://www.alphavantage.co/query?function=GLOBAL_QUOTE&symbol={t_av}&apikey={av_key}"
+                                    r_price = await http_client.get(price_url, timeout=8.0)
+                                    precio_av = None
+                                    if r_price.status_code == 200:
+                                        precio_av = float(r_price.json().get("Global Quote", {}).get("05. price", 0) or 0) or None
+                                    pe = float(d.get("PERatio", 0) or 0) or None
+                                    div_y = float(d.get("DividendYield", 0) or 0) or None
+                                    res[t_av.upper()] = {
+                                        "regularMarketPrice": precio_av,
+                                        "marketCap":  int(d.get("MarketCapitalization", 0) or 0) or None,
+                                        "shortName":  d.get("Name", t_av),
+                                        "trailingPE": pe,
+                                        "dividendYield": div_y,
+                                        "dividendRate": float(d.get("DividendPerShare", 0) or 0) or None,
+                                        "returnOnEquity": float(d.get("ReturnOnEquityTTM", 0) or 0) or None,
+                                        "profitMargins": float(d.get("ProfitMargin", 0) or 0) or None,
+                                        "beta": float(d.get("Beta", 0) or 0) or None,
+                                        "sector": d.get("Sector"),
+                                        "_fuente": "AlphaVantage",
+                                    }
+                                    logger.info(f"[AV-FALLBACK] {t_av}: PER={pe} DIV={div_y} OK")
+                                    break  # Pasar al siguiente ticker
+                        except Exception as e_av:
+                            logger.warning(f"[AV-FALLBACK] {t_av}: {type(e_av).__name__}: {e_av}")
+
+            if not res:
+                logger.warning(f"[FAST-FAIL] Todas las fuentes fallaron para lote {lote}. Se usará dataset estático.")
+                continue
+
             for t, info in res.items():
                 if info and info.get('regularMarketPrice'):
                     nuevos_datos[t] = info
@@ -1358,25 +1358,7 @@ async def _pipeline_hibrido_interno(
             elif '6mo' in temporalidad: limit = 180 if es_cripto else 126
             elif '1y' in temporalidad: limit = 365 if es_cripto else 252
 
-            hist = []
-            keys = [k.strip() for k in FMP_API_KEYS.split(',') if k.strip()] if FMP_API_KEYS else []
-            if not _FMP_HIST_DEAD and keys:
-                for fmp_key in keys:
-                    fmp_ticker = gan['ticker'].replace("-USD", "USD") if gan['ticker'].endswith("-USD") else gan['ticker']
-                    url = f"https://financialmodelingprep.com/api/v3/historical-price-full/{fmp_ticker}?apikey={fmp_key}"
-                    try:
-                        resp = await http_client.get(url, timeout=10.0)
-                        if resp.status_code == 200:
-                            hist = resp.json().get('historical', [])
-                            if hist: break
-                        elif resp.status_code == 403:
-                            _FMP_HIST_DEAD = True
-                            logger.warning("[REND] FMP historical-price-full marcado como Legacy (403). Bypass activado.")
-                            break
-                        else:
-                            logger.warning(f"[REND] FMP Key fallida para {gan['ticker']}: HTTP {resp.status_code}")
-                    except Exception:
-                        pass
+            hist = []  # FMP eliminado — Yahoo V8 es la fuente primaria de históricos
             
             # Fallback 1 a Yahoo V8 (by-pass WAF) - Se prioriza sobre RapidAPI
             if not hist:
@@ -1471,7 +1453,7 @@ async def _pipeline_hibrido_interno(
     logger.info(f"[PIPELINE] candidatos_validos tras filtro rend={rendimiento_objetivo}%: {[(g['ticker'], round(r,2)) for g,r in candidatos_validos]}")
 
     if not candidatos_validos:
-        logger.warning(f"[PIPELINE] CERO candidatos_validos. Pre-ganadores tenían rends: {[(t for t,r in [(g['ticker'],r) for g,r in tuples_rend])]}")
+        logger.warning(f"[PIPELINE] CERO candidatos_validos. Pre-ganadores tenían rends: {[(g['ticker'], round(r,2) if r is not None else None) for g,r in tuples_rend]}")
         # Guardar en BD los candidatos que sí encontramos (antes del filtro estricto de rendimiento)
         if tid and tuples_rend:
             candidatos_con_rend = [(g, r) for g, r in tuples_rend if r is not None]

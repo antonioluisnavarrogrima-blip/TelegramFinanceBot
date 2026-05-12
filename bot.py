@@ -984,7 +984,7 @@ _CLASES_CON_FUNDAMENTALES = {"ACCION", "REIT", "ETF", "BONO"}
 async def _obtener_info_bulk(tickers: list[str], clase: str) -> dict:
     require_fundamentals = clase.upper() in _CLASES_CON_FUNDAMENTALES
     cached = await db.obtener_yf_cache_bulk(tickers, require_fundamentals=require_fundamentals)
-    
+
     # Inyectar datos en tiempo real del WebSocket si están disponibles
     import websocket_client
     for t in tickers:
@@ -1001,62 +1001,115 @@ async def _obtener_info_bulk(tickers: list[str], clase: str) -> dict:
     if faltantes:
         nuevos_datos = {}
         for i_chunk in range(0, len(faltantes), 50):
-            lote = faltantes[i_chunk:i_chunk+50]
+            lote = faltantes[i_chunk:i_chunk + 50]
             res = {}
 
-            # --- Fuente 1: Yahoo Finance v7 quote bulk (curl_cffi, sin autenticación) ---
+            # --- Fuente 1: yfinance library (gestiona crumbs/cookies Yahoo internamente) ---
+            # No requiere API key; maneja autenticación Yahoo automáticamente via crumbs
             try:
-                from curl_cffi.requests import AsyncSession
-                simbolos_yf = ",".join(lote)
-                # v7 devuelve precio + fundamentales básicos en un solo request
-                yf7_url = (
-                    f"https://query1.finance.yahoo.com/v7/finance/quote"
-                    f"?symbols={simbolos_yf}"
-                    f"&fields=regularMarketPrice,trailingPE,forwardPE,dividendYield,dividendRate,"
-                    f"marketCap,shortName,beta,returnOnEquity,profitMargins,debtToEquity,"
-                    f"revenueGrowth,earningsGrowth,sector,previousClose"
-                )
-                async with AsyncSession(impersonate="chrome110") as sess:
-                    r7 = await sess.get(yf7_url, timeout=10.0)
-                if r7.status_code == 200:
-                    quote_response = r7.json().get("quoteResponse", {}).get("result", [])
-                    for item in quote_response:
-                        sym = item.get("symbol", "").upper()
-                        precio = item.get("regularMarketPrice")
-                        if sym and precio:
-                            div_yield = item.get("dividendYield")
-                            # Yahoo v7 devuelve dividendYield como fracción decimal (ej. 0.05 = 5%)
-                            res[sym] = {
-                                "regularMarketPrice":   precio,
-                                "previousClose":        item.get("regularMarketPreviousClose") or item.get("previousClose"),
-                                "marketCap":            item.get("marketCap"),
-                                "shortName":            item.get("shortName", sym),
-                                "trailingPE":           item.get("trailingPE"),
-                                "forwardPE":            item.get("forwardPE"),
-                                "dividendYield":        div_yield,
-                                "dividendRate":         item.get("dividendRate"),
-                                "returnOnEquity":       item.get("returnOnEquity"),
-                                "profitMargins":        item.get("profitMargins"),
-                                "debtToEquity":         item.get("debtToEquity"),
-                                "revenueGrowth":        item.get("revenueGrowth"),
-                                "earningsGrowth":       item.get("earningsGrowth"),
-                                "beta":                 item.get("beta"),
-                                "sector":               item.get("sector"),
-                                "_fuente":              "YahooV7",
-                            }
-                    if res:
-                        logger.info(f"[YF-V7] {len(res)}/{len(lote)} tickers OK desde Yahoo v7 bulk")
-                    else:
-                        logger.warning(f"[YF-V7] HTTP {r7.status_code} o sin resultados para lote {lote[:5]}")
-                else:
-                    logger.warning(f"[YF-V7] HTTP {r7.status_code} para lote {lote[:5]}. Body: {r7.text[:200]}")
-            except Exception as e_v7:
-                logger.warning(f"[YF-V7] Excepción en bulk Yahoo v7: {type(e_v7).__name__}: {e_v7}")
+                import yfinance as yf
 
-            # --- Fuente 2: Alpha Vantage (fallback por ticker, si YF v7 falló o dejó tickers sin datos) ---
+                def _yf_sync_fetch(syms: list) -> dict:
+                    resultado = {}
+                    for sym in syms:
+                        try:
+                            info = yf.Ticker(sym).info
+                            precio = info.get("currentPrice") or info.get("regularMarketPrice")
+                            if not precio:
+                                continue
+                            div_yield = info.get("dividendYield")
+                            # yfinance devuelve dividendYield como fracción (0.0088 = 0.88%)
+                            # pero a veces como porcentaje entero (0.88). Normalizar a fracción:
+                            if div_yield is not None and div_yield > 1:
+                                div_yield = div_yield / 100.0
+                            resultado[sym.upper()] = {
+                                "regularMarketPrice": precio,
+                                "previousClose":      info.get("previousClose"),
+                                "marketCap":          info.get("marketCap"),
+                                "shortName":          info.get("shortName", sym),
+                                "trailingPE":         info.get("trailingPE"),
+                                "forwardPE":          info.get("forwardPE"),
+                                "dividendYield":      div_yield,
+                                "dividendRate":       info.get("dividendRate"),
+                                "returnOnEquity":     info.get("returnOnEquity"),
+                                "profitMargins":      info.get("profitMargins"),
+                                "operatingMargins":   info.get("operatingMargins"),
+                                "debtToEquity":       info.get("debtToEquity"),
+                                "revenueGrowth":      info.get("revenueGrowth"),
+                                "earningsGrowth":     info.get("earningsGrowth"),
+                                "beta":               info.get("beta"),
+                                "sector":             info.get("sector"),
+                                "ebitda":             info.get("ebitda"),
+                                "priceToBook":        info.get("priceToBook"),
+                                "returnOnAssets":     info.get("returnOnAssets"),
+                                "_fuente":            "yfinance",
+                            }
+                        except Exception as e_sym:
+                            logger.debug(f"[YF-LIB] {sym}: {type(e_sym).__name__}: {e_sym}")
+                    return resultado
+
+                yf_res = await asyncio.to_thread(_yf_sync_fetch, lote)
+                if yf_res:
+                    res.update(yf_res)
+                    logger.info(f"[YF-LIB] {len(yf_res)}/{len(lote)} tickers OK via yfinance")
+                else:
+                    logger.warning(f"[YF-LIB] Sin datos desde yfinance para {lote}")
+            except ImportError:
+                logger.warning("[YF-LIB] yfinance no instalado.")
+            except Exception as e_yfl:
+                logger.warning(f"[YF-LIB] Error: {type(e_yfl).__name__}: {e_yfl}")
+
+            # --- Fuente 2: Yahoo Finance v7 bulk (curl_cffi) — fallback si yfinance falló ---
             faltantes_lote = [t for t in lote if t.upper() not in res]
             if faltantes_lote:
-                av_keys = [k.strip() for k in ALPHAVANTAGE_API_KEYS.split(',') if k.strip()] if ALPHAVANTAGE_API_KEYS else []
+                try:
+                    from curl_cffi.requests import AsyncSession
+                    simbolos_yf = ",".join(faltantes_lote)
+                    yf7_url = (
+                        f"https://query1.finance.yahoo.com/v7/finance/quote"
+                        f"?symbols={simbolos_yf}"
+                        f"&fields=regularMarketPrice,trailingPE,forwardPE,dividendYield,dividendRate,"
+                        f"marketCap,shortName,beta,returnOnEquity,profitMargins,debtToEquity,"
+                        f"revenueGrowth,earningsGrowth,sector,previousClose"
+                    )
+                    async with AsyncSession(impersonate="chrome110") as sess:
+                        r7 = await sess.get(yf7_url, timeout=10.0)
+                    if r7.status_code == 200:
+                        quote_response = r7.json().get("quoteResponse", {}).get("result", [])
+                        for item in quote_response:
+                            sym = item.get("symbol", "").upper()
+                            precio = item.get("regularMarketPrice")
+                            if sym and precio:
+                                res[sym] = {
+                                    "regularMarketPrice": precio,
+                                    "previousClose":      item.get("regularMarketPreviousClose") or item.get("previousClose"),
+                                    "marketCap":          item.get("marketCap"),
+                                    "shortName":          item.get("shortName", sym),
+                                    "trailingPE":         item.get("trailingPE"),
+                                    "forwardPE":          item.get("forwardPE"),
+                                    "dividendYield":      item.get("dividendYield"),
+                                    "dividendRate":       item.get("dividendRate"),
+                                    "returnOnEquity":     item.get("returnOnEquity"),
+                                    "profitMargins":      item.get("profitMargins"),
+                                    "debtToEquity":       item.get("debtToEquity"),
+                                    "revenueGrowth":      item.get("revenueGrowth"),
+                                    "earningsGrowth":     item.get("earningsGrowth"),
+                                    "beta":               item.get("beta"),
+                                    "sector":             item.get("sector"),
+                                    "_fuente":            "YahooV7",
+                                }
+                        nuevos_v7 = [t for t in faltantes_lote if t.upper() in res]
+                        if nuevos_v7:
+                            logger.info(f"[YF-V7] Fallback OK: {nuevos_v7}")
+                    else:
+                        logger.warning(f"[YF-V7] HTTP {r7.status_code}. Body: {r7.text[:150]}")
+                except Exception as e_v7:
+                    logger.warning(f"[YF-V7] Excepción: {type(e_v7).__name__}: {e_v7}")
+
+            # --- Fuente 3: Alpha Vantage (ticker a ticker, si todo lo anterior falló) ---
+            faltantes_lote = [t for t in lote if t.upper() not in res]
+            if faltantes_lote:
+                av_keys = [k.strip() for k in ALPHAVANTAGE_API_KEYS.split(",") if k.strip()] if ALPHAVANTAGE_API_KEYS else []
                 for t_av in faltantes_lote:
                     for av_key in av_keys:
                         try:
@@ -1074,19 +1127,19 @@ async def _obtener_info_bulk(tickers: list[str], clase: str) -> dict:
                                     div_y = float(d.get("DividendYield", 0) or 0) or None
                                     res[t_av.upper()] = {
                                         "regularMarketPrice": precio_av,
-                                        "marketCap":  int(d.get("MarketCapitalization", 0) or 0) or None,
-                                        "shortName":  d.get("Name", t_av),
-                                        "trailingPE": pe,
-                                        "dividendYield": div_y,
-                                        "dividendRate": float(d.get("DividendPerShare", 0) or 0) or None,
-                                        "returnOnEquity": float(d.get("ReturnOnEquityTTM", 0) or 0) or None,
-                                        "profitMargins": float(d.get("ProfitMargin", 0) or 0) or None,
-                                        "beta": float(d.get("Beta", 0) or 0) or None,
-                                        "sector": d.get("Sector"),
-                                        "_fuente": "AlphaVantage",
+                                        "marketCap":          int(d.get("MarketCapitalization", 0) or 0) or None,
+                                        "shortName":          d.get("Name", t_av),
+                                        "trailingPE":         pe,
+                                        "dividendYield":      div_y,
+                                        "dividendRate":       float(d.get("DividendPerShare", 0) or 0) or None,
+                                        "returnOnEquity":     float(d.get("ReturnOnEquityTTM", 0) or 0) or None,
+                                        "profitMargins":      float(d.get("ProfitMargin", 0) or 0) or None,
+                                        "beta":               float(d.get("Beta", 0) or 0) or None,
+                                        "sector":             d.get("Sector"),
+                                        "_fuente":            "AlphaVantage",
                                     }
                                     logger.info(f"[AV-FALLBACK] {t_av}: PER={pe} DIV={div_y} OK")
-                                    break  # Pasar al siguiente ticker
+                                    break
                         except Exception as e_av:
                             logger.warning(f"[AV-FALLBACK] {t_av}: {type(e_av).__name__}: {e_av}")
 
@@ -1095,18 +1148,21 @@ async def _obtener_info_bulk(tickers: list[str], clase: str) -> dict:
                 continue
 
             for t, info in res.items():
-                if info and info.get('regularMarketPrice'):
+                if info and info.get("regularMarketPrice"):
                     nuevos_datos[t] = info
                     cached[t] = info
             await asyncio.sleep(0.3)
+
         if nuevos_datos:
             await db.guardar_yf_cache_bulk(nuevos_datos, clase)
+
     if not cached:
         dataset_clase = _DATOS_ESTATICOS.get(clase, {})
         tickers_upper = {t.upper() for t in tickers}
         interseccion = {k: v for k, v in dataset_clase.items() if k in tickers_upper}
         cached = interseccion if interseccion else dict(dataset_clase)
     return cached
+
 
 async def pipeline_hibrido(solicitud: str, msg_espera=None, fuente_datos: str = "yahoo", tid: int | None = None):
     """Wrapper: ejecuta la fase NLP (barata/Gemini) fuera del semáforo y la fase

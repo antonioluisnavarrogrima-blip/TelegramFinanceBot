@@ -298,13 +298,19 @@ def _guardar_en_cache(hash_key: str, data: dict):
             
     _INTENT_CACHE[hash_key] = {"ts": time.time(), "data": data}
 # Mover la constante fuera de la función evita reasignaciones en memoria por cada mensaje.
-_PROMPT_SISTEMA_EXTRACTOR = """Rol Oficial: Analista Cuantitativo Senior de "Mejor Esfuerzo". Extrae parámetros usando lenguaje natural. No generes tickers de memoria.
-Evaluación de Probabilidad: Evalúa si los parámetros solicitados son realistas (ej. div > 20% o PER < 5 no lo son). Si hay discrepancia, ajusta los filtros a la realidad del sector (Best Effort), NO entregues validaciones imposibles.
-Prevención Filtro Aniquilador: Si el universo es de nicho (ETF, Cripto), relaja métricas 20% para habilitar tolerancia matemática.
+_PROMPT_SISTEMA_EXTRACTOR = """Rol Oficial: Analista Cuantitativo Senior. Extrae parámetros financieros del texto del usuario en JSON.
+
+REGLA FUNDAMENTAL: Si el usuario menciona un ticker o empresa concreta (ej. "Microsoft", "MSFT", "Apple", "Tesla") → SIEMPRE es válido. Pon el ticker en tickers_manuales, infiere la clase (ACCION por defecto), deja filtros_dinamicos=[] si no hay filtros explícitos, y deja error_api="" (vacío). NUNCA rechaces una petición sobre un ticker concreto.
+Ejemplos válidos sin error: "datos de Microsoft", "dividendo de AAPL", "PER de Tesla", "analiza NVDA", "qué tal está Coca-Cola".
+
+Evaluación de Probabilidad: Si los filtros son irreales (div>20% o PER<3), adjústalos a la realidad. NO rechaces, adapta.
+Prevencion Filtro Aniquilador: En universos de nicho (ETF, Cripto), relaja métricas 20%.
+
 CLASES válidas: ACCION|REIT|ETF|CRIPTO|BONO
 MÉTRICAS: {"ACCION":["per","rendimiento","dividendo_porcentaje","dividendo_absoluto","roe","margen_beneficio","beta","deuda_capital","crecimiento_ingresos"],"REIT":["p_ffo","dividend_yield","ocupacion","ltv"],"ETF":["ter","aum","dividend_yield","rendimiento"],"CRIPTO":["rendimiento","market_cap"],"BONO":["dividend_yield","rendimiento","duracion"]}
-TRADUCCIONES: {"PER bajo":{"metrica":"per","operador":"<","valor":45},"dividendo alto":{"metrica":"dividendo_porcentaje","operador":">","valor":4},"dividendo estable":{"metrica":"dividendo_porcentaje","operador":">","valor":2},"alta rentabilidad":{"metrica":"roe","operador":">","valor":45},"deuda baja":{"metrica":"deuda_capital","operador":"<","valor":50},"estable":{"metrica":"beta","operador":"<","valor":0.8},"crecimiento agresivo":{"metrica":"crecimiento_ingresos","operador":">","valor":20},"alcista":{"metrica":"rendimiento","operador":">","valor":0},"bajista":{"metrica":"rendimiento","operador":"<","valor":0},"ETF barato":{"metrica":"ter","operador":"<","valor":0.2},"ETF grande":{"metrica":"aum","operador":">","valor":1000000000},"REIT ocupacion alta":{"metrica":"ocupacion","operador":">","valor":90},"REIT dividendo alto":{"metrica":"dividend_yield","operador":">","valor":4},"cripto cap grande":{"metrica":"market_cap","operador":">","valor":1000000000}}
-REGLAS: sector siempre lleno ("tecnologia","energia","general"...). Perfil: "Seguro"|"Riesgo"|"Balanceado". Extrae 'tickers_excluidos' si pide descartar o ignorar activos."""
+TRADUCCIONES: {"PER bajo":{"metrica":"per","operador":"<","valor":45},"dividendo alto":{"metrica":"dividendo_porcentaje","operador":">","valor":4},"dividendo estable":{"metrica":"dividendo_porcentaje","operador":">","valor":2},"alta rentabilidad":{"metrica":"roe","operador":">","valor":45},"deuda baja":{"metrica":"deuda_capital","operador":"<","valor":50},"estable":{"metrica":"beta","operador":"<","valor":0.8},"crecimiento agresivo":{"metrica":"crecimiento_ingresos","operador":">","valor":20},"alcista":{"metrica":"rendimiento","operador":">","valor":0},"bajista":{"metrica":"rendimiento","operador":"<","valor":0}}
+REGLAS: sector siempre lleno ("tecnologia","energia","general"...). Perfil: "Seguro"|"Riesgo"|"Balanceado". Extrae tickers_excluidos si el usuario pide descartar activos.
+error_api: dejar SIEMPRE vacío ("") salvo que la solicitud sea completamente ajena a finanzas (ej. "escríbeme un poema"). Pedir datos o análisis de un activo financiero NUNCA es error."""
 
 async def extractor_intenciones(prompt_del_inversor: str) -> dict | None:
     """Extrae parámetros para búsqueda determínistica v4.5 — prompt compacto (-60% tokens)."""
@@ -318,7 +324,10 @@ async def extractor_intenciones(prompt_del_inversor: str) -> dict | None:
     
     if intent_hash in _INTENT_CACHE:
         cache_entry = _INTENT_CACHE[intent_hash]
-        if ahora - cache_entry['ts'] < 259200: # 3 días de TTL
+        # Invalidar si tiene error_api relleno (prompt pudo haber sido corregido)
+        if cache_entry['data'] and cache_entry['data'].get('error_api'):
+            del _INTENT_CACHE[intent_hash]
+        elif ahora - cache_entry['ts'] < 259200:  # 3 días de TTL
             logger.info("[CACHE] Intención semántica recuperada de caché.")
             return cache_entry['data']
         else:
@@ -1147,7 +1156,13 @@ async def _pipeline_hibrido_interno(
     Retorna SIEMPRE 4 valores: (texto_final, ruta_grafico, url_compra, ticker_final)
     """
     if extraccion and extraccion.get("error_api"):
-        return f"__TROLL__ ⚠️ {extraccion['error_api']}", None, None, None
+        tiene_tickers = bool(extraccion.get("tickers_manuales") or extraccion.get("tickers"))
+        if tiene_tickers:
+            # Falso positivo del LLM: hay tickers concretos, el error es irrelevante
+            logger.info(f"[PIPELINE] error_api ignorado (falso positivo LLM) — hay tickers: {extraccion.get('tickers_manuales')}")
+            extraccion.pop("error_api", None)
+        else:
+            return f"__TROLL__ ⚠️ {extraccion['error_api']}", None, None, None
 
     _t_manuales = extraccion.get("tickers_manuales") if extraccion else None
     _t_legacy   = extraccion.get("tickers") if extraccion else None
@@ -1174,9 +1189,21 @@ async def _pipeline_hibrido_interno(
         extraccion["tickers"] = []
         # Si el usuario pidio best_effort, limpiamos la solicitud para no confundir a los analistas
         solicitud = solicitud.replace("__BEST_EFFORT__", "").strip()
+
     perfil = extraccion.get("perfil", "Balanceado")
     sector_ia = extraccion.get("sector")
     filtros_dinamicos_raw = extraccion.get("filtros_dinamicos", [])
+
+    # MODO CONSULTA DIRECTA: el usuario nombró tickers explícitos sin filtros cuantitativos
+    # (ej. "dame los datos de MSFT", "qué dividendo tiene Apple")
+    # En este caso el usuario quiere INFORMACIÓN, no una recomendación filtrada.
+    # → Saltamos todos los filtros PER/dividendo y mostramos los datos directamente.
+    hay_tickers_manuales = bool(extraccion.get("tickers_manuales") or extraccion.get("tickers"))
+    hay_filtros_usuario  = bool(filtros_dinamicos_raw)
+    es_consulta_directa  = hay_tickers_manuales and not hay_filtros_usuario and not es_best_effort
+    if es_consulta_directa:
+        logger.info(f"[PIPELINE] Modo CONSULTA DIRECTA activado para {extraccion.get('tickers_manuales') or extraccion.get('tickers')} — sin filtros")
+        filtros_dinamicos_raw = []  # Asegurar que no haya filtros heredados
 
     logger.info(f"[PIPELINE] Solicitud='{solicitud[:80]}' | Clase={clase_activo} | Perfil={perfil} | Sector={sector_ia} | FiltrosDin={filtros_dinamicos_raw}")
 
@@ -1223,9 +1250,18 @@ async def _pipeline_hibrido_interno(
 
     # --- Dispatch por clase ---
     if clase_activo == "ACCION":
-        filtros_base = _construir_filtros(perfil, filtros_dinamicos_raw)
+        # En modo consulta directa o best_effort: omitir todos los filtros cuantitativos
+        # El perfil "Riesgo" ya pone max_per=999, por eso lo usamos como proxy de filtro nulo
+        perfil_real = "Riesgo" if (es_consulta_directa or es_best_effort) else perfil
+        filtros_base = _construir_filtros(perfil_real, filtros_dinamicos_raw)
+        if es_consulta_directa or es_best_effort:
+            filtros_base["max_per"]     = 99999.0
+            filtros_base["min_div_pct"] = 0.0
+            filtros_base["min_div_abs"] = 0.0
+            filtros_base["filtros_extra"] = []
         logger.info(f"[FILTROS BASE] max_per={filtros_base.get('max_per')} min_div_pct={filtros_base.get('min_div_pct')} min_div_abs={filtros_base.get('min_div_abs')} extras={filtros_base.get('filtros_extra')}")
-        max_intentos = 4
+        # En consulta directa: 1 solo intento (no tiene sentido relajar filtros que ya son 0)
+        max_intentos = 1 if (es_consulta_directa or es_best_effort) else 4
 
         for intento in range(max_intentos):
             filtros = copy.deepcopy(filtros_base)

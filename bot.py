@@ -103,7 +103,8 @@ _REGEX_FINANCIERO = re.compile(
     r"|activos?|precios?|fondos?|indexados?|renta (fija|variable)"
     r"|commodity|petr[oó]leo|oro|plata|divisas"
     r"|per|peg|roe|roa|ebitda|margen|deuda|capital|patrimonio|beneficios?"
-    r"|valoraci[oó]n|an[áa]lisis|rentabilidad|rendimiento)",
+    r"|valoraci[oó]n|an[áa]lisis|analiz|rentabilidad|rendimiento|datos"
+    r"|informaci[oó]n|info|cotiza|resultados)",
     re.IGNORECASE
 )
 

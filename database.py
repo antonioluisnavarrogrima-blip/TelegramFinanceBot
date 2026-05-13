@@ -176,16 +176,24 @@ async def inicializar_db():
         except Exception:
             pass
 
-        # ── Limpieza legacy y Tabla de caché FMP ─────────────────────────────
+        # ── Tabla de caché Yahoo Finance (yf_cache) ─────────────────────────────
         await conn.execute("DROP TABLE IF EXISTS fmp_cache;") # Elimina basura legacy
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS yf_cache (
-                ticker      TEXT PRIMARY KEY,
-                clase       TEXT NOT NULL DEFAULT 'ACCION',
-                data        JSONB NOT NULL,
-                updated_at  FLOAT NOT NULL
+                ticker          TEXT PRIMARY KEY,
+                clase           TEXT NOT NULL DEFAULT 'ACCION',
+                data            JSONB NOT NULL,
+                updated_at      FLOAT NOT NULL,
+                per             FLOAT,
+                dividend_yield  FLOAT
             )
         """)
+        # Migración incremental para yf_cache
+        try:
+            await conn.execute("ALTER TABLE yf_cache ADD COLUMN IF NOT EXISTS per FLOAT")
+            await conn.execute("ALTER TABLE yf_cache ADD COLUMN IF NOT EXISTS dividend_yield FLOAT")
+        except Exception: pass
+
         # Índice para búsquedas por expiración (barrido del sweeper)
         await conn.execute("""
             CREATE INDEX IF NOT EXISTS idx_yf_cache_updated_at
@@ -985,18 +993,30 @@ async def guardar_yf_cache_bulk(datos: dict[str, dict], clase: str):
     pool = _get_pool()
     ahora = time.time()
 
-    records = [(t.upper(), clase.upper(), json.dumps(d), ahora) for t, d in datos.items()]
+    records = []
+    for t, d in datos.items():
+        per = d.get("trailingPE") or d.get("forwardPE")
+        dy  = d.get("dividendYield")
+        # Asegurarse de que son float o None
+        try: per = float(per) if per is not None else None
+        except: per = None
+        try: dy = float(dy) if dy is not None else None
+        except: dy = None
+        
+        records.append((t.upper(), clase.upper(), json.dumps(d), ahora, per, dy))
 
     try:
         async with pool.acquire() as conn:
             await conn.executemany(
                 """
-                INSERT INTO yf_cache (ticker, clase, data, updated_at)
-                VALUES ($1, $2, $3::jsonb, $4)
+                INSERT INTO yf_cache (ticker, clase, data, updated_at, per, dividend_yield)
+                VALUES ($1, $2, $3::jsonb, $4, $5, $6)
                 ON CONFLICT (ticker) DO UPDATE
-                    SET clase      = EXCLUDED.clase,
-                        data       = EXCLUDED.data,
-                        updated_at = EXCLUDED.updated_at
+                    SET clase          = EXCLUDED.clase,
+                        data           = EXCLUDED.data,
+                        updated_at     = EXCLUDED.updated_at,
+                        per            = EXCLUDED.per,
+                        dividend_yield = EXCLUDED.dividend_yield
                 """,
                 records
             )

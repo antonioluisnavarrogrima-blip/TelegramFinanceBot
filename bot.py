@@ -821,6 +821,16 @@ def _chequear_fundamentales_accion(ticker: str, info: dict, filtros: dict) -> di
         div_yield = div_yield_dec if div_yield_dec is not None else 0
         div_rate = info.get('dividendRate', 0) or 0
         
+        # Normalización defensiva (inconsistencia % vs decimal en fuentes/caché)
+        if div_yield > 0:
+            precio = info.get('regularMarketPrice') or info.get('price')
+            if div_rate and precio:
+                calc_yield = div_rate / precio
+                if div_yield > calc_yield * 10:
+                    div_yield /= 100.0
+            elif div_yield > 1.0:
+                div_yield /= 100.0
+
         if not filtros["per_op"](per, filtros["max_per"]): return None
         if not filtros["div_op"](div_yield, filtros["min_div_pct"]): return None
         if not filtros["div_abs_op"](div_rate, filtros["min_div_abs"]): return None

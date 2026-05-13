@@ -2043,11 +2043,12 @@ async def generar_pdf_cartera(tickers: list[str], chat_id: int) -> bytes:
         ws_key = t_up.replace("-USD", "USDT").replace("-", "")
         datos_ws = websocket_client.cache_precios.get(ws_key) or websocket_client.cache_precios.get(t_up)
         
+        datos_bd = await db.obtener_yf_cache_bulk([t_up], allow_stale=True)
+        datos_t = datos_bd.get(t_up, {})
+
         if datos_ws:
             precio = datos_ws.get("regularMarketPrice", "N/D")
         else:
-            datos_bd = await db.obtener_yf_cache_bulk([t_up], allow_stale=True)
-            datos_t = datos_bd.get(t_up, {})
             precio = datos_t.get("regularMarketPrice", datos_t.get("price", "N/D"))
             
         precio_str = f"${precio:.2f}" if isinstance(precio, (int, float)) else str(precio)
@@ -2068,6 +2069,44 @@ async def generar_pdf_cartera(tickers: list[str], chat_id: int) -> bytes:
             pdf.set_font("helvetica", "I", 10)
             pdf.cell(0, 10, "Error al generar gráfico.", new_x="LMARGIN", new_y="NEXT")
             
+        # TABLA DE DATOS FUNDAMENTALES (Estilo Google Finance)
+        if datos_t:
+            pdf.ln(5)
+            pdf.set_font("helvetica", "", 10)
+            w = [45, 45, 40, 40]
+            
+            def format_cap(val):
+                if not val: return "N/D"
+                try:
+                    v = float(val)
+                    if v >= 1e12: return f"${v/1e12:.2f}T"
+                    if v >= 1e9: return f"${v/1e9:.2f}B"
+                    if v >= 1e6: return f"${v/1e6:.2f}M"
+                    return f"${v:,.0f}"
+                except: return str(val)
+            
+            def format_pct(val):
+                if not val: return "N/D"
+                try:
+                    v = float(val)
+                    return f"{v*100:.2f}%" if -1 < v < 1 else f"{v:.2f}%"
+                except: return str(val)
+
+            # Fila 1
+            pdf.cell(w[0], 8, f"Sector: {datos_t.get('sector', 'N/D')}", border=1)
+            pdf.cell(w[1], 8, f"Market Cap: {format_cap(datos_t.get('marketCap'))}", border=1)
+            pdf.cell(w[2], 8, f"P/E Ratio: {datos_t.get('trailingPE', 'N/D')}", border=1)
+            pdf.cell(w[3], 8, f"Beta: {datos_t.get('beta', 'N/D')}", border=1, new_x="LMARGIN", new_y="NEXT")
+            
+            # Fila 2
+            pdf.cell(w[0], 8, f"Div Yield: {format_pct(datos_t.get('dividendYield'))}", border=1)
+            pdf.cell(w[1], 8, f"ROE: {format_pct(datos_t.get('returnOnEquity'))}", border=1)
+            pdf.cell(w[2], 8, f"Margen: {format_pct(datos_t.get('profitMargins'))}", border=1)
+            
+            # Precio Cierre Anterior (Si lo hay)
+            prev_close = datos_t.get("previousClose", "N/D")
+            pdf.cell(w[3], 8, f"Prev Close: {prev_close}", border=1, new_x="LMARGIN", new_y="NEXT")
+
         pdf.ln(10)
         
     return bytes(pdf.output())

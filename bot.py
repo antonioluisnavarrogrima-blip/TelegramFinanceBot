@@ -2363,14 +2363,14 @@ async def manejador_botones(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "  • Cartera <b>ilimitada</b>\n"
             "  • Exportar cartera a <b>CSV</b>\n"
             "  • Precios en <b>tiempo real</b> vía WebSocket\n"
-            "  • Alertas Stop-Loss / Take-Profit\n"
+            "  • Alertas Stop-Loss (Límite de Pérdidas) / Take-Profit (Toma de Ganancias)\n"
             "  • Cálculo de valor intrínseco DCF (/valor)\n\n"
             "💎 <b>Plan Pro — 19.99€/mes</b>\n"
             "  ✅ TODO lo de Plus, más:\n"
-            "  • <b>Análisis Técnico IA</b> (RSI, MACD, Bollinger)\n"
-            "  • <b>Seguimiento de Insiders</b> (directivos SEC)\n"
+            "  • <b>Análisis Técnico IA</b> (Recomendaciones tácticas con RSI, MACD, Bollinger)\n"
+            "  • <b>Seguimiento de Insiders</b> (Avisos de compra/venta de directivos SEC)\n"
             "  • <b>Informe semanal</b> de salud de cartera\n\n"
-            "🏦 <b>Plan Ultra — 49.99€/mes</b>\n"
+            "🏦 <b>Plan Ultra — 49.99€/mes (En proceso de desarrollo)</b>\n"
             "  ✅ TODO lo de Pro, más:\n"
             "  • <b>Webhooks</b> para Auto-Trading (/webhook)\n"
             "  • <b>Sentimiento IA</b> en tiempo real (/sentimiento)\n"
@@ -2985,6 +2985,7 @@ async def manejador_botones(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 lineas.append(f"  • <b>{t}</b>: {precio_str} {fuente_ico}")
                 botones_cartera.append([
                     InlineKeyboardButton(f"🔍 Ver {t}", callback_data=f"view_cartera_{t}"),
+                    InlineKeyboardButton(f"🔔 Alertas", callback_data=f"menu_alertas_{t}"),
                     InlineKeyboardButton(f"🗑️", callback_data=f"rm_cartera_{t}")
                 ])
             lineas.append("")
@@ -3003,6 +3004,47 @@ async def manejador_botones(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text(text="\n".join(lineas), reply_markup=InlineKeyboardMarkup(botones_cartera), parse_mode="HTML")
         return
 
+
+    # --- Menú de Alertas para Cartera ---
+    if query.data.startswith("menu_alertas_"):
+        ticker_alerta = query.data.replace("menu_alertas_", "").upper()
+        es_plus = await db.es_plus(chat_id)
+        if not es_plus:
+            await query.answer("⭐ Las alertas de precio son exclusivas de usuarios Plus.", show_alert=True)
+            return
+            
+        texto = f"🔔 <b>Alertas de Precio: {ticker_alerta}</b>\n\nElige el tipo de alerta que deseas configurar:"
+        teclado = InlineKeyboardMarkup([
+            [InlineKeyboardButton("🛑 Fijar Stop-Loss", callback_data=f"set_sl_{ticker_alerta}")],
+            [InlineKeyboardButton("🎯 Fijar Take-Profit", callback_data=f"set_tp_{ticker_alerta}")],
+            [InlineKeyboardButton("⬅️ Volver a Cartera", callback_data="accion_cartera")]
+        ])
+        await query.edit_message_text(texto, reply_markup=teclado, parse_mode="HTML")
+        return
+
+    # --- Configurar Precio de Alerta ---
+    if query.data.startswith("set_sl_") or query.data.startswith("set_tp_"):
+        partes = query.data.split("_")
+        tipo = "sl" if partes[1] == "sl" else "tp"
+        ticker = partes[2].upper()
+        
+        estado = f"ESPERANDO_ALERTA_{tipo.upper()}_{ticker}"
+        await db.upsert_usuario(chat_id, estado=estado)
+        context.user_data['estado'] = estado
+        
+        tipo_str = "Stop-Loss" if tipo == "sl" else "Take-Profit"
+        emoji = "🛑" if tipo == "sl" else "🎯"
+        
+        texto_peticion = (
+            f"{emoji} <b>Configurar {tipo_str} para {ticker}</b>\n\n"
+            f"Escribe en el chat el precio límite para activar esta alerta (ejemplo: <code>150.50</code>)."
+        )
+        await query.edit_message_text(
+            texto_peticion,
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Cancelar", callback_data="accion_cartera")]])
+        )
+        return
 
     # --- Eliminar ticker de la Cartera ---
     if query.data.startswith("rm_cartera_"):
@@ -3227,6 +3269,36 @@ async def conversacion_inversor(update: Update, context: ContextTypes.DEFAULT_TY
     # El regex ya incluye: empresa, tendencia, alcista, bajista, comprar, vender, etc.
     # Solo llegan a Gemini las consultas que superan este primer filtro.
     estado_mem = context.user_data.get('estado')
+    
+    # INTERCEPTOR: Alertas de Precio Manuales
+    if estado_mem and estado_mem.startswith("ESPERANDO_ALERTA_"):
+        partes = estado_mem.split("_")
+        tipo_alerta = "stop_loss" if partes[2] == "SL" else "take_profit"
+        ticker = partes[3]
+        
+        try:
+            precio = float(texto_usuario.replace(",", "."))
+        except ValueError:
+            await update.message.reply_text(
+                "❌ Por favor, escribe un número válido (ej: 150.50).",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Cancelar", callback_data="accion_cartera")]])
+            )
+            return
+            
+        await db.crear_alerta_precio(tid, ticker, tipo_alerta, precio)
+        context.user_data['estado'] = None
+        await db.upsert_usuario(tid, estado=None)
+        
+        emoji = "🛑" if tipo_alerta == "stop_loss" else "🎯"
+        nombre = "Stop-Loss" if tipo_alerta == "stop_loss" else "Take-Profit"
+        
+        await update.message.reply_text(
+            f"✅ <b>Alerta Configurada</b>\n\nActivo: <code>{ticker}</code>\nTipo: {emoji} {nombre}\nPrecio Objetivo: <b>{precio}</b>",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Volver a Cartera", callback_data="accion_cartera")]])
+        )
+        return
+
     estados_especiales = ("ESPERANDO_URL", "ESPERANDO_TICKERS_MANUALES")
 
     if not es_reintento and not (estado_mem in estados_especiales):
@@ -3654,6 +3726,10 @@ async def comando_valor(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         # 1. Obtener datos DCF de FMP
         fmp_keys = [k.strip() for k in FMP_API_KEYS.split(',') if k.strip()]
+        # FMP está descartado temporalmente
+        await msg_espera.edit_text("🛠️ <b>Funcionalidad en Mantenimiento</b>\nEl proveedor de datos original ha sido descartado. Esta función estará disponible próximamente con una nueva integración.", parse_mode="HTML")
+        return
+            
         dcf_data = None
         for key in fmp_keys:
             url = f"https://financialmodelingprep.com/api/v3/discounted-cash-flow/{ticker}?apikey={key}"
@@ -3726,6 +3802,10 @@ async def comando_insider(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     try:
         fmp_keys = [k.strip() for k in FMP_API_KEYS.split(',') if k.strip()]
+        # FMP está descartado temporalmente
+        await msg_espera.edit_text("🛠️ <b>Funcionalidad en Mantenimiento</b>\nEl proveedor de datos original ha sido descartado. Esta función estará disponible próximamente con una nueva integración.", parse_mode="HTML")
+        return
+            
         insider_data = []
         for key in fmp_keys:
             url = f"https://financialmodelingprep.com/api/v4/insider-trading?symbol={ticker}&limit=5&apikey={key}"

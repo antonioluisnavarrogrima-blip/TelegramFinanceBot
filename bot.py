@@ -651,7 +651,7 @@ async def fabricante_de_graficos(ticker: str, periodo: str = "3mo") -> tuple[byt
                 }
             }
         },
-        "width": 600, "height": 300, "format": "webp"
+        "width": 600, "height": 300, "format": "png"
     }
 
     kwargs = {"json": qc_payload, "timeout": 8.0}
@@ -2021,6 +2021,58 @@ async def comando_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+async def generar_pdf_cartera(tickers: list[str], chat_id: int) -> bytes:
+    """Genera un PDF con el resumen y gráficos de la cartera."""
+    try:
+        from fpdf import FPDF
+    except ImportError:
+        logger.error("[PDF] fpdf2 no está instalado.")
+        raise Exception("Librería fpdf2 no encontrada. Reinicia el bot.")
+        
+    import io
+    pdf = FPDF()
+    pdf.set_auto_page_break(auto=True, margin=15)
+    pdf.add_page()
+    
+    pdf.set_font("helvetica", "B", 16)
+    pdf.cell(0, 10, "Resumen de Mi Cartera - Quant Bot", new_x="LMARGIN", new_y="NEXT", align="C")
+    pdf.ln(10)
+    
+    for t in tickers:
+        t_up = t.upper()
+        ws_key = t_up.replace("-USD", "USDT").replace("-", "")
+        datos_ws = websocket_client.cache_precios.get(ws_key) or websocket_client.cache_precios.get(t_up)
+        
+        if datos_ws:
+            precio = datos_ws.get("regularMarketPrice", "N/D")
+        else:
+            datos_bd = await db.obtener_yf_cache_bulk([t_up], allow_stale=True)
+            datos_t = datos_bd.get(t_up, {})
+            precio = datos_t.get("regularMarketPrice", datos_t.get("price", "N/D"))
+            
+        precio_str = f"${precio:.2f}" if isinstance(precio, (int, float)) else str(precio)
+        
+        pdf.set_font("helvetica", "B", 14)
+        pdf.cell(0, 10, f"Activo: {t_up}  |  Precio Actual: {precio_str}", new_x="LMARGIN", new_y="NEXT")
+        
+        try:
+            grafico_bytes, rend = await fabricante_de_graficos(t_up, "3mo")
+            if grafico_bytes:
+                with io.BytesIO(grafico_bytes) as img_stream:
+                    pdf.image(img_stream, w=170)
+            else:
+                pdf.set_font("helvetica", "I", 10)
+                pdf.cell(0, 10, "Gráfico no disponible para este activo.", new_x="LMARGIN", new_y="NEXT")
+        except Exception as e:
+            logger.error(f"[PDF] Error generando gráfico de {t_up}: {e}")
+            pdf.set_font("helvetica", "I", 10)
+            pdf.cell(0, 10, "Error al generar gráfico.", new_x="LMARGIN", new_y="NEXT")
+            
+        pdf.ln(10)
+        
+    return bytes(pdf.output())
+
+
 async def manejador_botones(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     chat_id = update.effective_chat.id
@@ -2879,7 +2931,7 @@ async def manejador_botones(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     # --- Mi Cartera (visualización y CSV) ---
-    if query.data == "accion_cartera" or query.data == "cartera_csv":
+    if query.data == "accion_cartera" or query.data == "cartera_csv" or query.data == "cartera_pdf":
         es_usuario_plus = await db.es_plus(chat_id)
         tickers_cartera = await db.obtener_cartera(chat_id)
 
@@ -2939,6 +2991,32 @@ async def manejador_botones(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await context.bot.send_message(chat_id=chat_id, text="❌ Error al generar el archivo CSV. Inténtalo de nuevo.")
             return
 
+        # 1.5. Caso: Exportar PDF
+        if query.data == "cartera_pdf":
+            if not es_usuario_plus:
+                await query.answer("⭐ El export PDF es exclusivo de Plus o Pro.", show_alert=True)
+                return
+            if not tickers_cartera:
+                await query.answer("Tu cartera está vacía.", show_alert=True)
+                return
+
+            await query.answer("⏳ Generando reporte PDF...")
+            msg_espera = await query.message.reply_text("⏳ Compilando gráficos y precios en tiempo real para tu PDF...")
+
+            try:
+                pdf_bytes = await generar_pdf_cartera(tickers_cartera, chat_id)
+                await context.bot.send_document(
+                    chat_id=chat_id,
+                    document=pdf_bytes,
+                    filename="Mi_Cartera_Quant.pdf",
+                    caption=f"📄 <b>Reporte PDF de Cartera</b>\nProcesados <b>{len(tickers_cartera)}</b> activos.",
+                    parse_mode="HTML"
+                )
+                await msg_espera.delete()
+            except Exception as e:
+                logger.error(f"[PDF] Error final: {e}")
+                await msg_espera.edit_text("❌ Hubo un error al generar el PDF. Inténtalo de nuevo más tarde.")
+            return
 
         # 2. Caso: Visualización Normal
         if not tickers_cartera:
@@ -2995,7 +3073,10 @@ async def manejador_botones(update: Update, context: ContextTypes.DEFAULT_TYPE):
             lineas.append(f"\n<i>📦 {len(tickers_cartera)}/5 activos (Free). ⭐ Plus = ilimitados + CSV</i>")
 
         if es_usuario_plus:
-            botones_cartera.append([InlineKeyboardButton("📥 Exportar CSV", callback_data="cartera_csv")])
+            botones_cartera.append([
+                InlineKeyboardButton("📥 Exportar CSV", callback_data="cartera_csv"),
+                InlineKeyboardButton("📄 Exportar PDF", callback_data="cartera_pdf")
+            ])
         else:
             if STRIPE_PAYMENT_LINK:
                 botones_cartera.append([InlineKeyboardButton("⭐ Actualizar a Plus", url=f"{STRIPE_PAYMENT_LINK}?client_reference_id={chat_id}")])

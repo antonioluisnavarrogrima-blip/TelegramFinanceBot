@@ -933,13 +933,24 @@ def _chequear_fundamentales_reit(ticker: str, info: dict, filtros_extra: list) -
 def _chequear_fundamentales_etf(ticker: str, info: dict, filtros_extra: list) -> dict | None:
     try:
         if not info: return None
-        aum = info.get('totalAssets', 0) or info.get('marketCap', 0) or 0
-        div_yield_dec = info.get('yield', 0) or info.get('dividendYield', 0)
+        aum = info.get('totalAssets') or info.get('marketCap') or 0
+        div_yield_dec = info.get('dividendYield') or info.get('yield') or info.get('trailingAnnualDividendYield') or 0
         div_yield = div_yield_dec if div_yield_dec is not None else 0
         
         for f in filtros_extra:
-            if f["metrica"] == "aum" and not OPS.get(f["operador"], operator.ge)(aum, f["valor"]): return None
-        
+            try:
+                if f["metrica"] == "aum":
+                    if not OPS.get(f["operador"], operator.ge)(aum, f["valor"]): return None
+                elif f["metrica"] == "dividend_yield":
+                    if not OPS.get(f["operador"], operator.ge)(div_yield * 100, f["valor"]): return None
+                elif f["metrica"] in ("per", "crecimiento_ingresos", "per_futuro", "precio_ventas"):
+                    continue # Exención de filtros de equity
+                else:
+                    logger.warning(f"[ETF] Ignorando métrica incompatible o no soportada nativamente: {f['metrica']}")
+            except Exception as e:
+                logger.warning(f"[ETF] Error al evaluar métrica {f['metrica']}: {e}. Ignorando filtro.")
+                continue
+                
         if aum <= 0: return None
         return {
             "ticker": ticker,
@@ -969,16 +980,32 @@ def _chequear_fundamentales_cripto(ticker: str, info: dict, filtros_extra: list)
 def _chequear_fundamentales_bono(ticker: str, info: dict, filtros_extra: list) -> dict | None:
     try:
         if not info: return None
-        div_yield_dec = info.get('yield', 0) or info.get('dividendYield', 0)
+        
+        # Mapeo robusto de Yield para Bonos
+        div_yield_dec = info.get('dividendYield') or info.get('yield') or info.get('trailingAnnualDividendYield') or 0
         div_yield = div_yield_dec if div_yield_dec is not None else 0
-        aum = info.get('totalAssets', 0) or info.get('marketCap', 0) or 0
+        aum = info.get('totalAssets') or info.get('marketCap') or 0
+        
+        # Log empírico (Fase 3)
+        logger.debug(f"[BONO FASE 3] Ticker: {ticker} | raw keys: {list(info.keys())} | yield: {div_yield}")
+
         for f in filtros_extra:
-            if f["metrica"] == "dividend_yield" and not OPS.get(f["operador"], operator.ge)(div_yield * 100, f["valor"]): return None
-        if div_yield <= 0 or aum <= 0: return None
+            try:
+                if f["metrica"] == "dividend_yield":
+                    if not OPS.get(f["operador"], operator.ge)(div_yield * 100, f["valor"]): return None
+                elif f["metrica"] in ("per", "crecimiento_ingresos", "precio_ventas", "per_futuro"):
+                    continue # Exención total de filtros equity
+                else:
+                    logger.warning(f"[BONO] Ignorando métrica incompatible o no soportada nativamente: {f['metrica']}")
+            except Exception as e:
+                logger.warning(f"[BONO] Error al evaluar métrica {f['metrica']}: {e}. Ignorando filtro.")
+                continue
+
+        if div_yield <= 0: return None
         return {
             "ticker": ticker,
             "ytm_proxy_pct": round(div_yield * 100, 2),
-            "aum_bn": round(aum / 1e9, 2),
+            "aum_bn": round(aum / 1e9, 2) if aum else 0.0,
             "nombre": info.get("shortName", ticker),
         }
     except Exception as e: logger.debug(f"[YF] Error {ticker} (Bono): {e}")
@@ -1087,7 +1114,7 @@ async def _obtener_info_bulk(tickers: list[str], clase: str) -> dict:
                             precio = info.get("currentPrice") or info.get("regularMarketPrice")
                             if not precio:
                                 continue
-                            div_yield = info.get("dividendYield")
+                            div_yield = info.get("dividendYield") or info.get("yield") or info.get("trailingAnnualDividendYield")
                             # yfinance es inconsistente: a veces devuelve 0.0088 (0.88%) y otras 0.88
                             # Normalización robusta: comparamos con dividendRate si existe
                             if div_yield is not None:
@@ -1109,6 +1136,8 @@ async def _obtener_info_bulk(tickers: list[str], clase: str) -> dict:
                                 "trailingPE":         info.get("trailingPE"),
                                 "forwardPE":          info.get("forwardPE"),
                                 "dividendYield":      div_yield,
+                                "yield":              info.get("yield"),
+                                "trailingAnnualDividendYield": info.get("trailingAnnualDividendYield"),
                                 "dividendRate":       info.get("dividendRate"),
                                 "returnOnEquity":     info.get("returnOnEquity"),
                                 "profitMargins":      info.get("profitMargins"),
@@ -1148,8 +1177,8 @@ async def _obtener_info_bulk(tickers: list[str], clase: str) -> dict:
                         f"https://query1.finance.yahoo.com/v7/finance/quote"
                         f"?symbols={simbolos_yf}"
                         f"&fields=regularMarketPrice,trailingPE,forwardPE,dividendYield,dividendRate,"
-                        f"marketCap,shortName,beta,returnOnEquity,profitMargins,debtToEquity,"
-                        f"revenueGrowth,earningsGrowth,sector,previousClose"
+                        f"yield,trailingAnnualDividendYield,marketCap,shortName,beta,returnOnEquity,"
+                        f"profitMargins,debtToEquity,revenueGrowth,earningsGrowth,sector,previousClose"
                     )
                     async with AsyncSession(impersonate="chrome110") as sess:
                         r7 = await sess.get(yf7_url, timeout=10.0)
@@ -1166,7 +1195,7 @@ async def _obtener_info_bulk(tickers: list[str], clase: str) -> dict:
                                     "shortName":          item.get("shortName", sym),
                                     "trailingPE":         item.get("trailingPE"),
                                     "forwardPE":          item.get("forwardPE"),
-                                    "dividendYield":      item.get("dividendYield"),
+                                    "dividendYield":      item.get("dividendYield") or item.get("yield") or item.get("trailingAnnualDividendYield"),
                                     "dividendRate":       item.get("dividendRate"),
                                     "returnOnEquity":     item.get("returnOnEquity"),
                                     "profitMargins":      item.get("profitMargins"),
@@ -1634,7 +1663,12 @@ async def _pipeline_hibrido_interno(
 
     candidatos_validos = [
         (gan, rend) for gan, rend in tuples_rend
-        if rend is not None and (es_best_effort or gan.get("_best_effort", False) or rendimiento_op(rend, rendimiento_objetivo))
+        if rend is not None and (
+            es_best_effort or 
+            gan.get("_best_effort", False) or 
+            rendimiento_op(rend, rendimiento_objetivo) or 
+            (clase_activo == "BONO" and rend >= -5.0)
+        )
     ]
     candidatos_validos.sort(key=lambda x: x[1], reverse=True)
 

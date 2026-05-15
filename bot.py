@@ -319,7 +319,7 @@ INTENCION: Detecta la intención principal del mensaje y rellena el campo intenc
 - "ALERTA_PRECIO": quiere crear una alerta de precio (stop-loss o take-profit). Rellena alerta_precio. Si falta el ticker, extrae la intención igual y déjalo vacío.
 - "BORRAR_ALERTA": quiere borrar o eliminar una alerta existente. Rellena borrar_alerta.
 - "CONFIGURAR_ALERTA": quiere cambiar la frecuencia o activar/desactivar sus alertas automáticas. Rellena configurar_alerta.
-- "VER_MENU": quiere navegar a una sección o ejecutar una acción global (cartera, screeners, alertas, plan, configuracion, macro, educacion, tutorial, exportar_csv, exportar_pdf, tutorial_acciones, etc). Rellena navegar_a.
+- "VER_MENU": quiere navegar a una sección o ejecutar una acción global (cartera, screeners, alertas, plan, configuracion, macro, educacion, tutorial, tutoriales, exportar_csv, exportar_pdf, tutorial_acciones, etc). Rellena navegar_a.
 - "GESTIONAR_CARTERA": quiere añadir o quitar un ticker específico de su cartera. Rellena gestionar_cartera.
 Si hay duda entre BUSQUEDA y otra intención, prioriza la otra intención cuando el usuario usa verbos como: pon, crea, borra, quita, añade, exporta, configura, activa, desactiva, lleváme, muestra mi.
 
@@ -423,7 +423,7 @@ async def extractor_intenciones(prompt_del_inversor: str) -> dict | None:
                         "navegar_a": {
                             "type": "OBJECT",
                             "properties": {
-                                "destino": {"type": "STRING", "description": "cartera | screeners | alertas | plan | configuracion | macro | educacion | tutorial | exportar_csv | exportar_pdf | tutorial_acciones | tutorial_etf | tutorial_reit | tutorial_cripto | tutorial_bonos"},
+                                "destino": {"type": "STRING", "description": "cartera | screeners | alertas | plan | configuracion | macro | educacion | tutorial | tutoriales | exportar_csv | exportar_pdf | tutorial_acciones | tutorial_etf | tutorial_reit | tutorial_cripto | tutorial_bonos"},
                                 "filtro_ticker": {"type": "STRING"}
                             }
                         },
@@ -933,6 +933,7 @@ def _chequear_fundamentales_reit(ticker: str, info: dict, filtros_extra: list) -
 def _chequear_fundamentales_etf(ticker: str, info: dict, filtros_extra: list) -> dict | None:
     try:
         if not info: return None
+        logger.debug(f"[ETF FASE 3] RAW KEYS para {ticker}: {list(info.keys())}")
         aum = info.get('totalAssets') or info.get('marketCap') or 0
         div_yield_dec = info.get('dividendYield') or info.get('yield') or info.get('trailingAnnualDividendYield') or 0
         div_yield = div_yield_dec if div_yield_dec is not None else 0
@@ -942,6 +943,8 @@ def _chequear_fundamentales_etf(ticker: str, info: dict, filtros_extra: list) ->
                 if f["metrica"] == "aum":
                     if not OPS.get(f["operador"], operator.ge)(aum, f["valor"]): return None
                 elif f["metrica"] == "dividend_yield":
+                    if div_yield == 0:
+                        continue # Asumimos ETF de acumulación y eximimos el filtro
                     if not OPS.get(f["operador"], operator.ge)(div_yield * 100, f["valor"]): return None
                 elif f["metrica"] in ("per", "crecimiento_ingresos", "per_futuro", "precio_ventas"):
                     continue # Exención de filtros de equity
@@ -951,11 +954,10 @@ def _chequear_fundamentales_etf(ticker: str, info: dict, filtros_extra: list) ->
                 logger.warning(f"[ETF] Error al evaluar métrica {f['metrica']}: {e}. Ignorando filtro.")
                 continue
                 
-        if aum <= 0: return None
         return {
             "ticker": ticker,
             "ter_pct": "N/A",
-            "aum_bn": round(aum / 1e9, 2),
+            "aum_bn": round(aum / 1e9, 2) if aum > 0 else 0.0,
             "div_yield_pct": round(div_yield * 100, 2),
         }
     except Exception as e: logger.debug(f"[YF] Error {ticker} (ETF): {e}")
@@ -1150,6 +1152,8 @@ async def _obtener_info_bulk(tickers: list[str], clase: str) -> dict:
                                 "ebitda":             info.get("ebitda"),
                                 "priceToBook":        info.get("priceToBook"),
                                 "returnOnAssets":     info.get("returnOnAssets"),
+                                "totalAssets":        info.get("totalAssets"),
+                                "navPrice":           info.get("navPrice"),
                                 "_fuente":            "yfinance",
                             }
                         except Exception as e_sym:
@@ -3694,6 +3698,7 @@ async def _nl_navegar(navegar_a: dict, update, context) -> bool:
         "macro":         "accion_macro",
         "educacion":     "menu_educacion",
         "tutorial":      "menu_educacion",
+        "tutoriales":    "menu_educacion",
         "exportar_csv":  "cartera_csv",
         "exportar_pdf":  "cartera_pdf",
         "tutorial_acciones": "tutorial_acciones",

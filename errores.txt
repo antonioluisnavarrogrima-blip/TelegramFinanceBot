@@ -1,0 +1,27 @@
+Observación sobre el P/FFO
+El bot marca un P/FFO de 7.33x. En la realidad, Equinix suele cotizar a múltiplos mucho más altos (20x-25x FFO). Esto sugiere que o bien tu base de datos tiene un dato de FFO muy reciente/distinto, o la fórmula de cálculo en el backend necesita una revisión. No obstante, que el campo exista ya es un éxito de arquitectura.
+Otra búsqueda: 
+Detección de error de sector: Aquí hay un detalle técnico importante. Aunque pediste "Industrial", las semillas obtenidas para ese sector fueron [] (vacío). El bot activó el Fallback y buscó en las generales, encontrando financieras y telecos con PER bajo.
+Siguiente porblema:
+🛑 ¡ALERTA DE PRECIO DISPARADA!
+
+Activo: VZ
+Tipo: Stop-Loss
+Precio Objetivo: 150.0
+Precio Actual: 47.07
+
+La alerta ha sido desactivada automáticament
+Revisa si está invertido.
+
+Siguiente problema:
+Error de Mapeo de Activos: Para una búsqueda "agresiva de crecimiento", el bot ha consultado semillas como O (Realty Income), T (AT&T) y VZ (Verizon). Estas son acciones de dividendo/valor, lo opuesto a crecimiento agresivo.
+
+Resultado: Solo una (D - Dominion Energy) pasó el filtro de ingresos, pero como tenía un rendimiento negativo (-5.17%), el "Filtro Gráfico" la tumbó.
+Siguiente problema: 
+Hay veces que no aparece el botón de ver el mejor resultado, debe aparecer siempre que el bot falle, pero gasta créditos si ha pasado el tercer reintento.
+SIguiente problema: 
+El extractor_intenciones.py o bien no está mapeando el campo periodo correctamente, o el componente encargado de la descarga de datos (posiblemente yfinance) tiene el valor "3mo" hardcodeado por defecto y no acepta la variable dinámica de la IA.
+
+El sistema anti troll no manda mensaje de aviso aunque si pone la penalización, que avise y avísale también de las penalizaciones que tendrá.
+Siguiente problema: TAREA 1: Expansión de Semillas para Bonos
+Actualiza la lógica de seeds_provider o la tabla de Supabase. Cuando la clase sea BONO, debe devolver al menos 5-10 opciones diversificadas (ej: TLT, IEF, SHY, AGG, LQD, TIP, BNDX). 

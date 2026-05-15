@@ -801,10 +801,19 @@ async def precargar_semillas_basicas():
         ("ABBV",  "ACCION", "salud"),
         ("UNH",   "ACCION", "salud"),
         ("LLY",   "ACCION", "salud"),
+        # BUG 4 FIX: Sector 'industria' tenía 0 semillas → añadimos las principales
         ("CAT",   "ACCION", "industria"),
         ("HON",   "ACCION", "industria"),
         ("MMM",   "ACCION", "industria"),
         ("GE",    "ACCION", "industria"),
+        ("RTX",   "ACCION", "industria"),   # Raytheon Technologies
+        ("BA",    "ACCION", "industria"),   # Boeing
+        ("LMT",   "ACCION", "industria"),   # Lockheed Martin
+        ("NOC",   "ACCION", "industria"),   # Northrop Grumman
+        ("DE",    "ACCION", "industria"),   # John Deere
+        ("EMR",   "ACCION", "industria"),   # Emerson Electric
+        ("ITW",   "ACCION", "industria"),   # Illinois Tool Works
+        ("UPS",   "ACCION", "industria"),   # United Parcel Service
         ("KO",    "ACCION", "consumo"),
         ("PEP",   "ACCION", "consumo"),
         ("PG",    "ACCION", "consumo"),
@@ -864,16 +873,22 @@ async def precargar_semillas_basicas():
         ("MATIC-USD","CRIPTO", "moneda"),
         ("LINK-USD", "CRIPTO", "moneda"),
         # ── BONOS (ETFs de renta fija) ──
-        ("TLT",   "BONO",   "tesoro"),
-        ("IEF",   "BONO",   "tesoro"),
-        ("SHY",   "BONO",   "tesoro"),
-        ("LQD",   "BONO",   "corporativo"),
-        ("HYG",   "BONO",   "corporativo"),
-        ("EMB",   "BONO",   "emergentes"),
-        ("BND",   "BONO",   "general"),
-        ("VCIT",  "BONO",   "corporativo"),
-        ("GOVT",  "BONO",   "tesoro"),
-        ("TIPS",  "BONO",   "inflacion"),
+        # BUG 5 FIX: Expandir semillas de BONO de 4 a 10 opciones diversificadas
+        ("TLT",   "BONO",   "tesoro"),     # 20+ años
+        ("IEF",   "BONO",   "tesoro"),     # 7-10 años
+        ("SHY",   "BONO",   "tesoro"),     # 1-3 años
+        ("GOVT",  "BONO",   "tesoro"),     # All Maturities
+        ("TIPS",  "BONO",   "inflacion"),  # TIPS contra inflación
+        ("LQD",   "BONO",   "corporativo"), # Investment-Grade
+        ("HYG",   "BONO",   "corporativo"), # High-Yield
+        ("EMB",   "BONO",   "emergentes"), # Mercados emergentes
+        ("BND",   "BONO",   "general"),    # Total Bond Market
+        ("VCIT",  "BONO",   "corporativo"), # Vanguard IG Corp
+        ("BNDX",  "BONO",   "general"),    # Total International Bond
+        ("AGG",   "BONO",   "general"),    # iShares Core Aggregate
+        ("MUB",   "BONO",   "general"),    # Municipales EEUU
+        ("IGIB",  "BONO",   "corporativo"), # IG Mid-Term
+
     ]
     pool = _get_pool()
     async with pool.acquire() as conn:
@@ -1265,6 +1280,56 @@ async def desactivar_suscripcion_por_stripe_id(stripe_subscription_id: str) -> i
         )
         logger.info(f"[DB] Suscripción cancelada → usuario {tid} degradado a 'free'")
         return tid
+
+async def obtener_tid_por_stripe_sub(stripe_subscription_id: str) -> int | None:
+    """
+    Busca el telegram_id del usuario propietario de una suscripción Stripe.
+    Devuelve None si no se encuentra. Centraliza la búsqueda inline que existía
+    directamente en los handlers del webhook de bot.py.
+    """
+    pool = _get_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT id FROM usuarios WHERE stripe_subscription_id = $1",
+            stripe_subscription_id
+        )
+    return row["id"] if row else None
+
+
+async def limpiar_planes_expirados_bulk() -> list[int]:
+    """
+    Degrada a 'free' todos los usuarios cuyo plan_expira haya pasado.
+    Ejecuta una única query UPDATE...RETURNING para máxima eficiencia.
+    Devuelve la lista de telegram_ids afectados (para notificación opcional).
+    """
+    pool = _get_pool()
+    ahora = time.time()
+    try:
+        async with pool.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                UPDATE usuarios
+                SET plan = 'free', plan_expira = NULL
+                WHERE plan != 'free'
+                  AND plan_expira IS NOT NULL
+                  AND plan_expira < $1
+                RETURNING id
+                """,
+                ahora,
+            )
+        ids_afectados = [r["id"] for r in rows]
+        if ids_afectados:
+            logger.warning(
+                f"[DB] Limpieza proactiva: {len(ids_afectados)} planes expirados degradados a 'free'. "
+                f"IDs: {ids_afectados}"
+            )
+        else:
+            logger.debug("[DB] Limpieza proactiva: Sin planes expirados.")
+        return ids_afectados
+    except Exception as e:
+        logger.error(f"[DB] Error en limpiar_planes_expirados_bulk: {e}")
+        return []
+
 
 async def obtener_info_plan(tid: int) -> dict:
     """Devuelve un dict con plan, plan_expira y creditos del usuario."""

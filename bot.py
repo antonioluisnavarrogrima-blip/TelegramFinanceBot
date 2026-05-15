@@ -311,6 +311,7 @@ CLASES válidas: ACCION|REIT|ETF|CRIPTO|BONO
 MÉTRICAS: {"ACCION":["per","rendimiento","dividendo_porcentaje","dividendo_absoluto","roe","margen_beneficio","beta","deuda_capital","crecimiento_ingresos"],"REIT":["p_ffo","dividend_yield","ocupacion","ltv"],"ETF":["ter","aum","dividend_yield","rendimiento"],"CRIPTO":["rendimiento","market_cap"],"BONO":["dividend_yield","rendimiento","duracion"]}
 TRADUCCIONES: {"PER bajo":{"metrica":"per","operador":"<","valor":45},"dividendo alto":{"metrica":"dividendo_porcentaje","operador":">","valor":4},"dividendo estable":{"metrica":"dividendo_porcentaje","operador":">","valor":2},"alta rentabilidad":{"metrica":"roe","operador":">","valor":45},"deuda baja":{"metrica":"deuda_capital","operador":"<","valor":50},"estable":{"metrica":"beta","operador":"<","valor":0.8},"crecimiento agresivo":{"metrica":"crecimiento_ingresos","operador":">","valor":20},"alcista":{"metrica":"rendimiento","operador":">","valor":0},"bajista":{"metrica":"rendimiento","operador":"<","valor":0}}
 REGLAS: sector siempre lleno ("tecnologia","energia","general"...). Perfil: "Seguro"|"Riesgo"|"Balanceado". Extrae tickers_excluidos si el usuario pide descartar activos.
+TEMPORALIDAD DEL GRÁFICO: Si el usuario menciona un periodo temporal (ej. "6 meses", "un año", "el último mes", "1y", "YTD") extrae el campo temporalidad con uno de estos valores exactos: "1mo" | "3mo" | "6mo" | "1y". Si no se menciona ninguno, usa "3mo" por defecto.
 error_api: dejar SIEMPRE vacío ("") salvo que la solicitud sea completamente ajena a finanzas (ej. "escríbeme un poema"). Pedir datos o análisis de un activo financiero NUNCA es error."""
 
 async def extractor_intenciones(prompt_del_inversor: str) -> dict | None:
@@ -346,6 +347,10 @@ async def extractor_intenciones(prompt_del_inversor: str) -> dict | None:
                         "clase_activo": {"type": "STRING"},
                         "perfil":       {"type": "STRING"},
                         "sector":       {"type": "STRING"},
+                        "temporalidad": {
+                            "type": "STRING",
+                            "description": "Periodo del gráfico: 1mo | 3mo | 6mo | 1y. Por defecto 3mo."
+                        },
                         "tickers_manuales": {
                             "type": "ARRAY",
                             "items": {"type": "STRING"}
@@ -1432,12 +1437,25 @@ async def _pipeline_hibrido_interno(
             None, None, f"FALLBACK_REQ_{clase_activo}"
         )
 
-    # --- 3. Filtro de rendimiento gráfico (FIX #2: prefetch concurrente + ordenación) ---
+    # --- 3. Filtro de rendimiento gráfico ---
+    # Prioridad 1: temporalidad extraída directamente por el extractor (campo top-level).
+    # Prioridad 2: temporalidad dentro de filtros_dinamicos (retrocompat).
+    # Prioridad 3: default 3mo.
+    _PERIODOS_VALIDOS = {"1mo", "3mo", "6mo", "1y"}
+    temporalidad_extractor = (extraccion.get("temporalidad") or "").strip().lower() if extraccion else ""
+    if temporalidad_extractor not in _PERIODOS_VALIDOS:
+        temporalidad_extractor = ""
+
     temporalidad = "3mo"
-    if clase_activo == "ACCION":
-        temporalidad = filtros.get("temporalidad", "3mo")
-    elif clase_activo == "CRIPTO":
+    if clase_activo == "CRIPTO":
         temporalidad = "1mo"
+    elif temporalidad_extractor:
+        # La IA detectó un periodo explícito → usarlo para TODAS las clases
+        temporalidad = temporalidad_extractor
+        logger.info(f"[PIPELINE] Temporalidad detectada por extractor: {temporalidad}")
+    elif clase_activo == "ACCION":
+        # Fallback a filtros_dinamicos si no hay campo top-level
+        temporalidad = filtros.get("temporalidad", "3mo")
 
     rendimiento_objetivo = 0.0
     rendimiento_op = operator.ge
@@ -1617,10 +1635,11 @@ async def _pipeline_hibrido_interno(
     nombre_empresa = mejor_opcion.get('shortName', mejor_opcion.get('name', ticker_final))
     texto_final = (
         f"⚡ <b>Señal {emoji_clase} {clase_activo}: {nombre_empresa} ({ticker_final})</b>{aviso_grafico}\n"
-        f"📈 Rendimiento ({temporalidad}): <b>{signo}{rend_str}%</b>\n\n"
+        f"📈 Rendimiento ({temporalidad}): <b>{signo}{rend_str}%</b>*\n\n"
         f"🔍 <b>Análisis Quant:</b>\n"
         f"{informe_gs}"
     )
+    texto_final += "\n\n<i>* Rendimiento calculado sobre precios de cierre sin ajustar (puede diferir ligeramente de Yahoo Finance, que usa precios ajustados por dividendos y splits).</i>"
     texto_final = _limpiar_html_telegram(texto_final)
     return texto_final, ruta_captura_final, url_compra, ticker_final
 
@@ -3589,11 +3608,41 @@ async def conversacion_inversor(update: Update, context: ContextTypes.DEFAULT_TY
 
     # Error → mostrar mensaje con botón de reintento (NO cobrar por defecto, a menos que abuse)
     if not url_compra:
+        # ── BUG 3 FIX: Anti-troll ahora notifica con mensaje y penalizaciones ─
         if texto_final and texto_final.startswith("__TROLL__"):
+            ban_level_actual = await db.obtener_ban_level(tid)
             await db.sumar_strike(tid)
+            ban_level_nuevo = await db.obtener_ban_level(tid)
             texto_troll = texto_final.replace("__TROLL__ ", "", 1)
-            await msg_espera.edit_text(texto_troll)
+            penalizaciones = {
+                0: "Sin restricción de tiempo.",
+                1: "⚠️ Cooldown de 30 segundos entre consultas.",
+                2: "⏳ Cooldown de 5 minutos entre consultas.",
+                3: "🕐 Cooldown de 1 hora entre consultas.",
+                4: "🛑 Sanción de 24 horas. Puedes saltarla recargando créditos.",
+            }
+            msg_penalizacion = ""
+            if ban_level_nuevo > ban_level_actual:
+                msg_penalizacion = (
+                    f"\n\n🚨 <b>¡Nivel de penalización aumentado!</b> Ahora estás en nivel {ban_level_nuevo}/4.\n"
+                    f"Restricción activa: {penalizaciones.get(ban_level_nuevo, 'Sanción permanente.')}\n"
+                    f"<i>Realiza consultas financieras válidas para limpiar tu historial.</i>"
+                )
+            else:
+                msg_penalizacion = (
+                    f"\n\n⚠️ <b>Consulta no financiera registrada.</b> "
+                    f"Nivel de penalización: {ban_level_nuevo}/4.\n"
+                    f"Si acumulas más avisos, se aplicará: {penalizaciones.get(ban_level_nuevo + 1, 'sanción máxima')}."
+                )
+            await msg_espera.edit_text(texto_troll + msg_penalizacion, parse_mode="HTML")
             return
+
+        # ── BUG 2 FIX: Determinar clase para el botón best-effort ─────────────
+        # El botón debe aparecer siempre que haya un pipeline failure, no solo en FALLBACK_REQ_
+        extraccion_guardada = await db.obtener_ultima_extraccion(tid)
+        clase_para_best_effort = "ACCION"
+        if extraccion_guardada:
+            clase_para_best_effort = (extraccion_guardada.get("clase_activo") or "ACCION").upper()
 
         es_imposible = (ticker and ticker.startswith("FALLBACK_REQ_")) or (texto_final and "Filtro Gráfico Fallido" in texto_final)
         msg_aviso = ""
@@ -3610,12 +3659,12 @@ async def conversacion_inversor(update: Update, context: ContextTypes.DEFAULT_TY
                     await msg_espera.edit_text("💳 <b>Saldo agotado.</b> Has superado el límite de intentos fallidos gratuitos de hoy.", parse_mode="HTML", reply_markup=teclado_pago)
                     return
                 await db.restar_credito(tid)
-                
+
                 if dias_abuso >= 3:
                     await db.sumar_strike(tid)
                     await db.sumar_strike(tid)
-                    await db.sumar_strike(tid) # 3 strikes fuerza un aumento de banLevel
-                
+                    await db.sumar_strike(tid)  # 3 strikes fuerza un aumento de banLevel
+
                 creditos_act = await db.obtener_creditos(tid)
                 msg_aviso = f"\n\n⚠️ <b>Límite diario superado.</b> Se te ha cobrado 1 crédito por esta búsqueda imposible (Te quedan {creditos_act})."
             else:
@@ -3624,15 +3673,11 @@ async def conversacion_inversor(update: Update, context: ContextTypes.DEFAULT_TY
         texto_con_aviso = texto_final + msg_aviso
 
         if ticker and ticker.startswith("FALLBACK_REQ_"):
-            clase_req = ticker.replace("FALLBACK_REQ_", "")
-            teclado_error = InlineKeyboardMarkup([
-                [InlineKeyboardButton("🔍 ¿Desea ver la alternativa más cercana encontrada?", callback_data=f"best_effort_{clase_req}")],
-                [InlineKeyboardButton("🔄 Reintentar con otros tickers", callback_data="reintentar")]
-            ])
-            await msg_espera.edit_text(texto_con_aviso, reply_markup=teclado_error, parse_mode="HTML")
-            return
+            clase_para_best_effort = ticker.replace("FALLBACK_REQ_", "")
 
+        # Botón best-effort: aparece en TODOS los fallos de pipeline (no solo FALLBACK_REQ_)
         teclado_error = InlineKeyboardMarkup([
+            [InlineKeyboardButton("🔍 Ver la alternativa más cercana encontrada", callback_data=f"best_effort_{clase_para_best_effort}")],
             [InlineKeyboardButton("🔄 Reintentar con otros tickers", callback_data="reintentar")]
         ])
         await msg_espera.edit_text(texto_con_aviso, reply_markup=teclado_error, parse_mode="HTML")
@@ -3806,17 +3851,60 @@ async def comando_alerta_precio(update: Update, context: ContextTypes.DEFAULT_TY
 
     try:
         precio = float(args[2].replace(",", "."))
+        if precio <= 0:
+            raise ValueError
     except ValueError:
-        await update.message.reply_text("❌ El precio debe ser un valor numérico.", parse_mode="HTML")
+        await update.message.reply_text("❌ El precio debe ser un valor numérico positivo.", parse_mode="HTML")
         return
 
+    # ── BUG 1 FIX: Validar dirección lógica de la alerta ─────────────────────
+    # Obtener precio actual para comprobar que el objetivo tiene sentido.
+    # Stop-Loss: el objetivo DEBE estar por debajo del precio actual.
+    # Take-Profit: el objetivo DEBE estar por encima del precio actual.
+    precio_actual_validacion: float | None = None
+    try:
+        from curl_cffi.requests import AsyncSession
+        y_url = f"https://query2.finance.yahoo.com/v8/finance/chart/{ticker}?range=1d&interval=1d"
+        async with AsyncSession(impersonate="chrome110") as sess:
+            r = await sess.get(y_url, timeout=8.0)
+        if r.status_code == 200:
+            result = r.json().get("chart", {}).get("result", [])
+            if result:
+                closes = result[0].get("indicators", {}).get("quote", [{}])[0].get("close", [])
+                closes_validos = [c for c in closes if c is not None]
+                if closes_validos:
+                    precio_actual_validacion = closes_validos[-1]
+    except Exception:
+        pass  # Si no podemos obtener el precio, permitimos la alerta sin validar
+
+    if precio_actual_validacion:
+        if tipo == "stop_loss" and precio >= precio_actual_validacion:
+            await update.message.reply_text(
+                f"❌ <b>Alerta inválida</b>\n\n"
+                f"Un <b>Stop-Loss</b> debe estar <b>por debajo</b> del precio actual.\n"
+                f"Precio actual de <code>{ticker}</code>: <b>{round(precio_actual_validacion, 2)}</b>\n"
+                f"Tu objetivo ({precio}) está por encima — usa <code>take_profit</code> para eso.",
+                parse_mode="HTML"
+            )
+            return
+        if tipo == "take_profit" and precio <= precio_actual_validacion:
+            await update.message.reply_text(
+                f"❌ <b>Alerta inválida</b>\n\n"
+                f"Un <b>Take-Profit</b> debe estar <b>por encima</b> del precio actual.\n"
+                f"Precio actual de <code>{ticker}</code>: <b>{round(precio_actual_validacion, 2)}</b>\n"
+                f"Tu objetivo ({precio}) está por debajo — usa <code>stop_loss</code> para eso.",
+                parse_mode="HTML"
+            )
+            return
+
     await db.crear_alerta_precio(tid, ticker, tipo, precio)
-    
+
     emoji = "🛑" if tipo == "stop_loss" else "🎯"
     nombre_tipo = "Stop-Loss" if tipo == "stop_loss" else "Take-Profit"
+    precio_ref_txt = f" (precio actual: ~{round(precio_actual_validacion, 2)})" if precio_actual_validacion else ""
     await update.message.reply_text(
         f"✅ <b>Alerta Configurada</b>\n\n"
-        f"Activo: <code>{ticker}</code>\n"
+        f"Activo: <code>{ticker}</code>{precio_ref_txt}\n"
         f"Tipo: {emoji} {nombre_tipo}\n"
         f"Precio Objetivo: <b>{precio}</b>\n\n"
         f"Te avisaré en cuanto el precio cruce este umbral.",
@@ -4572,59 +4660,141 @@ async def webhook_pago(request: Request):
                 return {"ok": True, "duplicado": True}
 
         # --- Activar suscripción si el metadata lo indica ---
-        plan_meta = metadata.get("suscripcion", "").lower()  # 'plus' | 'pro'
-        if plan_meta in ("plus", "pro") and modo == "subscription":
-            sub_id = session.get("subscription", "")
+        plan_meta = metadata.get("suscripcion", "").lower()  # 'plus' | 'pro' | 'ultra'
+        if plan_meta in ("plus", "pro", "ultra") and modo == "subscription":
+            sub_id      = session.get("subscription", "")
             customer_id = session.get("customer", "")
-            # La fecha de expiración la gestiona el evento invoice.paid / subscription.updated
-            await db.activar_suscripcion(tid, plan_meta, customer_id, sub_id, expira_ts=None)
+
+            # GAP-2 FIX: Obtener plan_expira directamente de la API de Stripe.
+            # Un plan de pago NUNCA debe quedar con plan_expira = NULL en BD.
+            expira_ts_sub: float | None = None
+            if sub_id:
+                try:
+                    sub_obj = await asyncio.to_thread(
+                        stripe.Subscription.retrieve, sub_id
+                    )
+                    expira_ts_sub = float(sub_obj.get("current_period_end") or 0) or None
+                    logger.info(
+                        f"[STRIPE] plan_expira obtenido de API para {sub_id}: {expira_ts_sub}"
+                    )
+                except Exception as e_sub:
+                    logger.error(
+                        f"[STRIPE] No se pudo recuperar current_period_end para {sub_id}: {e_sub}"
+                    )
+
+            await db.activar_suscripcion(tid, plan_meta, customer_id, sub_id, expira_ts_sub)
             try:
                 await telegram_app.bot.send_message(
                     chat_id=tid,
                     text=(
                         f"⭐ <b>¡Bienvenido a {plan_meta.upper()}!</b>\n\n"
-                        f"Tu plan ha sido activado. Ahora tienes acceso a la cartera avanzada, "
-                        f"alertas más frecuentes y datos en tiempo real.\n\n"
+                        f"Tu plan ha sido activado correctamente. Ahora tienes acceso "
+                        f"a la cartera avanzada, alertas más frecuentes y datos en tiempo real.\n\n"
                         f"Usa /plan para ver el estado de tu suscripción."
                     ),
                     parse_mode="HTML"
                 )
             except Exception: pass
 
-    # ── EVENTO 2: Suscripción renovada (actualizar fecha de expiración) ─────────
+    # ── EVENTO 2: Renovación mensual exitosa (fuente de verdad para plan_expira) ──
+    elif tipo == "invoice.paid":
+        invoice     = event["data"]["object"]
+        sub_id      = invoice.get("subscription", "")
+        customer_id = invoice.get("customer", "")
+        # invoice.lines.data[0].period.end es el fin del nuevo período facturado
+        nueva_expira: float | None = None
+        try:
+            lines = invoice.get("lines", {}).get("data", [])
+            if lines:
+                nueva_expira = float(lines[0].get("period", {}).get("end") or 0) or None
+        except Exception:
+            pass
+
+        if sub_id and nueva_expira:
+            tid_renovado = await db.obtener_tid_por_stripe_sub(sub_id)
+            if tid_renovado:
+                # Actualizar solo plan_expira; el plan y stripe_ids ya están guardados
+                pool_inv = db._get_pool()
+                async with pool_inv.acquire() as conn_inv:
+                    await conn_inv.execute(
+                        "UPDATE usuarios SET plan_expira = $1 WHERE id = $2",
+                        nueva_expira, tid_renovado,
+                    )
+                logger.info(
+                    f"[STRIPE] Renovación: usuario {tid_renovado} → plan_expira actualizado "
+                    f"a {nueva_expira} via invoice.paid ({sub_id})"
+                )
+        elif sub_id:
+            logger.warning(
+                f"[STRIPE] invoice.paid sin period.end calculable para sub {sub_id}."
+            )
+
+    # ── EVENTO 3: Fallo de cobro — notificar, NO degradar (Stripe reintentará) ──
+    elif tipo == "invoice.payment_failed":
+        invoice     = event["data"]["object"]
+        sub_id      = invoice.get("subscription", "")
+        intento_num = invoice.get("attempt_count", 1)  # número de intento fallido
+        if sub_id:
+            tid_aviso = await db.obtener_tid_por_stripe_sub(sub_id)
+            if tid_aviso:
+                try:
+                    await telegram_app.bot.send_message(
+                        chat_id=tid_aviso,
+                        text=(
+                            f"⚠️ <b>Pago fallido (intento {intento_num}).</b>\n\n"
+                            f"No hemos podido cobrar tu suscripción. "
+                            f"Por favor, actualiza tu método de pago para evitar "
+                            f"la suspensión del servicio.\n\n"
+                            f"➡️ <a href='https://billing.stripe.com/p/login/'>Gestionar facturación</a>"
+                        ),
+                        parse_mode="HTML",
+                        disable_web_page_preview=True,
+                    )
+                except Exception as e_msg:
+                    logger.warning(f"[STRIPE] No se pudo notificar fallo de pago a {tid_aviso}: {e_msg}")
+            logger.warning(
+                f"[STRIPE] invoice.payment_failed intento {intento_num} para sub {sub_id}. "
+                f"Stripe reintentará; la degradación llegará vía subscription.updated (past_due)."
+            )
+
+    # ── EVENTO 4: Estado de suscripción cambiado (past_due, canceled, etc.) ─────
     elif tipo == "customer.subscription.updated":
-        sub = event["data"]["object"]
+        sub         = event["data"]["object"]
         sub_id      = sub.get("id", "")
         status      = sub.get("status", "")
-        expira_ts   = float(sub.get("current_period_end", 0))
         customer_id = sub.get("customer", "")
-        # Leer el plan del metadata del subscription (Stripe lo hereda del Price)
-        meta_sub = sub.get("metadata") or {}
-        plan_meta = meta_sub.get("suscripcion", "").lower()
+        meta_sub    = sub.get("metadata") or {}
+        plan_meta   = meta_sub.get("suscripcion", "").lower()
 
         if status == "active" and plan_meta and sub_id:
-            # Buscar usuario por subscription_id y actualizar su expiración
-            pool = db._get_pool()
-            async with pool.acquire() as conn:
-                tid_row = await conn.fetchrow(
-                    "SELECT id FROM usuarios WHERE stripe_subscription_id = $1", sub_id
+            # Actualización de plan activo: refrescar expiración usando el DAO
+            expira_ts_upd = float(sub.get("current_period_end") or 0) or None
+            tid_upd = await db.obtener_tid_por_stripe_sub(sub_id)
+            if tid_upd:
+                await db.activar_suscripcion(tid_upd, plan_meta, customer_id, sub_id, expira_ts_upd)
+                logger.info(
+                    f"[STRIPE] subscription.updated activa → usuario {tid_upd} plan_expira={expira_ts_upd}"
                 )
-                if tid_row:
-                    await db.activar_suscripcion(
-                        tid_row["id"], plan_meta, customer_id, sub_id, expira_ts
-                    )
         elif status in ("canceled", "unpaid", "past_due"):
             tid_afectado = await db.desactivar_suscripcion_por_stripe_id(sub_id)
             if tid_afectado:
+                motivo = {
+                    "canceled": "cancelada",
+                    "unpaid":   "impagada",
+                    "past_due": "con pago vencido",
+                }.get(status, status)
                 try:
                     await telegram_app.bot.send_message(
                         chat_id=tid_afectado,
-                        text="⚠️ <b>Suscripción pausada.</b>\n\nTu plan ha vuelto a Free. Renueva desde /plan.",
+                        text=(
+                            f"⚠️ <b>Suscripción {motivo}.</b>\n\n"
+                            f"Tu plan ha vuelto a Free. Renueva desde /plan cuando quieras."
+                        ),
                         parse_mode="HTML"
                     )
                 except Exception: pass
 
-    # ── EVENTO 3: Suscripción cancelada definitivamente ───────────────────
+    # ── EVENTO 5: Suscripción cancelada definitivamente ───────────────────────
     elif tipo == "customer.subscription.deleted":
         sub    = event["data"]["object"]
         sub_id = sub.get("id", "")
@@ -4633,7 +4803,7 @@ async def webhook_pago(request: Request):
             try:
                 await telegram_app.bot.send_message(
                     chat_id=tid_afectado,
-                    text="❌ <b>Suscripción cancelada.</b>\n\nTu plan ha vuelto a Free. Puedes volver a suscribirte cuando quieras desde /plan.",
+                    text="❌ <b>Suscripción cancelada.</b>\n\nTu plan ha vuelto a Free. Puedes suscribirte de nuevo cuando quieras desde /plan.",
                     parse_mode="HTML"
                 )
             except Exception: pass
@@ -4987,6 +5157,46 @@ async def cron_ejecutar(request: Request, background_tasks: BackgroundTasks):
 
     background_tasks.add_task(procesar_todas_las_alertas)
     return {"ok": True, "msg": "Proceso de alertas iniciado en segundo plano."}
+
+
+@web_app.post("/cron/limpiar-planes")
+async def cron_limpiar_planes(request: Request):
+    """
+    Limpia proactivamente planes de pago expirados, degradándolos a 'free'.
+    Protegido por el mismo header X-Cron-Secret que el resto de endpoints admin.
+    Configurar en el scheduler externo (Render Cron Job, Make, etc.) para ejecutar
+    cada hora o cada 6 horas según la granularidad deseada.
+    """
+    secret = request.headers.get("X-Cron-Secret", "")
+    if not CRON_SECRET or secret != CRON_SECRET:
+        raise HTTPException(status_code=403, detail="Forbidden")
+
+    ids_afectados = await db.limpiar_planes_expirados_bulk()
+
+    # Notificar a cada usuario degradado (fire-and-forget, no bloquea la respuesta)
+    async def _notificar_degradados(tids: list[int]):
+        for tid_deg in tids:
+            try:
+                await telegram_app.bot.send_message(
+                    chat_id=tid_deg,
+                    text=(
+                        "🔔 <b>Tu suscripción ha expirado.</b>\n\n"
+                        "Tu plan ha vuelto a Free. Renueva desde /plan para recuperar "
+                        "el acceso a las funcionalidades premium."
+                    ),
+                    parse_mode="HTML"
+                )
+            except Exception as e_n:
+                logger.warning(f"[CRON-PLANES] No se pudo notificar a {tid_deg}: {e_n}")
+
+    if ids_afectados:
+        asyncio.ensure_future(_notificar_degradados(ids_afectados))
+
+    return {
+        "ok": True,
+        "planes_expirados_limpiados": len(ids_afectados),
+        "ids_afectados": ids_afectados,
+    }
 
 
 @web_app.post("/admin/actualizar_seeds")

@@ -319,7 +319,7 @@ INTENCION: Detecta la intención principal del mensaje y rellena el campo intenc
 - "ALERTA_PRECIO": quiere crear una alerta de precio (stop-loss o take-profit). Rellena alerta_precio. Si falta el ticker, extrae la intención igual y déjalo vacío.
 - "BORRAR_ALERTA": quiere borrar o eliminar una alerta existente. Rellena borrar_alerta.
 - "CONFIGURAR_ALERTA": quiere cambiar la frecuencia o activar/desactivar sus alertas automáticas. Rellena configurar_alerta.
-- "VER_MENU": quiere navegar a una sección o ejecutar una acción global (cartera, screeners, alertas, plan, configuracion, macro, educacion, exportar_csv, exportar_pdf, tutorial_acciones, etc). Rellena navegar_a.
+- "VER_MENU": quiere navegar a una sección o ejecutar una acción global (cartera, screeners, alertas, plan, configuracion, macro, educacion, tutorial, exportar_csv, exportar_pdf, tutorial_acciones, etc). Rellena navegar_a.
 - "GESTIONAR_CARTERA": quiere añadir o quitar un ticker específico de su cartera. Rellena gestionar_cartera.
 Si hay duda entre BUSQUEDA y otra intención, prioriza la otra intención cuando el usuario usa verbos como: pon, crea, borra, quita, añade, exporta, configura, activa, desactiva, lleváme, muestra mi.
 
@@ -423,7 +423,7 @@ async def extractor_intenciones(prompt_del_inversor: str) -> dict | None:
                         "navegar_a": {
                             "type": "OBJECT",
                             "properties": {
-                                "destino": {"type": "STRING", "description": "cartera | screeners | alertas | plan | configuracion | macro | educacion | exportar_csv | exportar_pdf | tutorial_acciones | tutorial_etf | tutorial_reit | tutorial_cripto | tutorial_bonos"},
+                                "destino": {"type": "STRING", "description": "cartera | screeners | alertas | plan | configuracion | macro | educacion | tutorial | exportar_csv | exportar_pdf | tutorial_acciones | tutorial_etf | tutorial_reit | tutorial_cripto | tutorial_bonos"},
                                 "filtro_ticker": {"type": "STRING"}
                             }
                         },
@@ -3693,6 +3693,7 @@ async def _nl_navegar(navegar_a: dict, update, context) -> bool:
         "configuracion": "menu_configuracion",
         "macro":         "accion_macro",
         "educacion":     "menu_educacion",
+        "tutorial":      "menu_educacion",
         "exportar_csv":  "cartera_csv",
         "exportar_pdf":  "cartera_pdf",
         "tutorial_acciones": "tutorial_acciones",

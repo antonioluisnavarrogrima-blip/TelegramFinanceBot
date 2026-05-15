@@ -458,7 +458,12 @@ async def extractor_intenciones(prompt_del_inversor: str) -> dict | None:
         return parsed
         
     except json.JSONDecodeError as je:
-        texto_bruto = getattr(res, "text", "")[:400] if 'res' in locals() else "No response object"
+        texto_bruto = "Error al leer res.text (posible bloqueo de seguridad)"
+        try:
+            if 'res' in locals() and hasattr(res, 'text'):
+                texto_bruto = res.text[:400]
+        except Exception:
+            pass
         logger.error(f"[EXTRACTOR] JSON decode error: {je} | Texto bruto: '{texto_bruto}'")
         return None
     except Exception as e:

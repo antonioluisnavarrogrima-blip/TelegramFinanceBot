@@ -3917,8 +3917,8 @@ async def conversacion_inversor(update: Update, context: ContextTypes.DEFAULT_TY
         _extraccion_intent = await extractor_intenciones(solicitud)
         if _extraccion_intent and not _extraccion_intent.get("_rate_limit"):
             _intencion = (_extraccion_intent.get("intencion") or "BUSQUEDA").upper()
-
-            if _intencion != "BUSQUEDA":
+            intenciones_premium = ("ALERTA_PRECIO", "BORRAR_ALERTA", "CONFIGURAR_ALERTA", "GESTIONAR_CARTERA", "VER_MENU")
+            if _intencion in intenciones_premium:
                 if not await db.es_plus(tid):
                     await update.message.reply_text(
                         "⭐ <b>Función Plus</b>\n\nEl asistente de IA para navegar menús, gestionar tu cartera "

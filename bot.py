@@ -311,8 +311,22 @@ CLASES válidas: ACCION|REIT|ETF|CRIPTO|BONO
 MÉTRICAS: {"ACCION":["per","rendimiento","dividendo_porcentaje","dividendo_absoluto","roe","margen_beneficio","beta","deuda_capital","crecimiento_ingresos"],"REIT":["p_ffo","dividend_yield","ocupacion","ltv"],"ETF":["ter","aum","dividend_yield","rendimiento"],"CRIPTO":["rendimiento","market_cap"],"BONO":["dividend_yield","rendimiento","duracion"]}
 TRADUCCIONES: {"PER bajo":{"metrica":"per","operador":"<","valor":45},"dividendo alto":{"metrica":"dividendo_porcentaje","operador":">","valor":4},"dividendo estable":{"metrica":"dividendo_porcentaje","operador":">","valor":2},"alta rentabilidad":{"metrica":"roe","operador":">","valor":45},"deuda baja":{"metrica":"deuda_capital","operador":"<","valor":50},"estable":{"metrica":"beta","operador":"<","valor":0.8},"crecimiento agresivo":{"metrica":"crecimiento_ingresos","operador":">","valor":20},"alcista":{"metrica":"rendimiento","operador":">","valor":0},"bajista":{"metrica":"rendimiento","operador":"<","valor":0}}
 REGLAS: sector siempre lleno ("tecnologia","energia","general"...). Perfil: "Seguro"|"Riesgo"|"Balanceado". Extrae tickers_excluidos si el usuario pide descartar activos.
-TEMPORALIDAD DEL GRÁFICO: Si el usuario menciona un periodo temporal (ej. "6 meses", "un año", "el último mes", "1y", "YTD") extrae el campo temporalidad con uno de estos valores exactos: "1mo" | "3mo" | "6mo" | "1y". Si no se menciona ninguno, usa "3mo" por defecto.
-error_api: dejar SIEMPRE vacío ("") salvo que la solicitud sea completamente ajena a finanzas (ej. "escríbeme un poema"). Pedir datos o análisis de un activo financiero NUNCA es error."""
+TEMPORALIDAD DEL GRÁFICO: Si el usuario menciona un periodo temporal extrae temporalidad: "1mo"|"3mo"|"6mo"|"1y". Default "3mo".
+
+INTENCION: Detecta la intención principal del mensaje y rellena el campo intencion:
+- "BUSQUEDA": quiere buscar/analizar activos (comportamiento normal).
+- "ALERTA_PRECIO": quiere crear una alerta de precio (stop-loss o take-profit). Rellena alerta_precio. Si falta el ticker, extrae la intención igual y déjalo vacío.
+- "BORRAR_ALERTA": quiere borrar o eliminar una alerta existente. Rellena borrar_alerta.
+- "CONFIGURAR_ALERTA": quiere cambiar la frecuencia o activar/desactivar sus alertas automáticas. Rellena configurar_alerta.
+- "VER_MENU": quiere navegar a una sección del bot (cartera, screeners, alertas, plan, configuracion). Rellena navegar_a.
+Si hay duda entre BUSQUEDA y otra intención, prioriza la otra intención cuando el usuario usa verbos como: pon, crea, borra, quita, configura, activa, desactiva, lleváme, muestra mi.
+
+Ejemplos:
+"pon un stop loss a Tesla a 200€" → intencion=ALERTA_PRECIO, alerta_precio={ticker:TSLA, tipo:stop_loss, precio:200}
+"desactiva mis alertas" → intencion=CONFIGURAR_ALERTA, configurar_alerta={estado:OFF}
+"quiero ver mis alertas de Microsoft" → intencion=VER_MENU, navegar_a={destino:alertas, filtro_ticker:MSFT}
+"borra mi alerta de AAPL" → intencion=BORRAR_ALERTA, borrar_alerta={ticker:AAPL}
+error_api: dejar SIEMPRE vacío ("") salvo que la solicitud sea completamente ajena a finanzas."""
 
 async def extractor_intenciones(prompt_del_inversor: str) -> dict | None:
     """Extrae parámetros para búsqueda determínistica v4.5 — prompt compacto (-60% tokens)."""
@@ -344,12 +358,16 @@ async def extractor_intenciones(prompt_del_inversor: str) -> dict | None:
                 response_schema={
                     "type": "OBJECT",
                     "properties": {
+                        "intencion": {
+                            "type": "STRING",
+                            "description": "BUSQUEDA | ALERTA_PRECIO | BORRAR_ALERTA | CONFIGURAR_ALERTA | VER_MENU"
+                        },
                         "clase_activo": {"type": "STRING"},
                         "perfil":       {"type": "STRING"},
                         "sector":       {"type": "STRING"},
                         "temporalidad": {
                             "type": "STRING",
-                            "description": "Periodo del gráfico: 1mo | 3mo | 6mo | 1y. Por defecto 3mo."
+                            "description": "1mo | 3mo | 6mo | 1y"
                         },
                         "tickers_manuales": {
                             "type": "ARRAY",
@@ -368,6 +386,35 @@ async def extractor_intenciones(prompt_del_inversor: str) -> dict | None:
                                     "operador": {"type": "STRING"},
                                     "valor":    {"type": "NUMBER"}
                                 }
+                            }
+                        },
+                        "alerta_precio": {
+                            "type": "OBJECT",
+                            "properties": {
+                                "ticker": {"type": "STRING"},
+                                "tipo":   {"type": "STRING", "description": "stop_loss | take_profit"},
+                                "precio": {"type": "NUMBER"}
+                            }
+                        },
+                        "borrar_alerta": {
+                            "type": "OBJECT",
+                            "properties": {
+                                "ticker": {"type": "STRING"},
+                                "tipo":   {"type": "STRING", "description": "stop_loss | take_profit | ALL"}
+                            }
+                        },
+                        "configurar_alerta": {
+                            "type": "OBJECT",
+                            "properties": {
+                                "intervalo_horas": {"type": "NUMBER", "description": "4 | 12 | 24 | 168"},
+                                "estado": {"type": "STRING", "description": "ON | OFF"}
+                            }
+                        },
+                        "navegar_a": {
+                            "type": "OBJECT",
+                            "properties": {
+                                "destino": {"type": "STRING", "description": "cartera | screeners | alertas | plan | configuracion"},
+                                "filtro_ticker": {"type": "STRING"}
                             }
                         },
                         "error_api": {
@@ -3395,8 +3442,214 @@ def formatear_tiempo(segundos: float) -> str:
     return " ".join(parts)
 
 
+# ── HANDLERS DE INTENCIÓN NATURAL (sin coste de crédito) ─────────────────────
+
+async def _nl_alerta_precio(tid: int, datos: dict, update) -> bool:
+    """Crea una alerta de precio (SL/TP) a partir de la extracción NL. Devuelve True si procesó."""
+    ticker = (datos.get("ticker") or "").upper().strip()
+    tipo   = (datos.get("tipo")   or "").lower().strip()
+    precio = datos.get("precio")
+
+    if not ticker:
+        await update.message.reply_text(
+            "¿De qué empresa quieres la alerta? Por favor, dime el ticker (ej. AAPL).",
+            parse_mode="HTML"
+        )
+        return True
+
+    if tipo not in ("stop_loss", "take_profit") or not precio:
+        await update.message.reply_text(
+            "⚠️ Faltan datos para crear la alerta.\n"
+            "Usa el formato: <i>stop loss a AAPL a 170</i> o <i>take profit Tesla 300</i>",
+            parse_mode="HTML"
+        )
+        return True
+
+    precio = float(precio)
+
+    # Validar plan
+    if not await db.es_plus(tid):
+        await update.message.reply_text(
+            "⭐ <b>Función Plus</b>\n\nLas alertas de precio (Stop-Loss/Take-Profit) "
+            "requieren plan Plus o superior.",
+            parse_mode="HTML"
+        )
+        return True
+
+    # Validar dirección lógica (reutiliza la lógica del comando /alerta_precio)
+    precio_actual_val: float | None = None
+    try:
+        from curl_cffi.requests import AsyncSession
+        y_url = f"https://query2.finance.yahoo.com/v8/finance/chart/{ticker}?range=1d&interval=1d"
+        async with AsyncSession(impersonate="chrome110") as sess:
+            r = await sess.get(y_url, timeout=8.0)
+        if r.status_code == 200:
+            result = r.json().get("chart", {}).get("result", [])
+            if result:
+                closes = result[0].get("indicators", {}).get("quote", [{}])[0].get("close", [])
+                closes_v = [c for c in closes if c is not None]
+                if closes_v:
+                    precio_actual_val = closes_v[-1]
+    except Exception:
+        pass
+
+    if precio_actual_val:
+        if tipo == "stop_loss" and precio >= precio_actual_val:
+            await update.message.reply_text(
+                f"❌ <b>Alerta inválida</b>\n\n"
+                f"Un <b>Stop-Loss</b> debe estar <b>por debajo</b> del precio actual.\n"
+                f"Precio actual de <code>{ticker}</code>: <b>{round(precio_actual_val, 2)}</b>\n"
+                f"Tu objetivo ({precio}) está por encima — usa <code>take profit</code> para eso.",
+                parse_mode="HTML"
+            )
+            return True
+        if tipo == "take_profit" and precio <= precio_actual_val:
+            await update.message.reply_text(
+                f"❌ <b>Alerta inválida</b>\n\n"
+                f"Un <b>Take-Profit</b> debe estar <b>por encima</b> del precio actual.\n"
+                f"Precio actual de <code>{ticker}</code>: <b>{round(precio_actual_val, 2)}</b>\n"
+                f"Tu objetivo ({precio}) está por debajo — usa <code>stop loss</code> para eso.",
+                parse_mode="HTML"
+            )
+            return True
+
+    await db.crear_alerta_precio(tid, ticker, tipo, precio)
+    emoji     = "🛑" if tipo == "stop_loss" else "🎯"
+    nombre    = "Stop-Loss" if tipo == "stop_loss" else "Take-Profit"
+    ref_txt   = f" (precio actual: ~{round(precio_actual_val, 2)})" if precio_actual_val else ""
+    await update.message.reply_text(
+        f"✅ <b>Alerta creada</b>\n\n"
+        f"Activo: <code>{ticker}</code>{ref_txt}\n"
+        f"Tipo: {emoji} {nombre}\n"
+        f"Precio objetivo: <b>{precio}</b>\n\n"
+        f"Te avisaré en cuanto el precio cruce ese nivel.",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("📋 Ver mis alertas", callback_data="gestionar_alertas")],
+            [InlineKeyboardButton("💼 Mi Cartera", callback_data="accion_cartera")],
+        ])
+    )
+    return True
+
+
+async def _nl_configurar_alerta(tid: int, datos: dict, update) -> bool:
+    """Cambia el intervalo de alertas o activa/desactiva las alertas. Devuelve True si procesó."""
+    estado = (datos.get("estado") or "").upper()
+    if estado in ("ON", "OFF"):
+        activa = estado == "ON"
+        pool = db._get_pool()
+        async with pool.acquire() as conn:
+            await conn.execute("UPDATE alertas_inversion SET activa = $1 WHERE user_id = $2", activa, tid)
+        await update.message.reply_text(
+            f"✅ Tus alertas de inversión automáticas han sido <b>{'activadas' if activa else 'desactivadas'}</b>.",
+            parse_mode="HTML"
+        )
+        return True
+
+    horas_raw = datos.get("intervalo_horas")
+    if not horas_raw:
+        await update.message.reply_text(
+            "⚠️ No detecté el ajuste. Dime algo como:\n"
+            "<i>«cambia mis alertas a cada 12 horas»</i> o <i>«desactiva mis alertas»</i>",
+            parse_mode="HTML"
+        )
+        return True
+
+    horas = int(horas_raw)
+    opciones_validas = [4, 12, 24, 168]
+    horas = min(opciones_validas, key=lambda x: abs(x - horas))
+    etiquetas = {4: "4 horas", 12: "12 horas", 24: "24 horas (diario)", 168: "semanal"}
+
+    pool = db._get_pool()
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE alertas_inversion SET intervalo = $1 WHERE user_id = $2 AND activa = TRUE",
+            horas, tid
+        )
+
+    await update.message.reply_text(
+        f"✅ <b>Alertas actualizadas</b>\n\n"
+        f"Tus alertas automáticas se enviarán cada <b>{etiquetas[horas]}</b>.",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("📋 Ver mis alertas", callback_data="gestionar_alertas")],
+        ])
+    )
+    return True
+
+
+async def _nl_borrar_alerta(tid: int, datos: dict, update) -> bool:
+    """Elimina las alertas de precio de un ticker en BD. Devuelve True si procesó."""
+    ticker = (datos.get("ticker") or "").upper().strip()
+    if not ticker:
+        await update.message.reply_text("¿De qué empresa quieres borrar la alerta? Por favor, dime el ticker.", parse_mode="HTML")
+        return True
+
+    borrados = await db.eliminar_alerta_precio_por_ticker(tid, ticker)
+    if borrados > 0:
+        await update.message.reply_text(f"✅ Se han borrado <b>{borrados}</b> alerta(s) de <code>{ticker}</code>.", parse_mode="HTML")
+    else:
+        await update.message.reply_text(f"⚠️ No he encontrado ninguna alerta activa para <code>{ticker}</code>.", parse_mode="HTML")
+    return True
+
+
+async def _nl_navegar(navegar_a: dict, update, context) -> bool:
+    """Navega a una sección del bot como si el usuario hubiese pulsado el botón. Devuelve True."""
+    destino = (navegar_a.get("destino") or "").lower().strip()
+    filtro_ticker = (navegar_a.get("filtro_ticker") or "").upper().strip()
+
+    _MAPA = {
+        "cartera":       "accion_cartera",
+        "screeners":     "menu_screeners",
+        "alertas":       "gestionar_alertas",
+        "plan":          "ver_planes_detalle",
+        "configuracion": "menu_configuracion",
+    }
+    callback = _MAPA.get(destino)
+
+    if not callback:
+        await update.message.reply_text(
+            "📍 Secciones disponibles:\n\n"
+            "• <i>«mi cartera»</i>\n"
+            "• <i>«screeners»</i>\n"
+            "• <i>«mis alertas»</i>\n"
+            "• <i>«mi plan»</i>\n"
+            "• <i>«configuración»</i>",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🏠 Menú principal", callback_data="volver_menu")]
+            ])
+        )
+        return True
+
+    # Si el usuario quiere ver alertas específicas de un ticker y el destino es alertas, 
+    # le abrimos el menú de alertas para ese ticker específico.
+    if callback == "gestionar_alertas" and filtro_ticker:
+        callback = f"menu_alertas_{filtro_ticker}"
+
+    # Simular la pulsación del botón correspondiente
+    etiquetas_menu = {
+        "accion_cartera":    "💼 Mi Cartera",
+        "menu_screeners":    "🔍 Screeners",
+        "gestionar_alertas": "🔔 Mis Alertas",
+        "ver_planes_detalle":"💎 Planes",
+        "menu_configuracion":"⚙️ Configuración",
+    }
+    etiqueta = etiquetas_menu.get(callback) or (f"🔔 Alertas de {filtro_ticker}" if filtro_ticker else destino)
+    
+    await update.message.reply_text(
+        f"📍 Abriendo <b>{etiqueta}</b>...",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton(etiqueta, callback_data=callback)]
+        ])
+    )
+    return True
+
+
 async def conversacion_inversor(update: Update, context: ContextTypes.DEFAULT_TYPE, es_reintento=False):
     """Handler principal con filtros de seguridad v4.3."""
+
     user_id = update.effective_user.id
     texto_usuario = update.message.text or ""
     
@@ -3577,6 +3830,39 @@ async def conversacion_inversor(update: Update, context: ContextTypes.DEFAULT_TY
         else:
             await msg_espera.edit_text(texto_final or "❌ No se encontraron activos con esos tickers.")
         return
+
+    # ── FORK DE INTENCIÓN NATURAL (sin coste de crédito) ─────────────────────
+    # Llamamos al extractor ligero para detectar la intención ANTES de cobrar
+    # crédito. Las acciones operativas (alerta, config, menú) no pasan por el
+    # pipeline de búsqueda y no consumen créditos.
+    if not es_reintento:
+        _extraccion_intent = await extractor_intenciones(solicitud)
+        if _extraccion_intent and not _extraccion_intent.get("_rate_limit"):
+            _intencion = (_extraccion_intent.get("intencion") or "BUSQUEDA").upper()
+
+            if _intencion == "ALERTA_PRECIO":
+                _datos_alerta = _extraccion_intent.get("alerta_precio") or {}
+                await _nl_alerta_precio(tid, _datos_alerta, update)
+                return
+            
+            elif _intencion == "BORRAR_ALERTA":
+                _datos_borrar = _extraccion_intent.get("borrar_alerta") or {}
+                await _nl_borrar_alerta(tid, _datos_borrar, update)
+                return
+
+            elif _intencion == "CONFIGURAR_ALERTA":
+                _datos_cfg = _extraccion_intent.get("configurar_alerta") or {}
+                await _nl_configurar_alerta(tid, _datos_cfg, update)
+                return
+
+            elif _intencion == "VER_MENU":
+                _destino = _extraccion_intent.get("navegar_a") or {}
+                # Backward compat in case it returns a string instead of dict temporarily
+                if isinstance(_destino, str):
+                    _destino = {"destino": _destino}
+                await _nl_navegar(_destino, update, context)
+                return
+            # Si intencion == "BUSQUEDA" (o vacío), continúa el flujo normal
 
     # Verificar créditos
     creditos = await db.obtener_creditos(tid)

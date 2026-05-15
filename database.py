@@ -1419,6 +1419,19 @@ async def eliminar_alerta_precio(user_id: int, alerta_id: int) -> bool:
         )
     return resultado == "DELETE 1"
 
+async def eliminar_alerta_precio_por_ticker(user_id: int, ticker: str) -> int:
+    """Elimina todas las alertas de precio de un usuario para un ticker específico. Devuelve número de filas borradas."""
+    pool = _get_pool()
+    async with pool.acquire() as conn:
+        resultado = await conn.execute(
+            "DELETE FROM alertas_precio WHERE user_id = $1 AND ticker = $2",
+            user_id, ticker
+        )
+    try:
+        return int(resultado.replace("DELETE ", ""))
+    except ValueError:
+        return 0
+
 async def obtener_alertas_precio_activas() -> List[dict]:
     """Retorna todas las alertas de precio activas para el proceso de verificación."""
     pool = _get_pool()

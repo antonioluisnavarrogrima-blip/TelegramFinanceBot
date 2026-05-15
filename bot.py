@@ -104,7 +104,8 @@ _REGEX_FINANCIERO = re.compile(
     r"|commodity|petr[oó]leo|oro|plata|divisas"
     r"|per|peg|roe|roa|ebitda|margen|deuda|capital|patrimonio|beneficios?"
     r"|valoraci[oó]n|an[áa]lisis|analiz|rentabilidad|rendimiento|datos"
-    r"|informaci[oó]n|info|cotiza|resultados|alertas?|stop loss|take profit)",
+    r"|informaci[oó]n|info|cotiza|resultados|alertas?|stop loss|take profit"
+    r"|planes?|men[uú]|configuraci[oó]n|screeners?)",
     re.IGNORECASE
 )
 
@@ -318,12 +319,14 @@ INTENCION: Detecta la intención principal del mensaje y rellena el campo intenc
 - "ALERTA_PRECIO": quiere crear una alerta de precio (stop-loss o take-profit). Rellena alerta_precio. Si falta el ticker, extrae la intención igual y déjalo vacío.
 - "BORRAR_ALERTA": quiere borrar o eliminar una alerta existente. Rellena borrar_alerta.
 - "CONFIGURAR_ALERTA": quiere cambiar la frecuencia o activar/desactivar sus alertas automáticas. Rellena configurar_alerta.
-- "VER_MENU": quiere navegar a una sección del bot (cartera, screeners, alertas, plan, configuracion). Rellena navegar_a.
-Si hay duda entre BUSQUEDA y otra intención, prioriza la otra intención cuando el usuario usa verbos como: pon, crea, borra, quita, configura, activa, desactiva, lleváme, muestra mi.
+- "VER_MENU": quiere navegar a una sección o ejecutar una acción global (cartera, screeners, alertas, plan, configuracion, macro, educacion, exportar_csv, exportar_pdf, tutorial_acciones, etc). Rellena navegar_a.
+- "GESTIONAR_CARTERA": quiere añadir o quitar un ticker específico de su cartera. Rellena gestionar_cartera.
+Si hay duda entre BUSQUEDA y otra intención, prioriza la otra intención cuando el usuario usa verbos como: pon, crea, borra, quita, añade, exporta, configura, activa, desactiva, lleváme, muestra mi.
 
 Ejemplos:
 "pon un stop loss a Tesla a 200€" → intencion=ALERTA_PRECIO, alerta_precio={ticker:TSLA, tipo:stop_loss, precio:200}
-"desactiva mis alertas" → intencion=CONFIGURAR_ALERTA, configurar_alerta={estado:OFF}
+"añade apple a mi cartera" → intencion=GESTIONAR_CARTERA, gestionar_cartera={accion:ADD, ticker:AAPL}
+"exporta mi cartera a pdf" → intencion=VER_MENU, navegar_a={destino:exportar_pdf}
 "quiero ver mis alertas de Microsoft" → intencion=VER_MENU, navegar_a={destino:alertas, filtro_ticker:MSFT}
 "borra mi alerta de AAPL" → intencion=BORRAR_ALERTA, borrar_alerta={ticker:AAPL}
 error_api: dejar SIEMPRE vacío ("") salvo que la solicitud sea completamente ajena a finanzas."""
@@ -360,7 +363,7 @@ async def extractor_intenciones(prompt_del_inversor: str) -> dict | None:
                     "properties": {
                         "intencion": {
                             "type": "STRING",
-                            "description": "BUSQUEDA | ALERTA_PRECIO | BORRAR_ALERTA | CONFIGURAR_ALERTA | VER_MENU"
+                            "description": "BUSQUEDA | ALERTA_PRECIO | BORRAR_ALERTA | CONFIGURAR_ALERTA | VER_MENU | GESTIONAR_CARTERA"
                         },
                         "clase_activo": {"type": "STRING"},
                         "perfil":       {"type": "STRING"},
@@ -410,10 +413,17 @@ async def extractor_intenciones(prompt_del_inversor: str) -> dict | None:
                                 "estado": {"type": "STRING", "description": "ON | OFF"}
                             }
                         },
+                        "gestionar_cartera": {
+                            "type": "OBJECT",
+                            "properties": {
+                                "accion": {"type": "STRING", "description": "ADD | REMOVE"},
+                                "ticker": {"type": "STRING"}
+                            }
+                        },
                         "navegar_a": {
                             "type": "OBJECT",
                             "properties": {
-                                "destino": {"type": "STRING", "description": "cartera | screeners | alertas | plan | configuracion"},
+                                "destino": {"type": "STRING", "description": "cartera | screeners | alertas | plan | configuracion | macro | educacion | exportar_csv | exportar_pdf | tutorial_acciones | tutorial_etf | tutorial_reit | tutorial_cripto | tutorial_bonos"},
                                 "filtro_ticker": {"type": "STRING"}
                             }
                         },
@@ -2521,6 +2531,7 @@ async def manejador_botones(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "  • Alertas configurables (4h, 12h, 24h, semanal)\n\n"
             "⭐ <b>Plan Plus — 7.99€/mes</b>\n"
             "  ✅ TODO lo de Free, más:\n"
+            "  • <b>Asistente IA total</b> (acciones de menú, cartera y alertas por chat)\n"
             "  • Cartera <b>ilimitada</b>\n"
             "  • Exportar cartera a <b>CSV y PDF</b>\n"
             "  • Precios en <b>tiempo real</b> vía WebSocket\n"
@@ -3597,8 +3608,46 @@ async def _nl_borrar_alerta(tid: int, datos: dict, update) -> bool:
     return True
 
 
+async def _nl_gestionar_cartera(tid: int, datos: dict, update, context) -> bool:
+    """Añade o elimina un activo de la cartera directamente usando MockUpdate."""
+    accion = (datos.get("accion") or "").upper()
+    ticker = (datos.get("ticker") or "").upper().strip()
+    
+    if not ticker or accion not in ("ADD", "REMOVE"):
+        await update.message.reply_text("¿Qué empresa quieres añadir o quitar de tu cartera? Dime el ticker.", parse_mode="HTML")
+        return True
+
+    callback = f"add_cartera_{ticker}" if accion == "ADD" else f"rm_cartera_{ticker}"
+    
+    # Delegamos al manejador de botones usando la simulación
+    await manejador_botones(MockUpdate(update, MockQuery(callback, update.message)), context)
+    return True
+
+
+class MockQuery:
+    """Simula un CallbackQuery de Telegram para engañar al manejador de botones."""
+    def __init__(self, data, message):
+        self.data = data
+        self.message = message
+        
+    async def answer(self, text=None, show_alert=False, *args, **kwargs):
+        if text: await self.message.reply_text(f"ℹ️ {text}")
+        
+    async def edit_message_text(self, text, *args, **kwargs):
+        # Convertimos la edición (que fallaría por ser un msg del user) en un nuevo mensaje del bot
+        return await self.message.reply_text(text, *args, **kwargs)
+
+class MockUpdate:
+    """Simula un Update que proviene de un InlineKeyboardButton."""
+    def __init__(self, update: Update, mock_query: MockQuery):
+        self.callback_query = mock_query
+        self.effective_chat = update.effective_chat
+        self.effective_user = update.effective_user
+        self.message = update.message
+
+
 async def _nl_navegar(navegar_a: dict, update, context) -> bool:
-    """Navega a una sección del bot como si el usuario hubiese pulsado el botón. Devuelve True."""
+    """Delega la navegación al handler de botones original usando MockUpdate."""
     destino = (navegar_a.get("destino") or "").lower().strip()
     filtro_ticker = (navegar_a.get("filtro_ticker") or "").upper().strip()
 
@@ -3608,46 +3657,31 @@ async def _nl_navegar(navegar_a: dict, update, context) -> bool:
         "alertas":       "gestionar_alertas",
         "plan":          "ver_planes_detalle",
         "configuracion": "menu_configuracion",
+        "macro":         "accion_macro",
+        "educacion":     "menu_educacion",
+        "exportar_csv":  "cartera_csv",
+        "exportar_pdf":  "cartera_pdf",
+        "tutorial_acciones": "tutorial_acciones",
+        "tutorial_etf":  "tutorial_etf",
+        "tutorial_reit": "tutorial_reit",
+        "tutorial_cripto": "tutorial_cripto",
+        "tutorial_bonos": "tutorial_bonos",
     }
     callback = _MAPA.get(destino)
 
     if not callback:
         await update.message.reply_text(
-            "📍 Secciones disponibles:\n\n"
-            "• <i>«mi cartera»</i>\n"
-            "• <i>«screeners»</i>\n"
-            "• <i>«mis alertas»</i>\n"
-            "• <i>«mi plan»</i>\n"
-            "• <i>«configuración»</i>",
-            parse_mode="HTML",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("🏠 Menú principal", callback_data="volver_menu")]
-            ])
+            "📍 Acción no reconocida. Prueba a decir <i>«ver mi cartera»</i> o <i>«exportar cartera a pdf»</i>.",
+            parse_mode="HTML"
         )
         return True
 
-    # Si el usuario quiere ver alertas específicas de un ticker y el destino es alertas, 
-    # le abrimos el menú de alertas para ese ticker específico.
     if callback == "gestionar_alertas" and filtro_ticker:
         callback = f"menu_alertas_{filtro_ticker}"
 
-    # Simular la pulsación del botón correspondiente
-    etiquetas_menu = {
-        "accion_cartera":    "💼 Mi Cartera",
-        "menu_screeners":    "🔍 Screeners",
-        "gestionar_alertas": "🔔 Mis Alertas",
-        "ver_planes_detalle":"💎 Planes",
-        "menu_configuracion":"⚙️ Configuración",
-    }
-    etiqueta = etiquetas_menu.get(callback) or (f"🔔 Alertas de {filtro_ticker}" if filtro_ticker else destino)
-    
-    await update.message.reply_text(
-        f"📍 Abriendo <b>{etiqueta}</b>...",
-        parse_mode="HTML",
-        reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton(etiqueta, callback_data=callback)]
-        ])
-    )
+    # Ejecuta mágicamente toda la lógica del botón (validaciones de BD, permisos, generación PDFs, etc)
+    # sin re-escribir ni una línea de código original.
+    await manejador_botones(MockUpdate(update, MockQuery(callback, update.message)), context)
     return True
 
 
@@ -3844,6 +3878,17 @@ async def conversacion_inversor(update: Update, context: ContextTypes.DEFAULT_TY
         if _extraccion_intent and not _extraccion_intent.get("_rate_limit"):
             _intencion = (_extraccion_intent.get("intencion") or "BUSQUEDA").upper()
 
+            if _intencion != "BUSQUEDA":
+                if not await db.es_plus(tid):
+                    await update.message.reply_text(
+                        "⭐ <b>Función Plus</b>\n\nEl asistente de IA para navegar menús, gestionar tu cartera "
+                        "o configurar alertas mediante chat es exclusivo para usuarios Plus.\n\n"
+                        "<i>Los usuarios Free solo pueden usar la IA para buscar activos. Usa los botones para el resto.</i>",
+                        parse_mode="HTML",
+                        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⭐ Ver Plan Plus", callback_data="ver_planes_detalle")]])
+                    )
+                    return
+
             if _intencion == "ALERTA_PRECIO":
                 _datos_alerta = _extraccion_intent.get("alerta_precio") or {}
                 await _nl_alerta_precio(tid, _datos_alerta, update)
@@ -3857,6 +3902,11 @@ async def conversacion_inversor(update: Update, context: ContextTypes.DEFAULT_TY
             elif _intencion == "CONFIGURAR_ALERTA":
                 _datos_cfg = _extraccion_intent.get("configurar_alerta") or {}
                 await _nl_configurar_alerta(tid, _datos_cfg, update)
+                return
+
+            elif _intencion == "GESTIONAR_CARTERA":
+                _datos_cartera = _extraccion_intent.get("gestionar_cartera") or {}
+                await _nl_gestionar_cartera(tid, _datos_cartera, update, context)
                 return
 
             elif _intencion == "VER_MENU":
@@ -4576,7 +4626,7 @@ async def comando_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/comprar → Recargar créditos y ver planes\n"
         "/plan → Ver tu plan activo y fecha de renovación\n"
         "  🆓 Free: 3 créditos iniciales\n"
-        "  ⭐ Plus: cartera ilimitada, alertas 4h, CSV y PDF\n"
+        "  ⭐ Plus: cartera ilimitada, IA total (control por chat), CSV y PDF\n"
         "  💎 Pro: todo Plus + predicciones IA + insider trading\n"
         "  🏦 Ultra: todo Pro + webhooks + sentimiento + backtest\n\n"
 

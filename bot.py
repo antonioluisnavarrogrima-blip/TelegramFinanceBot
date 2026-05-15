@@ -104,7 +104,7 @@ _REGEX_FINANCIERO = re.compile(
     r"|commodity|petr[oó]leo|oro|plata|divisas"
     r"|per|peg|roe|roa|ebitda|margen|deuda|capital|patrimonio|beneficios?"
     r"|valoraci[oó]n|an[áa]lisis|analiz|rentabilidad|rendimiento|datos"
-    r"|informaci[oó]n|info|cotiza|resultados)",
+    r"|informaci[oó]n|info|cotiza|resultados|alertas?|stop loss|take profit)",
     re.IGNORECASE
 )
 
@@ -1292,8 +1292,12 @@ async def _pipeline_hibrido_interno(
     _t_manuales = extraccion.get("tickers_manuales") if extraccion else None
     _t_legacy   = extraccion.get("tickers") if extraccion else None
     _t_excluidos = extraccion.get("tickers_excluidos", []) if extraccion else []
-    _hay_clase  = extraccion.get("clase_activo") if extraccion else None
-    if not extraccion or not (_t_manuales or _t_legacy or _hay_clase):
+    _hay_clase   = extraccion.get("clase_activo") if extraccion else None
+    _hay_sector  = extraccion.get("sector") if extraccion else None
+    _hay_perfil  = extraccion.get("perfil") if extraccion else None
+    _hay_filtros = extraccion.get("filtros_dinamicos") if extraccion else []
+
+    if not extraccion or not (_t_manuales or _t_legacy or _hay_clase or _hay_sector or _hay_perfil or _hay_filtros):
         logger.error(f"[PIPELINE] Extractor devolvio resultado invalido: {extraccion}")
         return (
             "❌ El Extractor IA no logró identificar activos para esa consulta.\n"

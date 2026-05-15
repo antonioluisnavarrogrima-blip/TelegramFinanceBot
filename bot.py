@@ -2518,7 +2518,7 @@ async def manejador_botones(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "⭐ <b>Plan Plus — 7.99€/mes</b>\n"
             "  ✅ TODO lo de Free, más:\n"
             "  • Cartera <b>ilimitada</b>\n"
-            "  • Exportar cartera a <b>CSV</b>\n"
+            "  • Exportar cartera a <b>CSV y PDF</b>\n"
             "  • Precios en <b>tiempo real</b> vía WebSocket\n"
             "  • Alertas Stop-Loss (Límite de Pérdidas) / Take-Profit (Toma de Ganancias)\n"
             "  • Cálculo de valor intrínseco DCF (/valor)\n\n"
@@ -3175,7 +3175,7 @@ async def manejador_botones(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         lineas.append("<i>⚡ = Tiempo real · 💾 = Caché BD</i>")
         if not es_usuario_plus:
-            lineas.append(f"\n<i>📦 {len(tickers_cartera)}/5 activos (Free). ⭐ Plus = ilimitados + CSV</i>")
+            lineas.append(f"\n<i>📦 {len(tickers_cartera)}/5 activos (Free). ⭐ Plus = ilimitados + CSV y PDF</i>")
 
         if es_usuario_plus:
             botones_cartera.append([
@@ -4373,7 +4373,7 @@ async def comando_plan(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "• Cartera ilimitada ✅\n"
             "• Alertas cada 4h ✅\n"
             "• Precios en tiempo real (WebSocket) ✅\n"
-            "• Exportar a CSV ✅"
+            "• Exportar a CSV y PDF ✅"
         )
         botones = []
 
@@ -4553,7 +4553,7 @@ async def comando_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         "━━━ 💼 <b>CARTERA</b> ━━━\n"
         "Añade activos con el botón '💼 Añadir a Cartera' de cualquier análisis.\n"
-        "Free: hasta 5 activos · Plus/Pro: ilimitado + CSV\n\n"
+        "Free: hasta 5 activos · Plus/Pro: ilimitado + CSV y PDF\n\n"
 
         "━━━ 🏆 <b>ANÁLISIS AVANZADO</b> (Plus/Pro) ━━━\n"
         "/valor TICKER → Valoración por DCF (Descuento de Flujo de Caja)\n"
@@ -4572,7 +4572,7 @@ async def comando_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/comprar → Recargar créditos y ver planes\n"
         "/plan → Ver tu plan activo y fecha de renovación\n"
         "  🆓 Free: 3 créditos iniciales\n"
-        "  ⭐ Plus: cartera ilimitada, alertas 4h, CSV\n"
+        "  ⭐ Plus: cartera ilimitada, alertas 4h, CSV y PDF\n"
         "  💎 Pro: todo Plus + predicciones IA + insider trading\n"
         "  🏦 Ultra: todo Pro + webhooks + sentimiento + backtest\n\n"
 

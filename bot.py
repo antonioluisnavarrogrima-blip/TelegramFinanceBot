@@ -2358,8 +2358,6 @@ async def manejador_botones(update: Update, context: ContextTypes.DEFAULT_TYPE):
         botones.append([InlineKeyboardButton("🔔 Crear Alerta", callback_data="crear_alerta")])
         teclado = InlineKeyboardMarkup(botones)
 
-        import io
-        from telegram import InputFile
         try:
             if grafico_bytes:
                 with io.BytesIO(grafico_bytes) as buf:

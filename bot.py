@@ -105,7 +105,7 @@ _REGEX_FINANCIERO = re.compile(
     r"|per|peg|roe|roa|ebitda|margen|deuda|capital|patrimonio|beneficios?"
     r"|valoraci[oó]n|an[áa]lisis|analiz|rentabilidad|rendimiento|datos"
     r"|informaci[oó]n|info|cotiza|resultados|alertas?|stop loss|take profit"
-    r"|planes?|men[uú]|configuraci[oó]n|screeners?)",
+    r"|planes?|men[uú]|configuraci[oó]n|screeners?|tutoriales?|educaci[oó]n|principal|inicio)",
     re.IGNORECASE
 )
 
@@ -423,7 +423,7 @@ async def extractor_intenciones(prompt_del_inversor: str) -> dict | None:
                         "navegar_a": {
                             "type": "OBJECT",
                             "properties": {
-                                "destino": {"type": "STRING", "description": "cartera | screeners | alertas | plan | configuracion | macro | educacion | tutorial | tutoriales | exportar_csv | exportar_pdf | tutorial_acciones | tutorial_etf | tutorial_reit | tutorial_cripto | tutorial_bonos"},
+                                "destino": {"type": "STRING", "description": "cartera | screeners | alertas | plan | configuracion | macro | educacion | tutorial | tutoriales | menu | principal | inicio | exportar_csv | exportar_pdf | tutorial_acciones | tutorial_etf | tutorial_reit | tutorial_cripto | tutorial_bonos"},
                                 "filtro_ticker": {"type": "STRING"}
                             }
                         },
@@ -547,8 +547,12 @@ async def generador_informe_goldman(ticker: str, sector: str, datos: dict, perfi
     # 1. Sanitización de datos (Mantenemos los 0, ignoramos nulos)
     datos_limpios = {
         k: v for k, v in datos.items()
-        if v is not None and str(v).strip().upper() != "N/A" and k not in ["ticker", "_best_effort", "_fuente", "rendimiento_real", "analisis_relevancia"]
+        if v is not None and str(v).strip() != "" and str(v).strip().upper() != "N/A" and k not in ["ticker", "_best_effort", "_fuente", "rendimiento_real", "analisis_relevancia"]
     }
+    
+    # Saneamiento específico para ETFs: evitar penalización por PER faltante
+    if clase_activo == "ETF" and "per" not in datos_limpios:
+        datos_limpios["per"] = "N/A (Fondo Indexado)"
 
     # Circuit Breaker: Si tras limpiar variables de metadata no hay fundamentales reales (ej. 429 Rate Limit)
     if len(datos_limpios) == 0:
@@ -566,7 +570,7 @@ async def generador_informe_goldman(ticker: str, sector: str, datos: dict, perfi
         f"PROHIBIDO usar etiquetas <font>, <span>, <div>. "
         f"REGLA CRUCIAL: Separa los tres bloques (Tesis, Datos, Veredicto) con DOBLE SALTO DE LÍNEA (\\n\\n). "
         f"Cada dato en el bloque Datos debe ir en una línea nueva con el símbolo •. "
-        f"REGLA CRUCIAL: Si los datos provistos en el json del contexto son vacíos parciales o nulos (ej. {{}}), DEBES NEGARTE a generar un veredicto de invencion. Responde estrictamente con: 'DATOS INSUFICIENTES'. "
+        f"REGLA CRUCIAL: Si los datos provistos en el json del contexto son vacíos parciales o nulos (ej. {{}}), DEBES NEGARTE a generar un veredicto de invencion. Responde estrictamente con: 'DATOS INSUFICIENTES' (Excepción: Para ETFs o Bonos, es normal que falten métricas de valoración corporativa como el PER, en estos casos NUNCA respondas DATOS INSUFICIENTES, evalúa en base a los rendimientos históricos e AUM). "
         f"{restricciones} "
         f"Estructura obligatoria:\n🎯 <b>Tesis:</b> [1 frase]\n\n📊 <b>Datos:</b>\n• [Dato 1]\n• [Dato 2]\n\n⚖️ <b>Veredicto:</b> [1 frase]\n"
         f"Sigue este ejemplo:\n{ejemplo}"
@@ -1909,17 +1913,22 @@ def _formatear_resultado_tabla(datos: dict, clase_activo: str) -> str:
         if datos.get("sector"):
             lineas.append(f"  • Subsector: <b>{datos['sector']}</b>")
     elif clase_activo == "ETF":
-        if datos.get("ter_pct") not in (None, "N/A"):
-            lineas.append(f"  • TER anual: <b>{datos['ter_pct']}%</b>")
-        if datos.get("aum_bn"):
-            lineas.append(f"  • AUM: <b>{datos['aum_bn']} Bn USD</b>")
-        if datos.get("div_yield_pct"):
-            lineas.append(f"  • Dividend Yield: <b>{datos['div_yield_pct']}%</b>")
+        ter = datos.get("ter_pct")
+        if ter not in (None, "N/A", ""):
+            lineas.append(f"  • TER anual: <b>{ter}%</b>")
+        aum = datos.get("aum_bn")
+        if aum not in (None, "", 0):
+            lineas.append(f"  • AUM: <b>{aum} Bn USD</b>")
+        div = datos.get("div_yield_pct")
+        if div not in (None, "", 0):
+            lineas.append(f"  • Dividend Yield: <b>{div}%</b>")
     elif clase_activo == "CRIPTO":
-        if datos.get("market_cap_bn"):
-            lineas.append(f"  • Market Cap: <b>{datos['market_cap_bn']} Bn USD</b>")
-        if datos.get("nombre"):
-            lineas.append(f"  • Nombre: <b>{datos['nombre']}</b>")
+        cap = datos.get("market_cap_bn")
+        if cap not in (None, "", 0):
+            lineas.append(f"  • Market Cap: <b>{cap} Bn USD</b>")
+        nom = datos.get("nombre")
+        if nom not in (None, ""):
+            lineas.append(f"  • Nombre: <b>{nom}</b>")
     elif clase_activo == "BONO":
         if datos.get("ytm_proxy_pct"):
             lineas.append(f"  • YTM / Cupón: <b>{datos['ytm_proxy_pct']}%</b>")
@@ -3704,6 +3713,9 @@ async def _nl_navegar(navegar_a: dict, update, context) -> bool:
         "educacion":     "menu_educacion",
         "tutorial":      "menu_educacion",
         "tutoriales":    "menu_educacion",
+        "menu":          "volver_menu",
+        "principal":     "volver_menu",
+        "inicio":        "volver_menu",
         "exportar_csv":  "cartera_csv",
         "exportar_pdf":  "cartera_pdf",
         "tutorial_acciones": "tutorial_acciones",

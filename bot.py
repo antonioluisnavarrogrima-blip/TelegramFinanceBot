@@ -955,8 +955,8 @@ def _chequear_fundamentales_etf(ticker: str, info: dict, filtros_extra: list) ->
                     if div_yield == 0:
                         continue # Asumimos ETF de acumulación y eximimos el filtro
                     if not OPS.get(f["operador"], operator.ge)(div_yield * 100, f["valor"]): return None
-                elif f["metrica"] in ("per", "crecimiento_ingresos", "per_futuro", "precio_ventas"):
-                    continue # Exención de filtros de equity
+                elif f["metrica"] in ("per", "crecimiento_ingresos", "per_futuro", "precio_ventas", "rendimiento"):
+                    continue # Exención de filtros de equity y rendimiento (se evalúa al final)
                 else:
                     logger.warning(f"[ETF] Ignorando métrica incompatible o no soportada nativamente: {f['metrica']}")
             except Exception as e:
@@ -1556,15 +1556,26 @@ async def _pipeline_hibrido_interno(
         # La IA detectó un periodo explícito → usarlo para TODAS las clases
         temporalidad = temporalidad_extractor
         logger.info(f"[PIPELINE] Temporalidad detectada por extractor: {temporalidad}")
-    elif clase_activo == "ACCION":
-        # Fallback a filtros_dinamicos si no hay campo top-level
-        temporalidad = filtros.get("temporalidad", "3mo")
 
     rendimiento_objetivo = 0.0
     rendimiento_op = operator.ge
+    
+    # Aplicar objetivos de rendimiento para TODAS las clases
     if clase_activo == "ACCION":
+        if not temporalidad_extractor:
+            temporalidad = filtros.get("temporalidad", "3mo")
         rendimiento_objetivo = filtros.get("rendimiento_objetivo", 0.0)
         rendimiento_op = filtros.get("rendimiento_op", operator.ge)
+    else:
+        for f in filtros_dinamicos_raw:
+            met = f.get("metrica", "").lower()
+            if "rendimiento" in met:
+                try:
+                    rendimiento_objetivo = float(f.get("valor", 0.0))
+                    rendimiento_op = OPS.get(f.get("operador", ""), operator.ge)
+                    if not temporalidad_extractor and f.get("temporalidad"):
+                        temporalidad = f.get("temporalidad")
+                except (ValueError, TypeError): pass
 
     if msg_espera:
         try:

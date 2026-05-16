@@ -312,7 +312,7 @@ CLASES válidas: ACCION|REIT|ETF|CRIPTO|BONO
 MÉTRICAS: {"ACCION":["per","rendimiento","dividendo_porcentaje","dividendo_absoluto","roe","margen_beneficio","beta","deuda_capital","crecimiento_ingresos"],"REIT":["p_ffo","dividend_yield","ocupacion","ltv"],"ETF":["ter","aum","dividend_yield","rendimiento"],"CRIPTO":["rendimiento","market_cap"],"BONO":["dividend_yield","rendimiento","duracion"]}
 TRADUCCIONES: {"PER bajo":{"metrica":"per","operador":"<","valor":45},"dividendo alto":{"metrica":"dividendo_porcentaje","operador":">","valor":4},"dividendo estable":{"metrica":"dividendo_porcentaje","operador":">","valor":2},"alta rentabilidad":{"metrica":"roe","operador":">","valor":45},"deuda baja":{"metrica":"deuda_capital","operador":"<","valor":50},"estable":{"metrica":"beta","operador":"<","valor":0.8},"crecimiento agresivo":{"metrica":"crecimiento_ingresos","operador":">","valor":20},"alcista":{"metrica":"rendimiento","operador":">","valor":0},"bajista":{"metrica":"rendimiento","operador":"<","valor":0}}
 REGLAS: sector siempre lleno ("tecnologia","energia","general"...). Perfil: "Seguro"|"Riesgo"|"Balanceado". Extrae tickers_excluidos si el usuario pide descartar activos.
-TEMPORALIDAD DEL GRÁFICO: Si el usuario menciona un periodo temporal extrae temporalidad: "1mo"|"3mo"|"6mo"|"1y". Default "3mo".
+TEMPORALIDAD DEL GRÁFICO: Si el usuario menciona un periodo (ej. "anual" o "1 año" -> "1y", "mensual" -> "1mo", "semestral" -> "6mo") extrae temporalidad: "1mo"|"3mo"|"6mo"|"1y". Default "3mo".
 
 INTENCION: Detecta la intención principal del mensaje y rellena el campo intencion:
 - "BUSQUEDA": quiere buscar/analizar activos (comportamiento normal).

@@ -70,7 +70,7 @@ try:
         logger.info(f"Inicializando Gemini con Proxy: {GEMINI_PROXY_URL}")
         client = genai.Client(
             api_key=GEMINI_API_KEY,
-            http_options=types.HttpOptions(base_url=GEMINI_PROXY_URL)
+            http_options={"base_url": GEMINI_PROXY_URL}
         )
     else:
         # El cliente de Gemini v2 soporta async nativo si se requiere

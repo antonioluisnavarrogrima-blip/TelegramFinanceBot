@@ -1,0 +1,111 @@
+name: AI Self-Healing & Feedback Update
+
+on:
+  repository_dispatch:
+    types: [ai-feedback]
+
+permissions:
+  contents: write
+
+jobs:
+  apply-ai-changes:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # Necesitamos el historial completo para el rollback
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install google-genai
+
+      # 1. Guarda el commit SHA antes de los cambios por si falla Render
+      - name: Save Previous Commit SHA
+        id: pre_ai
+        run: echo "PREV_SHA=$(git rev-parse HEAD)" >> $GITHUB_ENV
+
+      # 2. Ejecutar IA (Barrera 1 - Auto-Corrección Local en el script)
+      - name: Run AI Code Modifier
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          USER_FEEDBACK: ${{ github.event.client_payload.feedback }}
+          GEMINI_MODEL: "gemini-3.1-pro" # Forzamos el uso del modelo 3.1 Pro High solicitado
+        run: |
+          python automatizacionIA/apply_feedback.py
+
+      # 3. MODO AUTÓNOMO: Push directo a main
+      - name: Commit & Push Changes
+        run: |
+          git config --global user.name "AI Self-Healing Bot"
+          git config --global user.email "ai@botfinanzas.local"
+          git add bot.py database.py automatizacionIA/ Procfile requirements.txt || true
+          if git diff --staged --quiet; then
+            echo "No changes made by AI."
+            exit 0
+          fi
+          git commit -m "🤖 [AI Autonomous Update] Feedback: '${{ github.event.client_payload.feedback }}'"
+          git push
+
+      # 4. BARRERA 2: Esperar a Render y hacer Healthcheck
+      - name: Wait for Render Deployment & Healthcheck
+        id: healthcheck
+        run: |
+          echo "Esperando 90 segundos para dar tiempo a Render a arrancar el nuevo código..."
+          sleep 90
+          
+          # Hacemos pings al endpoint /ping durante máximo 2 minutos
+          MAX_RETRIES=12
+          RETRY_INTERVAL=10
+          SUCCESS=false
+          
+          for i in $(seq 1 $MAX_RETRIES); do
+            echo "Healthcheck intento $i..."
+            # La variable RENDER_EXTERNAL_URL debe estar en los Secrets de Github
+            HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" ${{ secrets.RENDER_EXTERNAL_URL }}/ping || echo "failed")
+            if [ "$HTTP_STATUS" = "200" ]; then
+              echo "✅ El bot ha revivido correctamente tras la actualización."
+              SUCCESS=true
+              break
+            fi
+            echo "El servidor respondió $HTTP_STATUS. Esperando $RETRY_INTERVAL s..."
+            sleep $RETRY_INTERVAL
+          done
+          
+          if [ "$SUCCESS" = false ]; then
+            echo "❌ El healthcheck falló. La aplicación no levanta. Procediendo a Rollback."
+            exit 1 # Esto lanza el status "failure()" para el siguiente paso
+          fi
+
+      # 5. BARRERA 3: Rollback Automático (Emergencia)
+      - name: Emergency Rollback
+        if: failure()
+        run: |
+          echo "⚠️ Iniciando Rollback de emergencia a $PREV_SHA..."
+          git reset --hard $PREV_SHA
+          git push --force origin main
+          echo "Rollback completado. Render redesplegará la versión anterior estable."
+
+      # 6. Notificar al Telegram
+      - name: Send Telegram Notification
+        if: always()
+        run: |
+          STATUS="${{ job.status }}"
+          if [ "$STATUS" = "success" ]; then
+            MESSAGE="🤖 <b>¡Actualización Autónoma Exitosa!</b><br><br>He aplicado el feedback: <i>\"${{ github.event.client_payload.feedback }}\"</i>.<br>El bot se reinició correctamente en Render y está activo."
+          else
+            MESSAGE="⚠️ <b>Fallo Crítico detectado</b><br><br>Tu feedback: <i>\"${{ github.event.client_payload.feedback }}\"</i> provocó un fallo al compilar o al desplegar en Render.<br>🛡️ <b>He ejecutado el Rollback de emergencia</b> y restaurado la versión antigua a salvo."
+          fi
+          
+          curl -s -X POST "https://api.telegram.org/bot${{ secrets.TELEGRAM_TOKEN }}/sendMessage" \
+            -d "chat_id=${{ github.event.client_payload.user_id }}" \
+            -d "parse_mode=HTML" \
+            -d "text=$MESSAGE"

@@ -319,17 +319,17 @@ INTENCION: Detecta la intención principal del mensaje y rellena el campo intenc
 - "ALERTA_PRECIO": quiere crear una alerta de precio (stop-loss o take-profit). Rellena alerta_precio. Si falta el ticker, extrae la intención igual y déjalo vacío.
 - "BORRAR_ALERTA": quiere borrar o eliminar una alerta existente. Rellena borrar_alerta.
 - "CONFIGURAR_ALERTA": quiere cambiar la frecuencia o activar/desactivar sus alertas automáticas. Rellena configurar_alerta.
-- "VER_MENU": quiere navegar a una sección o ejecutar una acción global (cartera, screeners, alertas, plan, configuracion, macro, educacion, tutorial, tutoriales, exportar_csv, exportar_pdf, tutorial_acciones, etc). Rellena navegar_a.
+- "VER_MENU": quiere navegar a una sección. **IMPORTANTE: Si el usuario usa palabras como "menú", "tutoriales", "educación", "configuración", "macro", "alertas", su intención es VER_MENU**. Rellena navegar_a con el destino correspondiente (ej. "educacion", "menu", "configuracion"). ¡NUNCA evalúes "tutoriales" como una búsqueda de activos!
 - "GESTIONAR_CARTERA": quiere añadir o quitar un ticker específico de su cartera. Rellena gestionar_cartera.
 Si hay duda entre BUSQUEDA y otra intención, prioriza la otra intención cuando el usuario usa verbos como: pon, crea, borra, quita, añade, exporta, configura, activa, desactiva, lleváme, muestra mi.
 
 Ejemplos:
+"llevame a tutoriales" → intencion=VER_MENU, navegar_a={destino:educacion}
+"llévame a menú" → intencion=VER_MENU, navegar_a={destino:menu}
 "pon un stop loss a Tesla a 200€" → intencion=ALERTA_PRECIO, alerta_precio={ticker:TSLA, tipo:stop_loss, precio:200}
 "añade apple a mi cartera" → intencion=GESTIONAR_CARTERA, gestionar_cartera={accion:ADD, ticker:AAPL}
 "exporta mi cartera a pdf" → intencion=VER_MENU, navegar_a={destino:exportar_pdf}
-"quiero ver mis alertas de Microsoft" → intencion=VER_MENU, navegar_a={destino:alertas, filtro_ticker:MSFT}
-"borra mi alerta de AAPL" → intencion=BORRAR_ALERTA, borrar_alerta={ticker:AAPL}
-error_api: dejar SIEMPRE vacío ("") salvo que la solicitud sea completamente ajena a finanzas."""
+error_api: dejar SIEMPRE vacío ("") salvo que la solicitud sea completamente ajena a finanzas o sea un troll."""
 
 async def extractor_intenciones(prompt_del_inversor: str) -> dict | None:
     """Extrae parámetros para búsqueda determínistica v4.5 — prompt compacto (-60% tokens)."""
@@ -1089,12 +1089,13 @@ class ExtractorFMP(ExtractorBase):
 # Clases de activo que REQUIEREN fundamentales (PER, dividendo...) para el filtrado
 _CLASES_CON_FUNDAMENTALES = {"ACCION", "REIT", "ETF", "BONO"}
 
-async def _obtener_info_bulk(tickers: list[str], clase: str) -> dict:
+async def _obtener_info_bulk(tickers: list[str], clase: str, es_plus: bool = False) -> dict:
     require_fundamentals = clase.upper() in _CLASES_CON_FUNDAMENTALES
-    cached = await db.obtener_yf_cache_bulk(tickers, require_fundamentals=require_fundamentals)
+    # Permite datos stale de la BD (si es Free), que luego se actualizan con precios del WebSocket.
+    cached = await db.obtener_yf_cache_bulk(tickers, require_fundamentals=require_fundamentals, allow_stale=not es_plus)
 
     # Inyectar datos en tiempo real del WebSocket si están disponibles
-    import websocket_client
+    faltantes_ws = []
     for t in tickers:
         ws_key = t.upper().replace("-USD", "USDT").replace("-", "")
         datos_ws = websocket_client.cache_precios.get(ws_key) or websocket_client.cache_precios.get(t.upper())
@@ -1104,6 +1105,12 @@ async def _obtener_info_bulk(tickers: list[str], clase: str) -> dict:
                 cached[t.upper()]["regularMarketPrice"] = precio
             elif not require_fundamentals:
                 cached[t.upper()] = {"regularMarketPrice": precio, "price": precio, "_fuente": "WebSocket"}
+        else:
+            faltantes_ws.append(t)
+
+    # Disparar suscripción dinámica a WebSockets para los tickers faltantes en caché real-time
+    if faltantes_ws:
+        websocket_client.suscribir_a_tickers(faltantes_ws)
 
     faltantes = [t for t in tickers if t.upper() not in cached]
     if faltantes:
@@ -1332,6 +1339,9 @@ async def _pipeline_hibrido_interno(
     La fase NLP ya se ejecutó en pipeline_hibrido() fuera del semáforo.
     Retorna SIEMPRE 4 valores: (texto_final, ruta_grafico, url_compra, ticker_final)
     """
+    usuario = await db.obtener_usuario(tid) if tid else None
+    es_plus = (usuario.get("plan", "free") != "free") if usuario else False
+
     if extraccion and extraccion.get("error_api"):
         tiene_tickers = bool(extraccion.get("tickers_manuales") or extraccion.get("tickers"))
         if tiene_tickers:
@@ -1481,7 +1491,7 @@ async def _pipeline_hibrido_interno(
                 "div_abs_op":  filtros["div_abs_op"],
                 "filtros_extra": list(filtros["filtros_extra"]),
             }
-            datos_bulk = await _obtener_info_bulk(tickers, "ACCION")
+            datos_bulk = await _obtener_info_bulk(tickers, "ACCION", es_plus=es_plus)
             if datos_bulk.get("_RATE_LIMIT_HIT"):
                 return "⚠️ Servicio de datos temporalmente no disponible. Por favor, espere.", None, None, None
 
@@ -1499,7 +1509,7 @@ async def _pipeline_hibrido_interno(
                 break
 
     elif clase_activo == "REIT":
-        datos_bulk = await _obtener_info_bulk(tickers, "REIT")
+        datos_bulk = await _obtener_info_bulk(tickers, "REIT", es_plus=es_plus)
         if datos_bulk.get("_RATE_LIMIT_HIT"):
             return "⚠️ Servicio de datos temporalmente no disponible. Por favor, espere.", None, None, None
         resultados = [_chequear_fundamentales_reit(t, datos_bulk.get(t, {}), filtros_dinamicos_raw) for t in tickers]
@@ -1507,7 +1517,7 @@ async def _pipeline_hibrido_interno(
         logger.info(f"[REIT] pre_ganadores={len(pre_ganadores)}/{len(tickers)} -> {[g['ticker'] for g in pre_ganadores]}")
 
     elif clase_activo == "ETF":
-        datos_bulk = await _obtener_info_bulk(tickers, "ETF")
+        datos_bulk = await _obtener_info_bulk(tickers, "ETF", es_plus=es_plus)
         if datos_bulk.get("_RATE_LIMIT_HIT"):
             return "⚠️ Servicio de datos temporalmente no disponible. Por favor, espere.", None, None, None
         resultados = [_chequear_fundamentales_etf(t, datos_bulk.get(t, {}), filtros_dinamicos_raw) for t in tickers]
@@ -1515,7 +1525,7 @@ async def _pipeline_hibrido_interno(
         logger.info(f"[ETF] pre_ganadores={len(pre_ganadores)}/{len(tickers)} -> {[g['ticker'] for g in pre_ganadores]}")
 
     elif clase_activo == "CRIPTO":
-        datos_bulk = await _obtener_info_bulk(tickers, "CRIPTO")
+        datos_bulk = await _obtener_info_bulk(tickers, "CRIPTO", es_plus=es_plus)
         if datos_bulk.get("_RATE_LIMIT_HIT"):
             return "⚠️ Servicio de datos temporalmente no disponible. Por favor, espere.", None, None, None
         resultados = [_chequear_fundamentales_cripto(t, datos_bulk.get(t, {}), filtros_dinamicos_raw) for t in tickers]
@@ -1523,7 +1533,7 @@ async def _pipeline_hibrido_interno(
         logger.info(f"[CRIPTO] pre_ganadores={len(pre_ganadores)}/{len(tickers)} -> {[g['ticker'] for g in pre_ganadores]}")
 
     elif clase_activo == "BONO":
-        datos_bulk = await _obtener_info_bulk(tickers, "BONO")
+        datos_bulk = await _obtener_info_bulk(tickers, "BONO", es_plus=es_plus)
         if datos_bulk.get("_RATE_LIMIT_HIT"):
             return "⚠️ Servicio de datos temporalmente no disponible. Por favor, espere.", None, None, None
         resultados = [_chequear_fundamentales_bono(t, datos_bulk.get(t, {}), filtros_dinamicos_raw) for t in tickers]
@@ -1769,7 +1779,8 @@ async def _pipeline_hibrido_interno(
 async def _pipeline_por_tabla(
     clase_activo: str,
     filtros_tabla: dict,
-    msg_espera=None
+    msg_espera=None,
+    tid: int | None = None
 ) -> tuple[str | None, bytes | None, str | None]:
     """Screener determinístico sin IA. Retorna (texto, bytes_grafico, ticker)."""
     clase_activo = clase_activo.upper()
@@ -1782,6 +1793,9 @@ async def _pipeline_por_tabla(
         tickers = await db.obtener_semillas_busqueda(clase_activo)
     if not tickers:
         return "❌ No hay activos registrados para esa categoría.", None, None
+
+    usuario = await db.obtener_usuario(tid) if tid else None
+    es_plus = (usuario.get("plan", "free") != "free") if usuario else False
 
     if msg_espera:
         try:
@@ -1801,7 +1815,7 @@ async def _pipeline_por_tabla(
             "temporalidad": "3mo", "ignorar_per_estricto": per_max >= 9999,
             "filtros_extra": [{"key": "beta", "op": operator.le, "val": beta_max}] if beta_max < 99 else [],
         }
-        datos_bulk = await _obtener_info_bulk(tickers, "ACCION")
+        datos_bulk = await _obtener_info_bulk(tickers, "ACCION", es_plus=es_plus)
         if datos_bulk.get("_RATE_LIMIT_HIT"):
             return "⚠️ Servicio de datos temporalmente no disponible. Por favor, espere.", None, None, None
         resultados = [_chequear_fundamentales_accion(t, datos_bulk.get(t, {}), filtros_a) for t in tickers]
@@ -1815,7 +1829,7 @@ async def _pipeline_por_tabla(
         p_ffo_max = float(filtros_tabla.get("p_ffo_max", 999))
         fe = [{"metrica": "dividend_yield", "operador": ">=", "valor": div_min},
               {"metrica": "p_ffo",           "operador": "<=", "valor": p_ffo_max}]
-        datos_bulk = await _obtener_info_bulk(tickers, "REIT")
+        datos_bulk = await _obtener_info_bulk(tickers, "REIT", es_plus=es_plus)
         if datos_bulk.get("_RATE_LIMIT_HIT"):
             return "⚠️ Servicio de datos temporalmente no disponible. Por favor, espere.", None, None, None
         resultados = [_chequear_fundamentales_reit(t, datos_bulk.get(t, {}), fe) for t in tickers]
@@ -1829,7 +1843,7 @@ async def _pipeline_por_tabla(
         aum_min = float(filtros_tabla.get("aum_min_bn", 0)) * 1e9
         fe = [{"metrica": "ter", "operador": "<=", "valor": ter_max},
               {"metrica": "aum", "operador": ">=", "valor": aum_min}]
-        datos_bulk = await _obtener_info_bulk(tickers, "ETF")
+        datos_bulk = await _obtener_info_bulk(tickers, "ETF", es_plus=es_plus)
         if datos_bulk.get("_RATE_LIMIT_HIT"):
             return "⚠️ Servicio de datos temporalmente no disponible. Por favor, espere.", None, None, None
         resultados = [_chequear_fundamentales_etf(t, datos_bulk.get(t, {}), fe) for t in tickers]
@@ -1843,7 +1857,7 @@ async def _pipeline_por_tabla(
         fe = []
         if mcap_min > 0:
             fe.append({"metrica": "market_cap", "operador": ">=", "valor": mcap_min})
-        datos_bulk = await _obtener_info_bulk(tickers, "CRIPTO")
+        datos_bulk = await _obtener_info_bulk(tickers, "CRIPTO", es_plus=es_plus)
         if datos_bulk.get("_RATE_LIMIT_HIT"):
             return "⚠️ Servicio de datos temporalmente no disponible. Por favor, espere.", None, None, None
         resultados = [_chequear_fundamentales_cripto(t, datos_bulk.get(t, {}), fe) for t in tickers]
@@ -1855,7 +1869,7 @@ async def _pipeline_por_tabla(
     elif clase_activo == "BONO":
         ytm_min = float(filtros_tabla.get("ytm_min", 0))
         fe = [{"metrica": "dividend_yield", "operador": ">=", "valor": ytm_min}]
-        datos_bulk = await _obtener_info_bulk(tickers, "BONO")
+        datos_bulk = await _obtener_info_bulk(tickers, "BONO", es_plus=es_plus)
         if datos_bulk.get("_RATE_LIMIT_HIT"):
             return "⚠️ Servicio de datos temporalmente no disponible. Por favor, espere.", None, None, None
         resultados = [_chequear_fundamentales_bono(t, datos_bulk.get(t, {}), fe) for t in tickers]
@@ -4181,6 +4195,16 @@ telegram_app = (
 telegram_app.add_handler(CommandHandler("start", comando_start))
 telegram_app.add_handler(CommandHandler("menu", comando_menu))
 telegram_app.add_handler(CallbackQueryHandler(manejador_botones))
+
+async def global_error_handler(update, context):
+    import traceback
+    logger.error(f'UNHANDLED TELEGRAM ERROR: {context.error}')
+    logger.error(traceback.format_exc())
+    if update and update.effective_message:
+        await update.effective_message.reply_text('⚠️ Ocurrió un error interno muy grave. Revisa los logs.')
+
+telegram_app.add_error_handler(global_error_handler)
+
 telegram_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, conversacion_inversor))
 
 
@@ -4640,6 +4664,70 @@ telegram_app.add_handler(CommandHandler("webhook", comando_webhook))
 telegram_app.add_handler(CommandHandler("sentimiento", comando_sentimiento))
 telegram_app.add_handler(CommandHandler("backtest", comando_backtest))
 
+# ── COMANDO /feedback (Auto-Actualizador IA) ──────────────────────────────────
+async def comando_feedback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Recibe feedback del usuario y dispara el workflow de GitHub Actions
+    para que la IA modifique el bot autónomamente.
+    """
+    tid = update.effective_user.id
+    
+    # 1. Verificación de cuota de feedback (1 cada 10 peticiones)
+    tiene_cuota = await db.gestionar_cuota_feedback(tid)
+    if not tiene_cuota:
+        await update.message.reply_text(
+            "🔒 <b>Feedback no disponible.</b>\n\n"
+            "Para poder enviar una sugerencia al sistema de IA necesitas usar más el bot. "
+            "Actualmente permitimos enviar 1 sugerencia por cada 10 peticiones de análisis realizadas.",
+            parse_mode="HTML"
+        )
+        return
+
+    # 2. Procesamiento del feedback
+    feedback = " ".join(context.args)
+    
+    if not feedback:
+        await update.message.reply_text(
+            "❌ <b>Falta el feedback.</b>\nUso: <code>/feedback [tu sugerencia]</code>\n\n"
+            "<i>Ejemplo: /feedback Añade un comando /mis_alertas que muestre una lista.</i>",
+            parse_mode="HTML"
+        )
+        return
+        
+    await update.message.reply_text(
+        "🧠 <b>Analizando feedback...</b>\n\nHe enviado tu sugerencia a la IA Autónoma (Gemini 3.1 Pro High). "
+        "Si el código pasa las pruebas de sintaxis y los healthchecks, el bot se auto-actualizará en unos minutos.",
+        parse_mode="HTML"
+    )
+    
+    # Disparar Github Action Repository Dispatch
+    github_token = os.getenv("GITHUB_TOKEN")
+    github_repo = os.getenv("GITHUB_REPO") # Formato: usuario/repositorio
+    
+    if github_token and github_repo:
+        url = f"https://api.github.com/repos/{github_repo}/dispatches"
+        headers = {
+            "Accept": "application/vnd.github.v3+json",
+            "Authorization": f"token {github_token}",
+            "User-Agent": "BotFinanzas-Feedback-Agent"
+        }
+        payload = {
+            "event_type": "ai-feedback",
+            "client_payload": {
+                "feedback": feedback,
+                "user_id": str(tid)
+            }
+        }
+        try:
+            # Lanzarlo en background para no bloquear a Telegram
+            asyncio.create_task(http_client.post(url, headers=headers, json=payload, timeout=5.0))
+        except Exception as e:
+            logger.error(f"[FEEDBACK] Error llamando a GitHub: {e}")
+    else:
+        logger.warning("[FEEDBACK] Falta GITHUB_TOKEN o GITHUB_REPO en el entorno de Render.")
+
+telegram_app.add_handler(CommandHandler("feedback", comando_feedback))
+
 # ── COMANDO /help ─────────────────────────────────────────────────────────────
 
 async def comando_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -4676,8 +4764,6 @@ async def comando_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Free: hasta 5 activos · Plus/Pro: ilimitado + CSV y PDF\n\n"
 
         "━━━ 🏆 <b>ANÁLISIS AVANZADO</b> (Plus/Pro) ━━━\n"
-        "/valor TICKER → Valoración por DCF (Descuento de Flujo de Caja)\n"
-        "  <i>Ejemplo: /valor MSFT</i>\n\n"
         "/prediccion TICKER → Análisis técnico IA (RSI, MACD, Bollinger) (Pro)\n"
         "  <i>Ejemplo: /prediccion TSLA</i>\n\n"
         "/insider TICKER → Movimientos de directivos e insiders (Pro)\n"
@@ -4906,6 +4992,9 @@ async def lifespan(app: FastAPI):
     asyncio.create_task(cron_alertas_precio_loop())
     asyncio.create_task(higiene_db_loop())
     asyncio.create_task(cron_informe_semanal_loop())
+    asyncio.create_task(mantener_supabase_vivo())
+    asyncio.create_task(cron_limpiar_planes_loop())
+
     
     # Pre-calentar el crumb de Financial Modeling Prep antes de que llegue tráfico de usuarios.
     logger.info("[LIFESPAN] Inicializando bot de Telegram...")
@@ -4990,6 +5079,14 @@ async def ping():
                 logger.info(f"[PING] Webhook restaurado a: {webhook_url}")
     except Exception as e:
         logger.error(f"[PING] Error verificando webhook: {e}")
+        
+    try:
+        pool = db._get_pool()
+        if pool:
+            await pool.execute("SELECT 1;")
+    except Exception as e:
+        logger.error(f"[PING] Error ping base de datos: {e}")
+        
     return {"ok": True, "ts": time.time()}
 
 @web_app.get("/health")
@@ -5448,14 +5545,19 @@ async def cron_informe_semanal_loop():
     while True:
         try:
             ahora = datetime.datetime.now()
-            # Domingo a las 10:00 AM (hora local del servidor)
-            if ahora.weekday() == 6 and ahora.hour == 10:
-                logger.info("[CRON SEMANAL] Iniciando generación de informes dominicales...")
+            semana_actual = ahora.isocalendar()[1]
+            
+            # Recuperar última semana enviada desde la base de datos
+            ultima_semana = await db.obtener_estado_bot("ultima_semana_informe")
+            ultima_semana = int(ultima_semana) if ultima_semana else -1
+            
+            # Domingo, a partir de las 10:00 AM, y si no se ha enviado esta semana (persistencia robusta)
+            if ahora.weekday() == 6 and ahora.hour >= 10 and ultima_semana != semana_actual:
+                logger.info(f"[CRON SEMANAL] Iniciando generación de informes dominicales (Semana {semana_actual})...")
                 await generar_y_enviar_informes_semanales()
-                # Dormir 1 hora para no repetir en el mismo bloque horario
-                await asyncio.sleep(3600)
-            else:
-                await asyncio.sleep(3600) # Verificar cada hora
+                await db.guardar_estado_bot("ultima_semana_informe", str(semana_actual))
+            
+            await asyncio.sleep(3600)
         except asyncio.CancelledError:
             break
         except Exception as e:
@@ -5532,7 +5634,7 @@ async def generar_y_enviar_informes_semanales():
                 else:
                     texto_informe += "\n\n🐳 <i>Sin movimientos de directivos significativos esta semana.</i>"
 
-            texto_informe += "\n\n<i>Usa /cartera para detalles o /valor [TICKER] para análisis DCF.</i>"
+            texto_informe += "\n\n<i>Accede a Mi Cartera desde el menú principal para más detalles.</i>"
 
             await telegram_app.bot.send_message(chat_id=tid, text=texto_informe, parse_mode="HTML")
             await asyncio.sleep(0.5)
@@ -5541,6 +5643,63 @@ async def generar_y_enviar_informes_semanales():
             logger.error(f"[INFORME SEMANAL] Error procesando usuario {tid}: {e}")
 
 
+
+async def mantener_supabase_vivo():
+    """Corrutina para mantener la conexión a Supabase viva con un ping cada 1h."""
+    logger.info("[KEEPALIVE] Iniciando ping preventivo a Supabase (cada 1h)...")
+    while True:
+        try:
+            # Enviar un ping ligero a la base de datos de forma correcta
+            pool = db._get_pool()
+            await pool.execute("SELECT 1;")
+            logger.info("[KEEPALIVE] Ping preventivo enviado a Supabase con éxito.")
+        except Exception as e:
+            logger.error(f"[KEEPALIVE] Error en ping preventivo a Supabase: {e}")
+        
+        # Esperar 1 hora (3600 segundos) en lugar de 24h
+        await asyncio.sleep(3600)
+
+async def cron_limpiar_planes_loop():
+    """Bucle interno para validar y degradar suscripciones expiradas automáticamente (cada 6 horas)."""
+    logger.info("[CRON PLANES] Iniciando loop de limpieza de suscripciones (cada 6h)...")
+    while True:
+        try:
+            # 1. Enviar avisos de 24 horas a los que estén por caducar
+            ids_avisos = await db.marcar_avisos_renovacion_pendientes()
+            for tid_aviso in ids_avisos:
+                try:
+                    await telegram_app.bot.send_message(
+                        chat_id=tid_aviso,
+                        text=(
+                            "⚠️ <b>¡Tu suscripción expira en menos de 24 horas!</b>\n\n"
+                            "Renueva ahora desde /plan para no perder el acceso a la IA avanzada y tu informe semanal."
+                        ),
+                        parse_mode="HTML"
+                    )
+                except Exception as e_aviso:
+                    logger.warning(f"[CRON-PLANES] No se pudo enviar aviso de 24h a {tid_aviso}: {e_aviso}")
+
+            # 2. Limpiar las suscripciones que ya caducaron del todo
+            ids_afectados = await db.limpiar_planes_expirados_bulk()
+            for tid_deg in ids_afectados:
+                try:
+                    await telegram_app.bot.send_message(
+                        chat_id=tid_deg,
+                        text=(
+                            "🔔 <b>Tu suscripción ha expirado.</b>\n\n"
+                            "Tu plan ha vuelto a Free. Renueva desde /plan para recuperar "
+                            "el acceso a las funcionalidades premium."
+                        ),
+                        parse_mode="HTML"
+                    )
+                except Exception as e_n:
+                    logger.warning(f"[CRON-PLANES] No se pudo notificar a {tid_deg}: {e_n}")
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            logger.error(f"[CRON PLANES] Error en loop: {e}")
+        
+        await asyncio.sleep(21600)  # Esperar 6 horas
 
 async def higiene_db_loop():
     """Bucle diario para purgar datos obsoletos y mantener la salud de la BD."""

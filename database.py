@@ -126,6 +126,7 @@ async def inicializar_db():
             ("plan_expira",              "ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS plan_expira FLOAT"),
             ("webhook_url",              "ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS webhook_url TEXT"),
             ("webhook_token",            "ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS webhook_token TEXT"),
+            ("aviso_renovacion_enviado", "ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS aviso_renovacion_enviado BOOLEAN NOT NULL DEFAULT FALSE"),
         ]
         for _col, ddl in columnas_extra:
             try:
@@ -224,8 +225,25 @@ async def inicializar_db():
         """)
 
     
+        # ── Tabla de Estadísticas de Feedback ──────────────────────────
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS feedback_stats (
+                user_id BIGINT PRIMARY KEY REFERENCES usuarios(id) ON DELETE CASCADE,
+                peticiones_hechas INTEGER NOT NULL DEFAULT 0,
+                feedback_enviado INTEGER NOT NULL DEFAULT 0
+            )
+        """)
+
+        # ── Tabla de Estado Global del Bot ───────────────────────────────────
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS bot_state (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            )
+        """)
+
         # ── RLS y Seguridad por DEFECTO ──────────────────────────────────────
-        tablas = ["usuarios", "semillas", "stripe_eventos", "yf_cache", "alertas_precio"]
+        tablas = ["usuarios", "semillas", "stripe_eventos", "yf_cache", "alertas_precio", "feedback_stats", "bot_state"]
         for t in tablas:
             try:
                 await conn.execute(f"ALTER TABLE {t} ENABLE ROW LEVEL SECURITY;")
@@ -378,6 +396,15 @@ async def restar_credito(tid: int):
     async with pool.acquire() as conn:
         await conn.execute(
             "UPDATE usuarios SET creditos = GREATEST(creditos - 1, 0) WHERE id = $1", tid
+        )
+        await conn.execute(
+            """
+            INSERT INTO feedback_stats (user_id, peticiones_hechas, feedback_enviado)
+            VALUES ($1, 1, 0)
+            ON CONFLICT (user_id) DO UPDATE 
+            SET peticiones_hechas = feedback_stats.peticiones_hechas + 1
+            """, 
+            tid
         )
 
 
@@ -560,6 +587,40 @@ async def obtener_broker_url(tid: int) -> str | None:
         row = await conn.fetchrow("SELECT broker_url FROM usuarios WHERE id = $1", tid)
     return row["broker_url"] if row else None
 
+
+async def gestionar_cuota_feedback(tid: int) -> bool:
+    """
+    Verifica si el usuario tiene cuota para enviar feedback (1 por cada 10 peticiones).
+    Si tiene cuota, suma 1 al feedback_enviado y devuelve True.
+    Si no, devuelve False.
+    """
+    pool = _get_pool()
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """
+            INSERT INTO feedback_stats (user_id, peticiones_hechas, feedback_enviado)
+            VALUES ($1, 0, 0)
+            ON CONFLICT (user_id) DO NOTHING
+            """, 
+            tid
+        )
+        row = await conn.fetchrow(
+            "SELECT peticiones_hechas, feedback_enviado FROM feedback_stats WHERE user_id = $1", 
+            tid
+        )
+        if not row:
+            return False
+        peticiones = row["peticiones_hechas"]
+        enviados = row["feedback_enviado"]
+        permitidos_totales = peticiones // 10
+        if enviados < permitidos_totales:
+            await conn.execute(
+                "UPDATE feedback_stats SET feedback_enviado = feedback_enviado + 1 WHERE user_id = $1", 
+                tid
+            )
+            return True
+        else:
+            return False
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # 5. SISTEMA DE ALERTAS CRON
@@ -1255,7 +1316,8 @@ async def activar_suscripcion(tid: int, plan: str, stripe_customer_id: str,
             SET plan = $1,
                 stripe_customer_id = $2,
                 stripe_subscription_id = $3,
-                plan_expira = $4
+                plan_expira = $4,
+                aviso_renovacion_enviado = FALSE
             WHERE id = $5
             """,
             plan, stripe_customer_id, stripe_subscription_id, expira_ts, tid
@@ -1450,3 +1512,49 @@ async def desactivar_alerta_precio(alerta_id: int):
             alerta_id
         )
 
+
+async def marcar_avisos_renovacion_pendientes() -> list[int]:
+    pool = _get_pool()
+    ahora = time.time()
+    limite_24h = ahora + 86400
+    try:
+        async with pool.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                UPDATE usuarios
+                SET aviso_renovacion_enviado = TRUE
+                WHERE plan != 'free'
+                  AND plan_expira IS NOT NULL
+                  AND plan_expira > $1
+                  AND plan_expira <= $2
+                  AND aviso_renovacion_enviado = FALSE
+                RETURNING id
+                """,
+                ahora, limite_24h
+            )
+        ids_afectados = [r["id"] for r in rows]
+        if ids_afectados:
+            import logging
+            logging.getLogger(__name__).info(f"[DB] {len(ids_afectados)} usuarios marcados para aviso de renovación de 24h.")
+        return ids_afectados
+    except Exception as e:
+        import logging
+        logging.getLogger(__name__).error(f"[DB] Error en marcar_avisos_renovacion_pendientes: {e}")
+        return []
+
+async def obtener_estado_bot(key: str) -> str | None:
+    pool = _get_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow("SELECT value FROM bot_state WHERE key = $1", key)
+    return row["value"] if row else None
+
+async def guardar_estado_bot(key: str, value: str):
+    pool = _get_pool()
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """
+            INSERT INTO bot_state (key, value) VALUES ($1, $2)
+            ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value
+            """,
+            key, str(value)
+        )

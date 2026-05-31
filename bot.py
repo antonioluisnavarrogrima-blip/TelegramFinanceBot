@@ -338,6 +338,40 @@ Ejemplos:
 "añade apple a mi cartera" → intencion=GESTIONAR_CARTERA, gestionar_cartera={accion:ADD, ticker:AAPL}
 "exporta mi cartera a pdf" → intencion=VER_MENU, navegar_a={destino:exportar_pdf}
 error_api: dejar SIEMPRE vacío ("") salvo que la solicitud sea completamente ajena a finanzas o sea un troll."""
+async def _llamar_gemini_con_fallback(client, contents, config=None):
+    """Función de contingencia (Self-Healing) que itera sobre una lista de modelos si hay errores de disponibilidad/ubicación."""
+    modelos_fallback = [
+        "gemini-3.5-flash",
+        "gemini-3.1-flash-lite",
+        "gemini-2.5-flash",
+        "gemini-2.5-flash-lite",
+        "gemini-1.5-flash"
+    ]
+    
+    ultimo_error = None
+    for modelo in modelos_fallback:
+        try:
+            kwargs = {"model": modelo, "contents": contents}
+            if config:
+                kwargs["config"] = config
+            res = await client.aio.models.generate_content(**kwargs)
+            return res
+        except Exception as e:
+            error_str = str(e).lower()
+            es_not_found = "404" in str(e) or "not found" in error_str
+            es_location = "400" in str(e) and "location" in error_str
+            if es_not_found or es_location:
+                logger.warning(f"[AUTO-HEAL] Modelo {modelo} falló ({'404 Deprecated' if es_not_found else '400 Geo-Blocked'}). Probando siguiente...")
+                ultimo_error = e
+                continue
+            # Si es otro error (como 429 Rate Limit o de red), no iteramos, lo lanzamos
+            raise e
+            
+    # Si todos fallan por ubicación o deprecación, lanzamos el último error
+    if ultimo_error:
+        raise ultimo_error
+    return None
+
 
 async def extractor_intenciones(prompt_del_inversor: str) -> dict | None:
     """Extrae parámetros para búsqueda determínistica v4.5 — prompt compacto (-60% tokens)."""
@@ -361,8 +395,8 @@ async def extractor_intenciones(prompt_del_inversor: str) -> dict | None:
             del _INTENT_CACHE[intent_hash]
 
     try:
-        res = await client.aio.models.generate_content(
-            model='gemini-3.5-flash',
+        res = await _llamar_gemini_con_fallback(
+            client=client,
             contents=f"{_PROMPT_SISTEMA_EXTRACTOR}\n\n[INPUT USUARIO]: {prompt_del_inversor}",
             config=types.GenerateContentConfig(
                 response_mime_type="application/json",
@@ -586,8 +620,8 @@ async def generador_informe_goldman(ticker: str, sector: str, datos: dict, perfi
     )
 
     try:
-        res = await client.aio.models.generate_content(
-            model='gemini-3.5-flash',  # FIX: Modelo actualizado (1.5-flash-8b fue retirado)
+        res = await _llamar_gemini_con_fallback(
+            client=client,
             contents=(
                 f"{prompt_sistema}\n"
                 f"Perfil:{perfil}|Sector:{sector}|"  # separadores compactos

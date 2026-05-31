@@ -64,9 +64,17 @@ if not TELEGRAM_TOKEN or not GEMINI_API_KEY:
     sys.exit(1)
 
 # --- CLIENTES GLOBALES ---
+GEMINI_PROXY_URL = os.getenv("GEMINI_PROXY_URL", "").strip()
 try:
-    # El cliente de Gemini v2 soporta async nativo si se requiere
-    client = genai.Client(api_key=GEMINI_API_KEY)
+    if GEMINI_PROXY_URL:
+        logger.info(f"Inicializando Gemini con Proxy: {GEMINI_PROXY_URL}")
+        client = genai.Client(
+            api_key=GEMINI_API_KEY,
+            http_options=types.HttpOptions(base_url=GEMINI_PROXY_URL)
+        )
+    else:
+        # El cliente de Gemini v2 soporta async nativo si se requiere
+        client = genai.Client(api_key=GEMINI_API_KEY)
 except Exception as e:
     logger.critical(f"Error SDK Gemini: {e}")
     sys.exit(1)
@@ -354,7 +362,7 @@ async def extractor_intenciones(prompt_del_inversor: str) -> dict | None:
 
     try:
         res = await client.aio.models.generate_content(
-            model='gemini-2.5-flash',
+            model='gemini-1.5-flash',
             contents=f"{_PROMPT_SISTEMA_EXTRACTOR}\n\n[INPUT USUARIO]: {prompt_del_inversor}",
             config=types.GenerateContentConfig(
                 response_mime_type="application/json",
@@ -571,6 +579,7 @@ async def generador_informe_goldman(ticker: str, sector: str, datos: dict, perfi
         f"REGLA CRUCIAL: Separa los tres bloques (Tesis, Datos, Veredicto) con DOBLE SALTO DE LÍNEA (\\n\\n). "
         f"Cada dato en el bloque Datos debe ir en una línea nueva con el símbolo •. "
         f"REGLA CRUCIAL: Si los datos provistos en el json del contexto son vacíos parciales o nulos (ej. {{}}), DEBES NEGARTE a generar un veredicto de invencion. Responde estrictamente con: 'DATOS INSUFICIENTES' (Excepción: Para ETFs o Bonos, es normal que falten métricas de valoración corporativa como el PER, en estos casos NUNCA respondas DATOS INSUFICIENTES, evalúa en base a los rendimientos históricos e AUM). "
+        f"REGLA CRUCIAL: Al mencionar el activo en la Tesis o Veredicto, usa SIEMPRE el nombre de la empresa junto a su ticker (ej. Apple (AAPL), Google (GOOGL)). "
         f"{restricciones} "
         f"Estructura obligatoria:\n🎯 <b>Tesis:</b> [1 frase]\n\n📊 <b>Datos:</b>\n• [Dato 1]\n• [Dato 2]\n\n⚖️ <b>Veredicto:</b> [1 frase]\n"
         f"Sigue este ejemplo:\n{ejemplo}"
@@ -578,7 +587,7 @@ async def generador_informe_goldman(ticker: str, sector: str, datos: dict, perfi
 
     try:
         res = await client.aio.models.generate_content(
-            model='gemini-2.5-flash',  # FIX: Modelo actualizado (1.5-flash-8b fue retirado)
+            model='gemini-1.5-flash',  # FIX: Modelo actualizado (1.5-flash-8b fue retirado)
             contents=(
                 f"{prompt_sistema}\n"
                 f"Perfil:{perfil}|Sector:{sector}|"  # separadores compactos

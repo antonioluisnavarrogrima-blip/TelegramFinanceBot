@@ -362,7 +362,7 @@ async def extractor_intenciones(prompt_del_inversor: str) -> dict | None:
 
     try:
         res = await client.aio.models.generate_content(
-            model='gemini-1.5-flash',
+            model='gemini-3.5-flash',
             contents=f"{_PROMPT_SISTEMA_EXTRACTOR}\n\n[INPUT USUARIO]: {prompt_del_inversor}",
             config=types.GenerateContentConfig(
                 response_mime_type="application/json",
@@ -587,7 +587,7 @@ async def generador_informe_goldman(ticker: str, sector: str, datos: dict, perfi
 
     try:
         res = await client.aio.models.generate_content(
-            model='gemini-1.5-flash',  # FIX: Modelo actualizado (1.5-flash-8b fue retirado)
+            model='gemini-3.5-flash',  # FIX: Modelo actualizado (1.5-flash-8b fue retirado)
             contents=(
                 f"{prompt_sistema}\n"
                 f"Perfil:{perfil}|Sector:{sector}|"  # separadores compactos

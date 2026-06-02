@@ -1046,7 +1046,13 @@ async def obtener_yf_cache_bulk(tickers: list[str], require_fundamentals: bool =
             
             if not allow_stale and age > ttl:
                 continue  # Entrada expirada
+                
             data = json.loads(row["data"]) if isinstance(row["data"], str) else dict(row["data"])
+            
+            # Purgado Inteligente: Si el caché se guardó corrupto/vacío por fallos previos de Yahoo, lo ignoramos
+            if data.get("trailingPE") is None and data.get("regularMarketPrice") is None:
+                continue
+
             data["updated_at"] = row["updated_at"]
             # Excluir datos legados sin fundamentales (datos pre-YahooV11 o degradados).
             if require_fundamentals and data.get("_fuente") in ("YahooV8_Degradado", "FMP", "AlphaVantage") and not data.get("trailingPE") and not data.get("dividendYield"):

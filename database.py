@@ -26,10 +26,10 @@ _pool: asyncpg.Pool | None = None
 # Fundamentales de empresas cambian trimestralmente → 24h es más que suficiente.
 # Criptos cotizan 24/7 con alta volatilidad → 1h para mantener relevancia.
 _YF_CACHE_TTL: dict[str, int] = {
-    "ACCION": 86400,   # 24 horas
-    "ETF":    86400,   # 24 horas
-    "REIT":   86400,   # 24 horas
-    "BONO":   86400,   # 24 horas
+    "ACCION": 172800,  # 48 horas (Ahorro máximo API)
+    "ETF":    172800,  # 48 horas
+    "REIT":   172800,  # 48 horas
+    "BONO":   172800,  # 48 horas
     "CRIPTO": 3600,    # 1 hora  ← mercado 24/7, alta volatilidad
 }
 _TTL_DEFAULT = 86400  # Fallback para clases desconocidas

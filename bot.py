@@ -1162,50 +1162,59 @@ async def _obtener_info_bulk(tickers: list[str], clase: str, es_plus: bool = Fal
             lote = faltantes[i_chunk:i_chunk + 50]
             res = {}
 
-            # --- Fuente 1: FMP (Financial Modeling Prep) [NUEVO PRIMARIO] ---
-            # Rápido, estable y permite bulk quoting
-            fmp_keys = [k.strip() for k in FMP_API_KEYS.split(",") if k.strip()] if FMP_API_KEYS else []
-            if fmp_keys:
-                try:
-                    simbolos_fmp = ",".join(lote)
-                    for fmp_key in fmp_keys:
-                        fmp_url = f"https://financialmodelingprep.com/api/v3/quote/{simbolos_fmp}?apikey={fmp_key}"
-                        print(f"🔌 [FMP-DEBUG] Intentando llamar a FMP con url (truncada): {fmp_url.replace(fmp_key, '***KEY***')}")
-                        r_fmp = await http_client.get(fmp_url, timeout=10.0)
-                        
-                        print(f"📥 [FMP-DEBUG] Respuesta FMP - Status: {r_fmp.status_code}")
-                        if r_fmp.status_code != 200:
-                            print(f"❌ [FMP-DEBUG] Error Body FMP: {r_fmp.text[:500]}")
-                            logger.error(f"[FMP-DEBUG] Error FMP {r_fmp.status_code}: {r_fmp.text[:200]}")
-                        
-                        if r_fmp.status_code == 200:
-                            datos_fmp = r_fmp.json()
-                            print(f"✅ [FMP-DEBUG] JSON recibido: {str(datos_fmp)[:200]}...")
-                            for item in datos_fmp:
-                                sym = item.get("symbol", "").upper()
-                                precio = item.get("price")
-                                if sym and precio:
-                                    res[sym] = {
-                                        "regularMarketPrice": precio,
-                                        "previousClose":      item.get("previousClose"),
-                                        "marketCap":          item.get("marketCap"),
-                                        "shortName":          item.get("name", sym),
-                                        "trailingPE":         item.get("pe"),
-                                        "forwardPE":          item.get("pe"), # Aproximación
-                                        "dividendYield":      None, # FMP Quote no trae DivYield en %. AV lo traerá si es necesario.
-                                        "beta":               item.get("beta"),
-                                        "earningsGrowth":     item.get("eps"),
-                                        "_fuente":            "FMP",
-                                    }
-                            nuevos_fmp = [t for t in lote if t.upper() in res]
-                            if nuevos_fmp:
-                                logger.info(f"[FMP-BULK] {len(nuevos_fmp)}/{len(lote)} tickers OK")
-                            break
-                        elif r_fmp.status_code == 429:
-                            logger.warning(f"[FMP-BULK] Rate Limit alcanzado con key actual.")
-                except Exception as e_fmp:
-                    print(f"💥 [FMP-DEBUG] Excepción Crítica FMP: {e_fmp}")
-                    logger.warning(f"[FMP-BULK] Excepción: {type(e_fmp).__name__}: {e_fmp}")
+            # --- Fuente 1: yfinance library (Actualizado) ---
+            # Yahoo Finance sigue siendo la mejor opción gratuita si FMP está bloqueado.
+            try:
+                import yfinance as yf
+                import time
+
+                def _yf_sync_fetch(syms: list) -> dict:
+                    resultado = {}
+                    for sym in syms:
+                        try:
+                            # yfinance puede ser lento, pero es la única fuente gratuita ilimitada para PER
+                            info = yf.Ticker(sym).info
+                            precio = info.get("currentPrice") or info.get("regularMarketPrice")
+                            if not precio:
+                                continue
+                            
+                            div_yield = info.get("dividendYield") or info.get("yield") or info.get("trailingAnnualDividendYield")
+                            if div_yield is not None:
+                                rate = info.get("dividendRate")
+                                if rate and precio:
+                                    calc_yield = rate / precio
+                                    if div_yield > calc_yield * 10: div_yield /= 100.0
+                                elif div_yield > 1.0:
+                                    div_yield /= 100.0
+
+                            resultado[sym.upper()] = {
+                                "regularMarketPrice": precio,
+                                "previousClose":      info.get("previousClose"),
+                                "marketCap":          info.get("marketCap"),
+                                "shortName":          info.get("shortName", sym),
+                                "trailingPE":         info.get("trailingPE"),
+                                "forwardPE":          info.get("forwardPE"),
+                                "dividendYield":      div_yield,
+                                "beta":               info.get("beta"),
+                                "sector":             info.get("sector"),
+                                "earningsGrowth":     info.get("earningsGrowth"),
+                                "_fuente":            "yfinance",
+                            }
+                            time.sleep(0.5) # Pausa anti-bloqueos de Yahoo
+                        except Exception as e_sym:
+                            logger.debug(f"[YF-LIB] {sym}: {type(e_sym).__name__}: {e_sym}")
+                    return resultado
+
+                yf_res = await asyncio.to_thread(_yf_sync_fetch, lote)
+                if yf_res:
+                    res.update(yf_res)
+                    logger.info(f"[YF-LIB] {len(yf_res)}/{len(lote)} tickers OK via yfinance")
+                else:
+                    logger.warning(f"[YF-LIB] Sin datos desde yfinance para {lote}")
+            except ImportError:
+                logger.warning("[YF-LIB] yfinance no instalado.")
+            except Exception as e_yfl:
+                logger.warning(f"[YF-LIB] Error global: {type(e_yfl).__name__}: {e_yfl}")
 
             # --- Fuente 2: Alpha Vantage (ticker a ticker) ---
             faltantes_lote = [t for t in lote if t.upper() not in res]

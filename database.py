@@ -1049,8 +1049,9 @@ async def obtener_yf_cache_bulk(tickers: list[str], require_fundamentals: bool =
                 
             data = json.loads(row["data"]) if isinstance(row["data"], str) else dict(row["data"])
             
-            # Purgado Inteligente: Si el caché se guardó corrupto/vacío por fallos previos de Yahoo, lo ignoramos
-            if data.get("trailingPE") is None and data.get("regularMarketPrice") is None:
+            # Purgado Inteligente: Si el caché se guardó corrupto (ej. sin PER), lo ignoramos
+            # para forzar que yfinance/APIs lo vuelvan a descargar completo.
+            if data.get("trailingPE") is None and clase.upper() == "ACCION":
                 continue
 
             data["updated_at"] = row["updated_at"]

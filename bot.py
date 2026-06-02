@@ -1162,59 +1162,79 @@ async def _obtener_info_bulk(tickers: list[str], clase: str, es_plus: bool = Fal
             lote = faltantes[i_chunk:i_chunk + 50]
             res = {}
 
-            # --- Fuente 1: yfinance library (Actualizado) ---
-            # Yahoo Finance sigue siendo la mejor opción gratuita si FMP está bloqueado.
+            # --- Fuente 1: Yahoo Finance v7 Bypassed (NUEVO PRIMARIO) ---
+            # Render bloquea IPs, yfinance falla. Usamos curl_cffi (impersonate chrome) + Crumb.
             try:
-                import yfinance as yf
-                import time
-
-                def _yf_sync_fetch(syms: list) -> dict:
+                from curl_cffi import requests as cffi_requests
+                
+                def _yf_bulk_bypassed(syms: list) -> dict:
                     resultado = {}
-                    for sym in syms:
-                        try:
-                            # yfinance puede ser lento, pero es la única fuente gratuita ilimitada para PER
-                            info = yf.Ticker(sym).info
-                            precio = info.get("currentPrice") or info.get("regularMarketPrice")
-                            if not precio:
-                                continue
+                    simbolos_yf = ",".join(syms)
+                    try:
+                        # 1. Crear sesión imitando Chrome 110 para saltar WAF de Yahoo
+                        sess = cffi_requests.Session(impersonate="chrome110")
+                        
+                        # 2. Visitar página principal para obtener cookies
+                        sess.get("https://finance.yahoo.com/", timeout=10.0)
+                        
+                        # 3. Obtener Crumb
+                        r_crumb = sess.get("https://query1.finance.yahoo.com/v1/test/getcrumb", timeout=10.0)
+                        crumb = r_crumb.text.strip()
+                        
+                        if not crumb or "<html>" in crumb:
+                            logger.warning("[YF-BYPASS] Fallo al obtener Crumb válido.")
+                            return resultado
                             
-                            div_yield = info.get("dividendYield") or info.get("yield") or info.get("trailingAnnualDividendYield")
-                            if div_yield is not None:
-                                rate = info.get("dividendRate")
-                                if rate and precio:
-                                    calc_yield = rate / precio
-                                    if div_yield > calc_yield * 10: div_yield /= 100.0
-                                elif div_yield > 1.0:
-                                    div_yield /= 100.0
+                        # 4. Llamada Bulk v7 (súper rápida, 50 tickers de golpe)
+                        url = f"https://query1.finance.yahoo.com/v7/finance/quote?symbols={simbolos_yf}&crumb={crumb}"
+                        r = sess.get(url, timeout=15.0)
+                        
+                        if r.status_code == 200:
+                            data = r.json()
+                            results = data.get("quoteResponse", {}).get("result", [])
+                            for info in results:
+                                sym = info.get("symbol", "").upper()
+                                precio = info.get("regularMarketPrice")
+                                if not sym or not precio:
+                                    continue
+                                
+                                div_yield = info.get("dividendYield") or info.get("trailingAnnualDividendYield")
+                                if div_yield is not None:
+                                    rate = info.get("trailingAnnualDividendRate")
+                                    if rate and precio:
+                                        calc_yield = rate / precio
+                                        if div_yield > calc_yield * 10: div_yield /= 100.0
+                                    elif div_yield > 1.0:
+                                        div_yield /= 100.0
 
-                            resultado[sym.upper()] = {
-                                "regularMarketPrice": precio,
-                                "previousClose":      info.get("previousClose"),
-                                "marketCap":          info.get("marketCap"),
-                                "shortName":          info.get("shortName", sym),
-                                "trailingPE":         info.get("trailingPE"),
-                                "forwardPE":          info.get("forwardPE"),
-                                "dividendYield":      div_yield,
-                                "beta":               info.get("beta"),
-                                "sector":             info.get("sector"),
-                                "earningsGrowth":     info.get("earningsGrowth"),
-                                "_fuente":            "yfinance",
-                            }
-                            time.sleep(0.5) # Pausa anti-bloqueos de Yahoo
-                        except Exception as e_sym:
-                            logger.warning(f"[YF-LIB] EXCEPCION para {sym}: {type(e_sym).__name__}: {e_sym}")
+                                resultado[sym] = {
+                                    "regularMarketPrice": precio,
+                                    "previousClose":      info.get("regularMarketPreviousClose"),
+                                    "marketCap":          info.get("marketCap"),
+                                    "shortName":          info.get("shortName", sym),
+                                    "trailingPE":         info.get("trailingPE"),
+                                    "forwardPE":          info.get("forwardPE"),
+                                    "dividendYield":      div_yield,
+                                    "beta":               info.get("beta"),
+                                    "earningsGrowth":     info.get("earningsGrowth"), # Puede no estar en v7
+                                    "_fuente":            "YF-V7-Bypassed",
+                                }
+                        else:
+                            logger.warning(f"[YF-BYPASS] Status Code {r.status_code}")
+                    except Exception as e_bulk:
+                        logger.warning(f"[YF-BYPASS] Excepción Bulk: {type(e_bulk).__name__}: {e_bulk}")
                     return resultado
 
-                yf_res = await asyncio.to_thread(_yf_sync_fetch, lote)
+                yf_res = await asyncio.to_thread(_yf_bulk_bypassed, lote)
                 if yf_res:
                     res.update(yf_res)
-                    logger.info(f"[YF-LIB] {len(yf_res)}/{len(lote)} tickers OK via yfinance")
+                    logger.info(f"[YF-BYPASS] {len(yf_res)}/{len(lote)} tickers OK")
                 else:
-                    logger.warning(f"[YF-LIB] Sin datos desde yfinance para {lote}")
+                    logger.warning(f"[YF-BYPASS] Sin datos para {lote}")
             except ImportError:
-                logger.warning("[YF-LIB] yfinance no instalado.")
+                logger.warning("[YF-BYPASS] curl_cffi no instalado.")
             except Exception as e_yfl:
-                logger.warning(f"[YF-LIB] Error global: {type(e_yfl).__name__}: {e_yfl}")
+                logger.warning(f"[YF-BYPASS] Error global: {type(e_yfl).__name__}: {e_yfl}")
 
             # --- Fuente 2: Alpha Vantage (ticker a ticker) ---
             faltantes_lote = [t for t in lote if t.upper() not in res]

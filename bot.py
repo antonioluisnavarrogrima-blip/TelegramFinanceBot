@@ -1202,7 +1202,7 @@ async def _obtener_info_bulk(tickers: list[str], clase: str, es_plus: bool = Fal
                             }
                             time.sleep(0.5) # Pausa anti-bloqueos de Yahoo
                         except Exception as e_sym:
-                            logger.debug(f"[YF-LIB] {sym}: {type(e_sym).__name__}: {e_sym}")
+                            logger.warning(f"[YF-LIB] EXCEPCION para {sym}: {type(e_sym).__name__}: {e_sym}")
                     return resultado
 
                 yf_res = await asyncio.to_thread(_yf_sync_fetch, lote)

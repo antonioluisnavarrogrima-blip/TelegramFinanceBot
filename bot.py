@@ -959,6 +959,7 @@ def _chequear_fundamentales_accion(ticker: str, info: dict, filtros: dict) -> di
             "per": round(per, 2) if per != 999 else "N/A",
             "div_yield_pct": div_pct,
             "div_rate_abs": round(div_rate, 2),
+            "shortName": info.get("shortName") or info.get("name") or info.get("longName") or ticker,
         }
     except Exception as e: logger.debug(f"[YF] Error {ticker} (Acciones): {e}")
 
@@ -979,6 +980,7 @@ def _chequear_fundamentales_reit(ticker: str, info: dict, filtros_extra: list) -
             "div_yield_pct": round(div_yield * 100, 2),
             "p_ffo_proxy": round(p_ffo_proxy, 2) if p_ffo_proxy != 999 else "N/A",
             "sector": info.get("sector", "Real Estate"),
+            "shortName": info.get("shortName") or info.get("name") or info.get("longName") or ticker,
         }
     except Exception as e: logger.debug(f"[YF] Error {ticker} (REIT): {e}")
 
@@ -1162,79 +1164,67 @@ async def _obtener_info_bulk(tickers: list[str], clase: str, es_plus: bool = Fal
             lote = faltantes[i_chunk:i_chunk + 50]
             res = {}
 
-            # --- Fuente 1: Yahoo Finance v7 Bypassed (NUEVO PRIMARIO) ---
-            # Render bloquea IPs, yfinance falla. Usamos curl_cffi (impersonate chrome) + Crumb.
-            try:
-                from curl_cffi import requests as cffi_requests
-                
-                def _yf_bulk_bypassed(syms: list) -> dict:
-                    resultado = {}
-                    simbolos_yf = ",".join(syms)
-                    try:
-                        # 1. Crear sesión imitando Chrome 110 para saltar WAF de Yahoo
-                        sess = cffi_requests.Session(impersonate="chrome110")
+            # --- Fuente 1: FMP Profile & Metrics (NUEVO PRIMARIO) ---
+            # Yahoo Finance bloquea al 100% las IPs de Render (incluso con impersonation de Chrome).
+            # FMP Quote está bloqueado (Legacy), pero Profile y Key-Metrics-TTM son gratuitos y activos.
+            fmp_keys = [k.strip() for k in FMP_API_KEYS.split(",") if k.strip()] if FMP_API_KEYS else []
+            if fmp_keys:
+                try:
+                    simbolos_fmp = ",".join(lote)
+                    for fmp_key in fmp_keys:
+                        # 1. Bulk request to /profile for Price, MarketCap, Beta, Name
+                        url_profile = f"https://financialmodelingprep.com/api/v3/profile/{simbolos_fmp}?apikey={fmp_key}"
+                        r_prof = await http_client.get(url_profile, timeout=15.0)
                         
-                        # 2. Visitar página principal para obtener cookies
-                        sess.get("https://finance.yahoo.com/", timeout=10.0)
-                        
-                        # 3. Obtener Crumb
-                        r_crumb = sess.get("https://query1.finance.yahoo.com/v1/test/getcrumb", timeout=10.0)
-                        crumb = r_crumb.text.strip()
-                        
-                        if not crumb or "<html>" in crumb:
-                            logger.warning("[YF-BYPASS] Fallo al obtener Crumb válido.")
-                            return resultado
+                        if r_prof.status_code == 200:
+                            datos_prof = r_prof.json()
+                            for item in datos_prof:
+                                sym = item.get("symbol", "").upper()
+                                precio = item.get("price")
+                                if sym and precio:
+                                    res[sym] = {
+                                        "regularMarketPrice": precio,
+                                        "marketCap":          item.get("mktCap"),
+                                        "shortName":          item.get("companyName", sym),
+                                        "beta":               item.get("beta"),
+                                        "sector":             item.get("sector"),
+                                        "trailingPE":         None,
+                                        "dividendYield":      None,
+                                        "_fuente":            "FMP-Metrics",
+                                    }
                             
-                        # 4. Llamada Bulk v7 (súper rápida, 50 tickers de golpe)
-                        url = f"https://query1.finance.yahoo.com/v7/finance/quote?symbols={simbolos_yf}&crumb={crumb}"
-                        r = sess.get(url, timeout=15.0)
-                        
-                        if r.status_code == 200:
-                            data = r.json()
-                            results = data.get("quoteResponse", {}).get("result", [])
-                            for info in results:
-                                sym = info.get("symbol", "").upper()
-                                precio = info.get("regularMarketPrice")
-                                if not sym or not precio:
-                                    continue
+                            # 2. Async individual requests for key-metrics-ttm (to get PE and DivYield)
+                            async def _fetch_metrics(sym_m):
+                                url_metrics = f"https://financialmodelingprep.com/api/v3/key-metrics-ttm/{sym_m}?apikey={fmp_key}"
+                                try:
+                                    r_m = await http_client.get(url_metrics, timeout=10.0)
+                                    if r_m.status_code == 200:
+                                        d_m = r_m.json()
+                                        if d_m and len(d_m) > 0:
+                                            pe = d_m[0].get("peRatioTTM")
+                                            div_pct = d_m[0].get("dividendYieldPercentageTTM")
+                                            
+                                            if pe is not None and pe > 0:
+                                                res[sym_m]["trailingPE"] = pe
+                                            if div_pct is not None:
+                                                res[sym_m]["dividendYield"] = div_pct / 100.0
+                                except Exception as em:
+                                    logger.debug(f"[FMP-METRICS] Error métricas {sym_m}: {em}")
                                 
-                                div_yield = info.get("dividendYield") or info.get("trailingAnnualDividendYield")
-                                if div_yield is not None:
-                                    rate = info.get("trailingAnnualDividendRate")
-                                    if rate and precio:
-                                        calc_yield = rate / precio
-                                        if div_yield > calc_yield * 10: div_yield /= 100.0
-                                    elif div_yield > 1.0:
-                                        div_yield /= 100.0
-
-                                resultado[sym] = {
-                                    "regularMarketPrice": precio,
-                                    "previousClose":      info.get("regularMarketPreviousClose"),
-                                    "marketCap":          info.get("marketCap"),
-                                    "shortName":          info.get("shortName", sym),
-                                    "trailingPE":         info.get("trailingPE"),
-                                    "forwardPE":          info.get("forwardPE"),
-                                    "dividendYield":      div_yield,
-                                    "beta":               info.get("beta"),
-                                    "earningsGrowth":     info.get("earningsGrowth"), # Puede no estar en v7
-                                    "_fuente":            "YF-V7-Bypassed",
-                                }
-                        else:
-                            logger.warning(f"[YF-BYPASS] Status Code {r.status_code}")
-                    except Exception as e_bulk:
-                        logger.warning(f"[YF-BYPASS] Excepción Bulk: {type(e_bulk).__name__}: {e_bulk}")
-                    return resultado
-
-                yf_res = await asyncio.to_thread(_yf_bulk_bypassed, lote)
-                if yf_res:
-                    res.update(yf_res)
-                    logger.info(f"[YF-BYPASS] {len(yf_res)}/{len(lote)} tickers OK")
-                else:
-                    logger.warning(f"[YF-BYPASS] Sin datos para {lote}")
-            except ImportError:
-                logger.warning("[YF-BYPASS] curl_cffi no instalado.")
-            except Exception as e_yfl:
-                logger.warning(f"[YF-BYPASS] Error global: {type(e_yfl).__name__}: {e_yfl}")
+                            if res:
+                                tareas = [_fetch_metrics(sym) for sym in res.keys()]
+                                await asyncio.gather(*tareas)
+                                
+                            nuevos_fmp = [t for t in lote if t.upper() in res]
+                            if nuevos_fmp:
+                                logger.info(f"[FMP-METRICS] {len(nuevos_fmp)}/{len(lote)} tickers OK")
+                            break
+                        elif r_prof.status_code == 403:
+                            logger.warning(f"[FMP-METRICS] Key denegada (403).")
+                        elif r_prof.status_code == 429:
+                            logger.warning(f"[FMP-METRICS] Rate Limit alcanzado.")
+                except Exception as e_fmp:
+                    logger.warning(f"[FMP-METRICS] Excepción: {type(e_fmp).__name__}: {e_fmp}")
 
             # --- Fuente 2: Alpha Vantage (ticker a ticker) ---
             faltantes_lote = [t for t in lote if t.upper() not in res]

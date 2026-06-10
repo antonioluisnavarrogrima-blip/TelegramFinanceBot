@@ -675,13 +675,14 @@ async def fabricante_de_graficos(ticker: str, periodo: str = "3mo") -> tuple[byt
                     if resp.status_code == 200:
                         result = resp.json().get("chart", {}).get("result", [])
                         if result:
-                            timestamps = result[0].get("timestamp", [])
-                            closes = result[0].get("indicators", {}).get("quote", [{}])[0].get("close", [])
-                            for t, c in zip(timestamps, closes):
-                                if c is not None:
-                                    dt = datetime.datetime.fromtimestamp(t).strftime('%Y-%m-%d')
-                                    hist.append({"date": dt, "close": c})
-                            hist.reverse() # Invertir para que sea descendente como FMP
+                            timestamps = result[0].get("timestamp") or []
+                            closes = result[0].get("indicators", {}).get("quote", [{}])[0].get("close") or []
+                            if timestamps and closes:
+                                for t, c in zip(timestamps, closes):
+                                    if c is not None:
+                                        dt = datetime.datetime.fromtimestamp(t).strftime('%Y-%m-%d')
+                                        hist.append({"date": dt, "close": c})
+                                hist.reverse() # Invertir para que sea descendente como FMP
             except Exception as e:
                 logger.warning(f"[CHART] Yahoo Fallback falló para {ticker}: {e}")
 
@@ -697,13 +698,14 @@ async def fabricante_de_graficos(ticker: str, periodo: str = "3mo") -> tuple[byt
             if resp.status_code == 200:
                 result = resp.json().get("chart", {}).get("result", [])
                 if result:
-                    timestamps = result[0].get("timestamp", [])
-                    closes = result[0].get("indicators", {}).get("quote", [{}])[0].get("close", [])
-                    for t, c in zip(timestamps, closes):
-                        if c is not None:
-                            dt = datetime.datetime.fromtimestamp(t).strftime('%Y-%m-%d')
-                            hist.append({"date": dt, "close": c})
-                    hist.reverse() # Invertir para que sea descendente
+                    timestamps = result[0].get("timestamp") or []
+                    closes = result[0].get("indicators", {}).get("quote", [{}])[0].get("close") or []
+                    if timestamps and closes:
+                        for t, c in zip(timestamps, closes):
+                            if c is not None:
+                                dt = datetime.datetime.fromtimestamp(t).strftime('%Y-%m-%d')
+                                hist.append({"date": dt, "close": c})
+                        hist.reverse() # Invertir para que sea descendente
             else:
                 logger.warning(f"[CHART] RapidAPI fallida: {resp.status_code} - {resp.text[:100]}")
 
@@ -1322,6 +1324,83 @@ async def pipeline_hibrido(solicitud: str, msg_espera=None, fuente_datos: str = 
     async with _PIPELINE_SEMA:
         return await _pipeline_hibrido_interno(extraccion, solicitud, msg_espera, fuente_datos, tid=tid)
 
+async def _obtener_semillas_dinamicas(clase_activo: str, sector: str | None = None) -> list[str]:
+    """Obtiene una lista de tickers dinámicos usando FMP, Yahoo o Alpha Vantage para mayor variedad."""
+    if clase_activo != "ACCION":
+        return []
+    
+    import random
+    from curl_cffi.requests import AsyncSession
+    
+    fuentes = ["fmp", "yahoo", "alphavantage"]
+    
+    # Si hay sector específico, FMP es el mejor para filtrar por sector.
+    es_busqueda_general = not sector or sector.lower() in ("general", "__all__", "")
+    if not es_busqueda_general:
+        fuentes = ["fmp"] + fuentes  # Mayor probabilidad para FMP
+        
+    random.shuffle(fuentes)
+    
+    for fuente in fuentes:
+        tickers = []
+        if fuente == "fmp":
+            fmp_keys = [k.strip() for k in FMP_API_KEYS.split(',') if k.strip()]
+            if fmp_keys:
+                key = random.choice(fmp_keys)
+                url = f"https://financialmodelingprep.com/api/v3/stock-screener?exchange=NYSE,NASDAQ&isActivelyTrading=true&limit=100&apikey={key}"
+                if not es_busqueda_general:
+                    mapeo_sectores = {
+                        "tecnologia": "Technology", "energia": "Energy", "banca": "Financial Services", 
+                        "salud": "Healthcare", "industria": "Industrials", "consumo": "Consumer Defensive"
+                    }
+                    sector_fmp = mapeo_sectores.get(sector.lower())
+                    if sector_fmp:
+                        url += f"&sector={sector_fmp}"
+                try:
+                    resp = await http_client.get(url, timeout=10.0)
+                    if resp.status_code == 200:
+                        data = resp.json()
+                        tickers = [item.get("symbol") for item in data if item.get("symbol")]
+                except Exception as e:
+                    logger.warning(f"[SCREENER] Error FMP: {e}")
+                    
+        elif fuente == "yahoo":
+            scr_ids = ["day_gainers", "day_losers", "most_actives", "undervalued_growth_stocks", "aggressive_small_caps", "growth_technology_stocks"]
+            scr_id = random.choice(scr_ids)
+            url = f"https://query2.finance.yahoo.com/v1/finance/screener/predefined/saved?formatted=false&scrIds={scr_id}&count=50"
+            try:
+                async with AsyncSession(impersonate='chrome110') as session:
+                    resp = await session.get(url, timeout=10.0)
+                    if resp.status_code == 200:
+                        data = resp.json()
+                        quotes = data.get("finance", {}).get("result", [{}])[0].get("quotes", [])
+                        tickers = [q.get("symbol") for q in quotes if q.get("symbol")]
+            except Exception as e:
+                logger.warning(f"[SCREENER] Error Yahoo ({scr_id}): {e}")
+                
+        elif fuente == "alphavantage":
+            av_keys = [k.strip() for k in ALPHAVANTAGE_API_KEYS.split(',') if k.strip()]
+            if av_keys:
+                key = random.choice(av_keys)
+                url = f"https://www.alphavantage.co/query?function=TOP_GAINERS_LOSERS&apikey={key}"
+                try:
+                    resp = await http_client.get(url, timeout=10.0)
+                    if resp.status_code == 200:
+                        data = resp.json()
+                        for list_key in ["top_gainers", "top_losers", "most_actively_traded"]:
+                            items = data.get(list_key, [])
+                            tickers.extend([item.get("ticker") for item in items if item.get("ticker")])
+                except Exception as e:
+                    logger.warning(f"[SCREENER] Error AlphaVantage: {e}")
+                    
+        if tickers:
+            logger.info(f"[SCREENER] Éxito usando fuente: {fuente.upper()}. Se obtuvieron {len(tickers)} tickers.")
+            if len(tickers) > 40:
+                return random.sample(tickers, 40)
+            return tickers
+
+    return []
+
 async def _pipeline_hibrido_interno(
     extraccion: dict | None,
     solicitud: str,
@@ -1398,11 +1477,30 @@ async def _pipeline_hibrido_interno(
         if msg_espera:
             try: await msg_espera.edit_text(f"📡 Consultando terminal de activos para sector: <b>{sector_ia}</b>...", parse_mode="HTML")
             except BadRequest: pass
-        tickers = await db.obtener_semillas_busqueda(clase_activo, sector_ia)
-        logger.info(f"[PIPELINE] Semillas obtenidas para ({clase_activo}, {sector_ia}): {tickers}")
+        
+        tickers_estaticos = await db.obtener_semillas_busqueda(clase_activo, sector_ia)
+        tickers_dinamicos = await _obtener_semillas_dinamicas(clase_activo, sector_ia)
+        
+        # Combinar y eliminar duplicados manteniendo variedad
+        import random
+        tickers = list(set(tickers_estaticos + tickers_dinamicos))
+        random.shuffle(tickers)
+        
+        logger.info(f"[PIPELINE] Semillas obtenidas para ({clase_activo}, {sector_ia}): {len(tickers)} combinadas.")
+        
         if not tickers:
             tickers = await db.obtener_semillas_busqueda(clase_activo)
             logger.info(f"[PIPELINE] Semillas fallback para {clase_activo}: {tickers}")
+            
+        # Filtro Anti-Repetición basado en Historial
+        if tid and not es_consulta_directa:
+            historial = await db.obtener_historial_recomendaciones(tid)
+            if historial:
+                tickers_filtrados = [t for t in tickers if t.upper() not in historial]
+                if not tickers_filtrados and tickers:
+                    logger.warning(f"[PIPELINE] Todos los candidatos filtrados por historial para el usuario {tid}. Reutilizando antiguos.")
+                else:
+                    tickers = tickers_filtrados
     else:
         logger.info(f"[PIPELINE] Tickers manuales/extractados: {tickers}")
 
@@ -1620,11 +1718,12 @@ async def _pipeline_hibrido_interno(
                         if resp.status_code == 200:
                             result = resp.json().get("chart", {}).get("result", [])
                             if result:
-                                closes = result[0].get("indicators", {}).get("quote", [{}])[0].get("close", [])
-                                for c in closes:
-                                    if c is not None:
-                                        hist.append({"close": c})
-                                hist.reverse() # Invertir a descendente
+                                closes = result[0].get("indicators", {}).get("quote", [{}])[0].get("close") or []
+                                if closes:
+                                    for c in closes:
+                                        if c is not None:
+                                            hist.append({"close": c})
+                                    hist.reverse() # Invertir a descendente
                 except Exception as e:
                     logger.warning(f"[REND] Yahoo Fallback falló para {gan['ticker']}: {e}")
 
@@ -1640,11 +1739,12 @@ async def _pipeline_hibrido_interno(
                 if resp.status_code == 200:
                     result = resp.json().get("chart", {}).get("result", [])
                     if result:
-                        closes = result[0].get("indicators", {}).get("quote", [{}])[0].get("close", [])
-                        for c in closes:
-                            if c is not None:
-                                hist.append({"close": c})
-                        hist.reverse() # Invertir a descendente
+                        closes = result[0].get("indicators", {}).get("quote", [{}])[0].get("close") or []
+                        if closes:
+                            for c in closes:
+                                if c is not None:
+                                    hist.append({"close": c})
+                            hist.reverse() # Invertir a descendente
                 else:
                     logger.warning(f"[REND] RapidAPI fallida para {gan['ticker']}: {resp.status_code}")
 
@@ -1765,6 +1865,8 @@ async def _pipeline_hibrido_interno(
     )
     texto_final += "\n\n<i>* Rendimiento calculado sobre precios de cierre sin ajustar (puede diferir ligeramente de Yahoo Finance, que usa precios ajustados por dividendos y splits).</i>"
     texto_final = _limpiar_html_telegram(texto_final)
+    if tid:
+        asyncio.ensure_future(db.registrar_recomendacion(tid, ticker_final))
     return texto_final, ruta_captura_final, url_compra, ticker_final
 
 
@@ -1783,9 +1885,25 @@ async def _pipeline_por_tabla(
     if sector_tabla == "__all__":
         sector_tabla = None
 
-    tickers = await db.obtener_semillas_busqueda(clase_activo, sector_tabla)
+    tickers_estaticos = await db.obtener_semillas_busqueda(clase_activo, sector_tabla)
+    tickers_dinamicos = await _obtener_semillas_dinamicas(clase_activo, sector_tabla)
+    
+    import random
+    tickers = list(set(tickers_estaticos + tickers_dinamicos))
+    random.shuffle(tickers)
+    
     if not tickers:
         tickers = await db.obtener_semillas_busqueda(clase_activo)
+    
+    if tid:
+        historial = await db.obtener_historial_recomendaciones(tid)
+        if historial:
+            tickers_filtrados = [t for t in tickers if t.upper() not in historial]
+            if not tickers_filtrados and tickers:
+                logger.warning(f"[TABLA] Todos los candidatos filtrados por historial para el usuario {tid}. Reutilizando antiguos.")
+            else:
+                tickers = tickers_filtrados
+
     if not tickers:
         return "❌ No hay activos registrados para esa categoría.", None, None
 
@@ -1899,6 +2017,9 @@ async def _pipeline_por_tabla(
     mejor["temporalidad"] = temporalidad  # Para que la etiqueta refleje el período real
 
     texto = _formatear_resultado_tabla(mejor, clase_activo)
+    if tid:
+        import asyncio
+        asyncio.ensure_future(db.registrar_recomendacion(tid, mejor["ticker"]))
     return texto, grafico_bytes, mejor["ticker"]
 
 

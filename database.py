@@ -242,8 +242,19 @@ async def inicializar_db():
             )
         """)
 
+        # ── Tabla de Historial de Recomendaciones ────────────────────────────
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS historial_recomendaciones (
+                id SERIAL PRIMARY KEY,
+                user_id BIGINT REFERENCES usuarios(id) ON DELETE CASCADE,
+                ticker TEXT NOT NULL,
+                fecha FLOAT NOT NULL
+            )
+        """)
+
+
         # ── RLS y Seguridad por DEFECTO ──────────────────────────────────────
-        tablas = ["usuarios", "semillas", "stripe_eventos", "yf_cache", "alertas_precio", "feedback_stats", "bot_state"]
+        tablas = ["usuarios", "semillas", "stripe_eventos", "yf_cache", "alertas_precio", "feedback_stats", "bot_state", "historial_recomendaciones"]
         for t in tablas:
             try:
                 await conn.execute(f"ALTER TABLE {t} ENABLE ROW LEVEL SECURITY;")
@@ -253,6 +264,8 @@ async def inicializar_db():
         # ── Indices de base de datos ──────────────────────────────────────
         await conn.execute("CREATE INDEX IF NOT EXISTS idx_usuarios_id ON usuarios (id)")
         await conn.execute("CREATE INDEX IF NOT EXISTS idx_semillas_clase ON semillas (clase, sector)")
+        await conn.execute("CREATE INDEX IF NOT EXISTS idx_historial_user ON historial_recomendaciones (user_id)")
+        await conn.execute("CREATE INDEX IF NOT EXISTS idx_historial_fecha ON historial_recomendaciones (fecha)")
 
     logger.info("[DB] Esquema inicializado/verificado correctamente.")
 
@@ -1445,12 +1458,55 @@ async def purgar_datos_obsoletos() -> dict:
         count_yf = int(res_yf.split(" ")[1]) if "DELETE" in res_yf else 0
         count_stripe = int(res_stripe.split(" ")[1]) if "DELETE" in res_stripe else 0
 
-        logger.info(f"[HIGIENE] Limpieza completada: {count_yf} ticks de caché y {count_stripe} eventos Stripe eliminados.")
-        return {"yf_cache_deleted": count_yf, "stripe_events_deleted": count_stripe}
+        # Borrar el historial de recomendaciones antiguas (7 días)
+        res_historial = await conn.execute(
+            "DELETE FROM historial_recomendaciones WHERE fecha < $1",
+            ahora - siete_dias
+        )
+        count_historial = int(res_historial.split(" ")[1]) if "DELETE" in res_historial else 0
 
+        logger.info(f"[HIGIENE] Limpieza completada: {count_yf} ticks de caché, {count_stripe} eventos Stripe y {count_historial} historiales eliminados.")
+        return {"yf_cache_deleted": count_yf, "stripe_events_deleted": count_stripe, "historial_deleted": count_historial}
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 12. HISTORIAL DE RECOMENDACIONES
+# ═══════════════════════════════════════════════════════════════════════════════
+
+async def registrar_recomendacion(tid: int, ticker: str) -> bool:
+    """Registra que un activo ha sido devuelto al usuario."""
+    pool = _get_pool()
+    ahora = time.time()
+    try:
+        async with pool.acquire() as conn:
+            await conn.execute(
+                """
+                INSERT INTO historial_recomendaciones (user_id, ticker, fecha)
+                VALUES ($1, $2, $3)
+                """,
+                tid, ticker.upper(), ahora
+            )
+            return True
+    except Exception as e:
+        logger.error(f"[DB] Error registrando historial de recomendación: {e}")
+        return False
+
+async def obtener_historial_recomendaciones(tid: int) -> list[str]:
+    """Obtiene la lista de todos los tickers recomendados recientemente a un usuario."""
+    pool = _get_pool()
+    try:
+        async with pool.acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT ticker FROM historial_recomendaciones WHERE user_id = $1", 
+                tid
+            )
+            return [r["ticker"] for r in rows]
+    except Exception as e:
+        logger.error(f"[DB] Error obteniendo historial de recomendaciones: {e}")
+        return []
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # 7. GESTIÓN DE ALERTAS DE PRECIO (Stop-Loss / Take-Profit)
+
 # ═══════════════════════════════════════════════════════════════════════════════
 
 async def crear_alerta_precio(user_id: int, ticker: str, tipo: str, precio_objetivo: float) -> int:

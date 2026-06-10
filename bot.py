@@ -311,6 +311,8 @@ def _guardar_en_cache(hash_key: str, data: dict):
 _PROMPT_SISTEMA_EXTRACTOR = """Rol Oficial: Analista Cuantitativo Senior. Extrae parámetros financieros del texto del usuario en JSON.
 
 REGLA FUNDAMENTAL: Si el usuario menciona un ticker o empresa concreta (ej. "Microsoft", "MSFT", "Apple", "Tesla") → SIEMPRE es válido. Pon el ticker en tickers_manuales, infiere la clase (ACCION por defecto), deja filtros_dinamicos=[] si no hay filtros explícitos, y deja error_api="" (vacío). NUNCA rechaces una petición sobre un ticker concreto.
+REGLA DE CLÚSTERES (GRUPOS FAMOSOS): Si el usuario pide explícitamente un grupo o canasta famosa de empresas (ej: "FAANG", "Big Tech", "los 7 magníficos", "bancos grandes de EEUU"), DEBES inyectar los tickers correspondientes en 'tickers_manuales' (ej: ["AAPL", "MSFT", "GOOGL", "AMZN", "META", "NVDA"]) para focalizar la búsqueda.
+PROHIBIDO INVENTAR TICKERS EN BÚSQUEDAS GENÉRICAS. Si el usuario pide una búsqueda genérica (ej: "búscame acciones baratas", "empresas de salud", "alto dividendo") sin nombrar un grupo cerrado, 'tickers_manuales' DEBE ir siempre vacío []. ¡Nunca copies los ejemplos del prompt!
 Ejemplos válidos sin error: "datos de Microsoft", "dividendo de AAPL", "PER de Tesla", "analiza NVDA", "qué tal está Coca-Cola".
 
 Evaluación de Probabilidad: Si los filtros son irreales (div>20% o PER<3), adjústalos a la realidad. NO rechaces, adapta.
@@ -932,7 +934,7 @@ def _construir_filtros(perfil: str, filtros_dinamicos: list) -> dict:
 # Inicializado en lifespan para garantizar el event loop correcto de Uvicorn
 def _chequear_fundamentales_accion(ticker: str, info: dict, filtros: dict) -> dict | None:
     try:
-        if not info: return None
+        info = info or {}
         per = info.get('trailingPE') or info.get('forwardPE') or 999
         div_yield_dec = info.get('dividendYield', 0)
         div_yield = div_yield_dec if div_yield_dec is not None else 0
@@ -967,7 +969,7 @@ def _chequear_fundamentales_accion(ticker: str, info: dict, filtros: dict) -> di
 
 def _chequear_fundamentales_reit(ticker: str, info: dict, filtros_extra: list) -> dict | None:
     try:
-        if not info: return None
+        info = info or {}
         div_yield_dec = info.get('dividendYield', 0)
         div_yield = div_yield_dec if div_yield_dec is not None else 0
         p_ffo_proxy = info.get('priceToBook', 999) or 999
@@ -988,7 +990,7 @@ def _chequear_fundamentales_reit(ticker: str, info: dict, filtros_extra: list) -
 
 def _chequear_fundamentales_etf(ticker: str, info: dict, filtros_extra: list) -> dict | None:
     try:
-        if not info: return None
+        info = info or {}
         logger.debug(f"[ETF FASE 3] RAW KEYS para {ticker}: {list(info.keys())}")
         aum = info.get('totalAssets') or info.get('marketCap') or 0
         div_yield_dec = info.get('dividendYield') or info.get('yield') or info.get('trailingAnnualDividendYield') or 0
@@ -1020,7 +1022,7 @@ def _chequear_fundamentales_etf(ticker: str, info: dict, filtros_extra: list) ->
 
 def _chequear_fundamentales_cripto(ticker: str, info: dict, filtros_extra: list) -> dict | None:
     try:
-        if not info: return None
+        info = info or {}
         market_cap = info.get('marketCap', 0) or 0
         
         for f in filtros_extra:
@@ -1037,7 +1039,7 @@ def _chequear_fundamentales_cripto(ticker: str, info: dict, filtros_extra: list)
 
 def _chequear_fundamentales_bono(ticker: str, info: dict, filtros_extra: list) -> dict | None:
     try:
-        if not info: return None
+        info = info or {}
         
         # Mapeo robusto de Yield para Bonos
         div_yield_dec = info.get('dividendYield') or info.get('yield') or info.get('trailingAnnualDividendYield') or 0

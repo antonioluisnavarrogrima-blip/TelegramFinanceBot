@@ -747,6 +747,17 @@ async def fabricante_de_graficos(ticker: str, periodo: str = "3mo") -> tuple[byt
     rendimiento = 0.0 if p_inicial == 0 else ((p_final - p_inicial) / p_inicial) * 100
     color = "rgb(44,160,44)" if rendimiento >= 0 else "rgb(214,39,40)"
 
+    # Downsampling preventivo para evitar QuickChart HTTP 400 (límite free = 200 puntos máx)
+    if len(prices) > 120:
+        step = (len(prices) + 119) // 120
+        prices_ds = prices[::step]
+        labels_ds = labels[::step]
+        if prices_ds[-1] != p_final:
+            prices_ds.append(p_final)
+            labels_ds.append(labels[-1])
+        prices = prices_ds
+        labels = labels_ds
+
     qc_payload = {
         "chart": {
             "type": "line",
@@ -1242,23 +1253,30 @@ async def _obtener_info_bulk(tickers: list[str], clase: str, es_plus: bool = Fal
                             if r_av.status_code == 200:
                                 d = r_av.json()
                                 if d.get("Symbol"):  # AV devuelve {} si rate-limited
+                                    def _sfloat(val):
+                                        try:
+                                            return float(val) if val and str(val).strip().lower() not in ("none", "n/a", "") else None
+                                        except (ValueError, TypeError):
+                                            return None
+                                            
                                     price_url = f"https://www.alphavantage.co/query?function=GLOBAL_QUOTE&symbol={t_av}&apikey={av_key}"
                                     r_price = await http_client.get(price_url, timeout=8.0)
                                     precio_av = None
                                     if r_price.status_code == 200:
-                                        precio_av = float(r_price.json().get("Global Quote", {}).get("05. price", 0) or 0) or None
-                                    pe = float(d.get("PERatio", 0) or 0) or None
-                                    div_y = float(d.get("DividendYield", 0) or 0) or None
+                                        precio_av = _sfloat(r_price.json().get("Global Quote", {}).get("05. price"))
+                                    pe = _sfloat(d.get("PERatio"))
+                                    div_y = _sfloat(d.get("DividendYield"))
+                                    mcap = _sfloat(d.get("MarketCapitalization"))
                                     res[t_av.upper()] = {
                                         "regularMarketPrice": precio_av,
-                                        "marketCap":          int(d.get("MarketCapitalization", 0) or 0) or None,
+                                        "marketCap":          int(mcap) if mcap is not None else None,
                                         "shortName":          d.get("Name", t_av),
                                         "trailingPE":         pe,
                                         "dividendYield":      div_y,
-                                        "dividendRate":       float(d.get("DividendPerShare", 0) or 0) or None,
-                                        "returnOnEquity":     float(d.get("ReturnOnEquityTTM", 0) or 0) or None,
-                                        "profitMargins":      float(d.get("ProfitMargin", 0) or 0) or None,
-                                        "beta":               float(d.get("Beta", 0) or 0) or None,
+                                        "dividendRate":       _sfloat(d.get("DividendPerShare")),
+                                        "returnOnEquity":     _sfloat(d.get("ReturnOnEquityTTM")),
+                                        "profitMargins":      _sfloat(d.get("ProfitMargin")),
+                                        "beta":               _sfloat(d.get("Beta")),
                                         "sector":             d.get("Sector"),
                                         "_fuente":            "AlphaVantage",
                                     }

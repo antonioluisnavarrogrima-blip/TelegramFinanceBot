@@ -19,12 +19,6 @@ graph TD
         DB -->|SQL| Supabase[(PostgreSQL / Supabase)]
     end
     
-    subgraph "Sincronización & Memoria"
-        Sync[sync_docs.py] -->|Auth| GoogleDocsAPI[Google Docs API]
-        Sync -->|Read| Files[MD & TXT Files]
-        NotebookLM[NotebookLM] <--- GoogleDocsAPI
-    end
-    
     subgraph "Servicios Externos"
         Bot -->|Payments| Stripe[Stripe API]
         Bot -->|Charts| QuickChart[QuickChart API]
@@ -38,7 +32,6 @@ graph TD
 | `bot.py` | `database.py` | Acceso a créditos, caché y perfiles de usuario. |
 | `bot.py` | `Gemini API` | NLP para extracción de métricas y generación de tesis. |
 | `database.py` | `asyncpg` | Conexión asíncrona a la base de datos PostgreSQL. |
-| `sync_docs.py` | `credentials.json` | Sincronización de la documentación local con la nube. |
 | `fix_zombis.py` | `bot.py` | Refactorización y limpieza de funciones obsoletas. |
 
 ---
@@ -48,3 +41,4 @@ graph TD
 2. **Procesamiento**: `bot.py` -> `Gemini 2.5` (Entiende) -> `yfinance` (Calcula) -> `database.py` (Caché).
 3. **Salida**: `QuickChart` (Gráfico) -> `Gemini 2.0` (Tesis) -> Telegram.
 4. **Memoria**: Cualquier fallo o cambio estructural se anota en `DECISION_LOG.md`.
+

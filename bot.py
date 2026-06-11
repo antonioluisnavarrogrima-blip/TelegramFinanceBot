@@ -1153,15 +1153,24 @@ async def _fetch_yahoo_cffi_fundamentals(tickers: list[str]) -> dict:
     res = {}
     try:
         async with AsyncSession(impersonate='chrome110') as s:
-            await s.get('https://finance.yahoo.com', timeout=10.0)
+            # 1. Obtener Cookie
+            r0 = await s.get('https://fc.yahoo.com', timeout=10.0)
+            logger.debug(f"[YAHOO-CFFI] Cookie fetch status: {r0.status_code}")
+            
+            # 2. Obtener Crumb
             r1 = await s.get('https://query1.finance.yahoo.com/v1/test/getcrumb', timeout=10.0)
             crumb = r1.text.strip()
-            if not crumb or "<html>" in crumb: return res
+            if not crumb or "<html>" in crumb:
+                logger.warning(f"[YAHOO-CFFI] Fallo al obtener crumb. Status={r1.status_code}. Response={crumb[:50]}")
+                return res
                 
+            # 3. Obtener Datos
             simbolos_str = ",".join(tickers)
             url = f"https://query2.finance.yahoo.com/v7/finance/quote?symbols={simbolos_str}&crumb={crumb}"
             r2 = await s.get(url, timeout=15.0)
-            if r2.status_code != 200: return res
+            if r2.status_code != 200:
+                logger.warning(f"[YAHOO-CFFI] Endpoint quote falló con HTTP {r2.status_code}. Respuesta: {r2.text[:100]}")
+                return res
                 
             resultados = r2.json().get("quoteResponse", {}).get("result", [])
             for item in resultados:

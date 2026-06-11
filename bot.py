@@ -1146,51 +1146,51 @@ class ExtractorFMP(ExtractorBase):
             logger.warning(f"[FMP] Excepción en fetch_batch para {simbolos[:60]}: {type(e).__name__}: {e}")
             return {}
 
-async def _fetch_rapidapi_fundamentals(tickers: list[str]) -> dict:
-    """Extrae fundamentales desde RapidAPI (Yahoo Finance Apidojo) como fallback de pago por uso."""
-    if not tickers or not RAPIDAPI_KEY: return {}
+async def _fetch_yahoo_cffi_fundamentals(tickers: list[str]) -> dict:
+    """Extrae fundamentales desde la API privada de Yahoo v7 usando curl_cffi para evadir HTTP 401."""
+    if not tickers: return {}
+    from curl_cffi.requests import AsyncSession
     res = {}
     try:
-        simbolos_str = ",".join(tickers)
-        url = f"https://apidojo-yahoo-finance-v1.rapidapi.com/market/v2/get-quotes?region=US&symbols={simbolos_str}"
-        headers = {
-            "x-rapidapi-key": RAPIDAPI_KEY,
-            "x-rapidapi-host": "apidojo-yahoo-finance-v1.rapidapi.com"
-        }
-        r = await http_client.get(url, headers=headers, timeout=15.0)
-        
-        if r.status_code != 200:
-            logger.warning(f"[RAPIDAPI] Error HTTP {r.status_code}: {r.text[:100]}")
+        async with AsyncSession(impersonate='chrome110') as s:
+            await s.get('https://finance.yahoo.com', timeout=10.0)
+            r1 = await s.get('https://query1.finance.yahoo.com/v1/test/getcrumb', timeout=10.0)
+            crumb = r1.text.strip()
+            if not crumb or "<html>" in crumb: return res
+                
+            simbolos_str = ",".join(tickers)
+            url = f"https://query2.finance.yahoo.com/v7/finance/quote?symbols={simbolos_str}&crumb={crumb}"
+            r2 = await s.get(url, timeout=15.0)
+            if r2.status_code != 200: return res
+                
+            resultados = r2.json().get("quoteResponse", {}).get("result", [])
+            for item in resultados:
+                sym = item.get("symbol", "").upper()
+                if not sym: continue
+                    
+                def _sf(v): return float(v) if v is not None else None
+                
+                dy = _sf(item.get("trailingAnnualDividendYield"))
+                if dy is None and item.get("dividendYield") is not None:
+                    dy = _sf(item.get("dividendYield")) / 100.0
+                    
+                res[sym] = {
+                    "regularMarketPrice": _sf(item.get("regularMarketPrice")),
+                    "marketCap":          int(_sf(item.get("marketCap"))) if item.get("marketCap") else None,
+                    "shortName":          item.get("shortName", sym),
+                    "trailingPE":         _sf(item.get("trailingPE")),
+                    "dividendYield":      dy,
+                    "dividendRate":       _sf(item.get("trailingAnnualDividendRate") or item.get("dividendRate")),
+                    "returnOnEquity":     None,
+                    "profitMargins":      None,
+                    "beta":               None,
+                    "sector":             None,
+                    "_fuente":            "Yahoo-CFFI",
+                }
+            logger.info(f"[YAHOO-CFFI] Éxito recuperando {len(res)} tickers vía bypass.")
             return res
-            
-        resultados = r.json().get("quoteResponse", {}).get("result", [])
-        for item in resultados:
-            sym = item.get("symbol", "").upper()
-            if not sym: continue
-                
-            def _sf(v): return float(v) if v is not None else None
-            
-            dy = _sf(item.get("trailingAnnualDividendYield"))
-            if dy is None and item.get("dividendYield") is not None:
-                dy = _sf(item.get("dividendYield")) / 100.0
-                
-            res[sym] = {
-                "regularMarketPrice": _sf(item.get("regularMarketPrice")),
-                "marketCap":          int(_sf(item.get("marketCap"))) if item.get("marketCap") else None,
-                "shortName":          item.get("shortName", sym),
-                "trailingPE":         _sf(item.get("trailingPE")),
-                "dividendYield":      dy,
-                "dividendRate":       _sf(item.get("trailingAnnualDividendRate") or item.get("dividendRate")),
-                "returnOnEquity":     None,
-                "profitMargins":      None,
-                "beta":               None,
-                "sector":             None,
-                "_fuente":            "RapidAPI",
-            }
-        logger.info(f"[RAPIDAPI] Éxito recuperando {len(res)} tickers vía Apidojo.")
-        return res
     except Exception as e:
-        logger.warning(f"[RAPIDAPI] Error en fetch: {e}")
+        logger.warning(f"[YAHOO-CFFI] Error en bypass: {e}")
         return {}
 
 # Clases de activo que REQUIEREN fundamentales (PER, dividendo...) para el filtrado
@@ -1332,11 +1332,11 @@ async def _obtener_info_bulk(tickers: list[str], clase: str, es_plus: bool = Fal
                         except Exception as e_av:
                             logger.warning(f"[AV-FALLBACK] {t_av}: {type(e_av).__name__}: {e_av}")
 
-            # --- Fuente 3: RapidAPI Yahoo Finance (Pago por Uso) ---
+            # --- Fuente 3: Yahoo Finance CFFI Bypass (GRATUITO) ---
             faltantes_lote = [t for t in lote if t.upper() not in res]
-            if faltantes_lote and RAPIDAPI_KEY:
-                logger.info(f"[RAPIDAPI] Intentando rescatar {len(faltantes_lote)} tickers vía pago por uso...")
-                yahoo_data = await _fetch_rapidapi_fundamentals(faltantes_lote)
+            if faltantes_lote:
+                logger.info(f"[YAHOO-CFFI] Intentando rescatar {len(faltantes_lote)} tickers vía bypass gratuito...")
+                yahoo_data = await _fetch_yahoo_cffi_fundamentals(faltantes_lote)
                 for t_yh, d_yh in yahoo_data.items():
                     res[t_yh.upper()] = d_yh
 

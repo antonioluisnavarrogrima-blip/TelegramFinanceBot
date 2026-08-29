@@ -1146,61 +1146,86 @@ class ExtractorFMP(ExtractorBase):
             logger.warning(f"[FMP] Excepción en fetch_batch para {simbolos[:60]}: {type(e).__name__}: {e}")
             return {}
 
+_YAHOO_CFFI_CRUMB = None
+_YAHOO_CFFI_COOKIES = None
+
 async def _fetch_yahoo_cffi_fundamentals(tickers: list[str]) -> dict:
     """Extrae fundamentales desde la API privada de Yahoo v7 usando curl_cffi para evadir HTTP 401."""
     if not tickers: return {}
     from curl_cffi.requests import AsyncSession
+    global _YAHOO_CFFI_CRUMB, _YAHOO_CFFI_COOKIES
     res = {}
-    try:
-        async with AsyncSession(impersonate='chrome110') as s:
-            # 1. Obtener Cookie
-            r0 = await s.get('https://fc.yahoo.com', timeout=10.0)
-            logger.debug(f"[YAHOO-CFFI] Cookie fetch status: {r0.status_code}")
-            
-            # 2. Obtener Crumb
-            r1 = await s.get('https://query1.finance.yahoo.com/v1/test/getcrumb', timeout=10.0)
-            crumb = r1.text.strip()
-            if not crumb or "<html>" in crumb:
-                logger.warning(f"[YAHOO-CFFI] Fallo al obtener crumb. Status={r1.status_code}. Response={crumb[:50]}")
-                return res
-                
-            # 3. Obtener Datos
-            simbolos_str = ",".join(tickers)
-            url = f"https://query2.finance.yahoo.com/v7/finance/quote?symbols={simbolos_str}&crumb={crumb}"
-            r2 = await s.get(url, timeout=15.0)
-            if r2.status_code != 200:
-                logger.warning(f"[YAHOO-CFFI] Endpoint quote falló con HTTP {r2.status_code}. Respuesta: {r2.text[:100]}")
-                return res
-                
-            resultados = r2.json().get("quoteResponse", {}).get("result", [])
-            for item in resultados:
-                sym = item.get("symbol", "").upper()
-                if not sym: continue
+    
+    for intento in range(2):
+        try:
+            async with AsyncSession(impersonate='chrome110') as s:
+                if _YAHOO_CFFI_COOKIES:
+                    s.cookies.update(_YAHOO_CFFI_COOKIES)
                     
-                def _sf(v): return float(v) if v is not None else None
-                
-                dy = _sf(item.get("trailingAnnualDividendYield"))
-                if dy is None and item.get("dividendYield") is not None:
-                    dy = _sf(item.get("dividendYield")) / 100.0
+                if not _YAHOO_CFFI_CRUMB:
+                    # 1. Obtener Cookie
+                    r0 = await s.get('https://finance.yahoo.com', timeout=10.0)
+                    logger.debug(f"[YAHOO-CFFI] Cookie fetch status: {r0.status_code}")
                     
-                res[sym] = {
-                    "regularMarketPrice": _sf(item.get("regularMarketPrice")),
-                    "marketCap":          int(_sf(item.get("marketCap"))) if item.get("marketCap") else None,
-                    "shortName":          item.get("shortName", sym),
-                    "trailingPE":         _sf(item.get("trailingPE")),
-                    "dividendYield":      dy,
-                    "dividendRate":       _sf(item.get("trailingAnnualDividendRate") or item.get("dividendRate")),
-                    "returnOnEquity":     None,
-                    "profitMargins":      None,
-                    "beta":               None,
-                    "sector":             None,
-                    "_fuente":            "Yahoo-CFFI",
-                }
-            logger.info(f"[YAHOO-CFFI] Éxito recuperando {len(res)} tickers vía bypass.")
-            return res
-    except Exception as e:
-        logger.warning(f"[YAHOO-CFFI] Error en bypass: {e}")
-        return {}
+                    # 2. Obtener Crumb
+                    r1 = await s.get('https://query1.finance.yahoo.com/v1/test/getcrumb', timeout=10.0)
+                    crumb = r1.text.strip()
+                    if not crumb or "<html>" in crumb:
+                        logger.warning(f"[YAHOO-CFFI] Fallo al obtener crumb. Status={r1.status_code}. Response={crumb[:50]}")
+                        return res
+                    _YAHOO_CFFI_CRUMB = crumb
+                    _YAHOO_CFFI_COOKIES = s.cookies.get_dict()
+                else:
+                    crumb = _YAHOO_CFFI_CRUMB
+                    
+                # 3. Obtener Datos
+                simbolos_str = ",".join(tickers)
+                url = f"https://query2.finance.yahoo.com/v7/finance/quote?symbols={simbolos_str}&crumb={crumb}"
+                r2 = await s.get(url, timeout=15.0)
+                
+                if r2.status_code == 401:
+                    logger.warning(f"[YAHOO-CFFI] HTTP 401 Unauthorized. Crumb/Cookie expirado. Reintentando ({intento+1}/2)...")
+                    _YAHOO_CFFI_CRUMB = None
+                    _YAHOO_CFFI_COOKIES = None
+                    continue # Reintenta pidiendo nuevo crumb
+                elif r2.status_code != 200:
+                    logger.warning(f"[YAHOO-CFFI] Endpoint quote falló con HTTP {r2.status_code}. Respuesta: {r2.text[:100]}")
+                    return res
+                    
+                resultados = r2.json().get("quoteResponse", {}).get("result", [])
+                for item in resultados:
+                    sym = item.get("symbol", "").upper()
+                    if not sym: continue
+                        
+                    def _sf(v): return float(v) if v is not None else None
+                    
+                    dy = _sf(item.get("trailingAnnualDividendYield"))
+                    if dy is None and item.get("dividendYield") is not None:
+                        dy = _sf(item.get("dividendYield")) / 100.0
+                        
+                    res[sym] = {
+                        "regularMarketPrice": _sf(item.get("regularMarketPrice")),
+                        "marketCap":          int(_sf(item.get("marketCap"))) if item.get("marketCap") else None,
+                        "shortName":          item.get("shortName", sym),
+                        "trailingPE":         _sf(item.get("trailingPE")),
+                        "dividendYield":      dy,
+                        "dividendRate":       _sf(item.get("trailingAnnualDividendRate") or item.get("dividendRate")),
+                        "returnOnEquity":     None,
+                        "profitMargins":      None,
+                        "beta":               None,
+                        "sector":             None,
+                        "_fuente":            "Yahoo-CFFI",
+                    }
+                logger.info(f"[YAHOO-CFFI] Éxito recuperando {len(res)} tickers vía bypass.")
+                return res
+        except Exception as e:
+            logger.warning(f"[YAHOO-CFFI] Error en bypass: {type(e).__name__}: {e}")
+            if intento == 0:
+                _YAHOO_CFFI_CRUMB = None
+                _YAHOO_CFFI_COOKIES = None
+            else:
+                return {}
+    return res
 
 # Clases de activo que REQUIEREN fundamentales (PER, dividendo...) para el filtrado
 _CLASES_CON_FUNDAMENTALES = {"ACCION", "REIT", "ETF", "BONO"}

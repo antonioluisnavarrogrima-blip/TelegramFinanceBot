@@ -7,8 +7,8 @@ async def _fetch_yahoo_cffi_fundamentals(tickers: list[str]) -> dict:
     res = {}
     try:
         async with AsyncSession(impersonate='chrome110') as s:
-            r0 = await s.get('https://finance.yahoo.com', timeout=10.0)
-            print("finance.yahoo.com status:", r0.status_code)
+            r0 = await s.get('https://fc.yahoo.com', timeout=10.0)
+            print("cookie endpoint status:", r0.status_code)
             r1 = await s.get('https://query1.finance.yahoo.com/v1/test/getcrumb', timeout=10.0)
             crumb = r1.text.strip()
             print("Crumb:", crumb[:20] if crumb else "EMPTY")
